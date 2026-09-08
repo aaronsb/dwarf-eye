@@ -138,22 +138,27 @@ impl World {
     }
 
     /// Folds a block list into the world, replacing any chunks it covers.
+    /// `shift` moves the reply's window-local block coordinates and levels
+    /// into render space. Returns the keys of the chunks that arrived.
     ///
     /// An incremental reply carries blocks whose hash changed for any reason —
     /// a unit moved, a liquid shifted — and those can arrive with no tile array
     /// at all. Absorbing one of those would replace a decoded chunk with an
     /// empty one, so a block with no tiles is left to stand on what is already
     /// known.
-    pub fn absorb(&mut self, list: BlockList) -> usize {
-        let mut absorbed = 0;
+    pub fn absorb(&mut self, list: BlockList, shift: (i32, i32, i32)) -> Vec<(i32, i32, i32)> {
+        let mut absorbed = Vec::new();
         for block in list.map_blocks {
             if block.tiles.is_empty() {
                 continue;
             }
-            let chunk = self.decode(&block);
-            self.chunks
-                .insert((chunk.block_x, chunk.block_y, chunk.z), chunk);
-            absorbed += 1;
+            let mut chunk = self.decode(&block);
+            chunk.block_x += shift.0;
+            chunk.block_y += shift.1;
+            chunk.z += shift.2;
+            let key = (chunk.block_x, chunk.block_y, chunk.z);
+            self.chunks.insert(key, chunk);
+            absorbed.push(key);
         }
         absorbed
     }

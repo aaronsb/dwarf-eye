@@ -28,7 +28,7 @@ pub const LAYER_TOP: f32 = 200.0;
 /// The cirrus sheet, well above the main layer.
 pub const CIRRUS_HEIGHT: f32 = 290.0;
 /// How far the ray is followed, in tiles.
-pub const MAX_DISTANCE: f32 = 1200.0;
+pub const MAX_DISTANCE: f32 = 2600.0;
 /// The whole field repeats at this period, in tiles.
 pub const WEATHER_PERIOD: f32 = 2048.0;
 pub const BASE_PERIOD: f32 = 256.0;
@@ -497,7 +497,6 @@ pub fn bake_shadow(
     mut bake: ResMut<ShadowBake>,
     mut images: ResMut<Assets<Image>>,
     mut terrain: ResMut<Assets<crate::shadow::TerrainMaterial>>,
-    material: Res<crate::TerrainMaterial>,
 ) {
     bake.since += time.delta_secs();
 
@@ -511,24 +510,26 @@ pub fn bake_shadow(
         bake.baked_sun = baked.sun;
         bake.baked_for = Some(baked.weather);
         bake.baked_ground = baked.ground;
-        if let Some(mut terrain) = terrain.get_mut(&material.0) {
-            let n = SHADOW_RESOLUTION as u32;
-            let mut image = Image::new(
-                Extent3d { width: n, height: n, depth_or_array_layers: 1 },
-                TextureDimension::D2,
-                baked.data,
-                TextureFormat::R8Unorm,
-                RenderAssetUsages::RENDER_WORLD,
-            );
-            image.sampler = repeating();
-            terrain.extension.map = images.add(image);
+        let n = SHADOW_RESOLUTION as u32;
+        let mut image = Image::new(
+            Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            baked.data,
+            TextureFormat::R8Unorm,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        image.sampler = repeating();
+        let map = images.add(image);
+        // Both terrain materials, fine and horizon, read the same map.
+        for (_, terrain) in terrain.iter_mut() {
+            terrain.extension.map = map.clone();
             terrain.extension.uniform.sun = baked.sun;
             terrain.extension.uniform.ground = baked.ground;
         }
     }
 
-    // Keep the live parts of the terrain uniform current every frame.
-    if let Some(mut terrain) = terrain.get_mut(&material.0) {
+    // Keep the live parts of the terrain uniforms current every frame.
+    for (_, terrain) in terrain.iter_mut() {
         let u = &mut terrain.extension.uniform;
         u.wind = state.params.wind;
         u.period = WEATHER_PERIOD;

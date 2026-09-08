@@ -40,6 +40,8 @@ pub enum Event {
     Connected { world_name: String, save: String, center: (i32, i32, i32), size: (i32, i32, i32) },
     /// Geometry for chunks that changed; an empty `data` means "despawn this one".
     Chunks(Vec<(ChunkKey, MeshData)>),
+    /// Coarse terrain beyond the loaded map, sent once the map's surface is known.
+    Horizon(MeshData),
     Status(String),
     Failed(String),
 }
@@ -71,7 +73,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
     // The window we last asked for. DFHack answers with only the blocks it
     // thinks changed, so any chunk we prune has to be re-requested outright or
     // it never comes back.
-    let mut last_window: Option<(i32, i32, i32, i32, i32, i32)> = None;
+    let mut last_window: Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))> = None;
 
     // Dwarf Fortress's own sprites, indexed by tiletype and species.
     let tiletypes: rfr::TiletypeList = df.client.call_empty(methods::GET_TILETYPE_LIST)?;
@@ -109,6 +111,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
         ),
     })?;
 
+    let mut horizon_sent = false;
     loop {
         let command = match commands.try_recv() {
             Ok(c) => c,
@@ -138,35 +141,52 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
             }
             Command::Fetch { center, radius, depth, opts, force } => {
+                // The game's window follows the character; a move changes what
+                // every local coordinate means, so the next request must be
+                // a full one.
+                let window_moved = df.refresh_window()?;
                 let bounds =
                     BlockBounds::under_ceiling(center.0, center.1, center.2, radius, depth);
                 let window = (
                     bounds.min_x, bounds.max_x, bounds.min_y,
-                    bounds.max_y, bounds.min_z, bounds.max_z,
+                    bounds.max_y, bounds.min_z, bounds.max_z, df.shift(),
                 );
                 let moved = last_window != Some(window);
                 last_window = Some(window);
 
-                let fetched = df.fetch(bounds, force || moved)?;
+                let arrived = df.fetch(bounds, force || moved)?;
 
-                // Retire chunks the camera has left behind before remeshing, so
-                // the loaded set stays proportional to the view and not to how
-                // far the camera has travelled.
-                let dropped = df.world.retain_within(bounds);
+                // Chunks stay as the character travels, so the map paints in.
+                // Only what is far behind the camera is retired.
+                let keep = BlockBounds::under_ceiling(
+                    center.0, center.1, center.2, RETAIN_RADIUS, RETAIN_DEPTH,
+                );
+                let dropped = df.world.retain_within(keep);
                 if !dropped.is_empty() {
                     events.send(Event::Chunks(
                         dropped.into_iter().map(|k| (k, MeshData::default())).collect(),
                     ))?;
                 }
 
-                if fetched > 0 {
+                if !arrived.is_empty() {
                     events.send(Event::Status(format!(
-                        "{fetched} blocks fetched, {} chunks in view",
+                        "{} blocks fetched, {} chunks held",
+                        arrived.len(),
                         df.world.chunk_count()
                     )))?;
-                    // A new block changes its neighbours' culling, so remesh the
-                    // whole loaded set rather than only what just arrived.
-                    remesh_all(&df, library.as_mut(), opts, events)?;
+                    // A new block changes its neighbours' culling, so those
+                    // remesh along with it.
+                    remesh_touched(&df, library.as_mut(), opts, events, &arrived)?;
+                }
+
+                // The outer terrain needs the map's own surface to meet it, so
+                // it waits for the first blocks, and follows the window after.
+                if df.world.chunk_count() > 0 && (!horizon_sent || window_moved) {
+                    horizon_sent = true;
+                    match build_horizon(&mut df) {
+                        Ok(mesh) => events.send(Event::Horizon(mesh))?,
+                        Err(e) => events.send(Event::Status(format!("no horizon: {e:#}")))?,
+                    }
                 }
             }
         }
@@ -230,6 +250,58 @@ fn read_weather(map: &rfr::WorldMap) -> Weather {
 }
 
 /// Meshes every loaded chunk and ships the results in batches.
+/// Pulls the region and world maps and stitches the land beyond the loaded map.
+fn build_horizon(df: &mut Session) -> Result<MeshData> {
+    let regions: rfr::RegionMaps = df.client.call_empty(methods::GET_REGION_MAPS_NEW)?;
+    let world_map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP)?;
+    let transpose = std::env::var("DWARF_EYE_HORIZON_TRANSPOSE").is_ok();
+    Ok(dwarf_eye_world::horizon::build(
+        &df.world.palette,
+        &df.map_info,
+        df.origin(),
+        &regions,
+        &world_map,
+        &df.world,
+        transpose,
+    ))
+}
+
+/// How far from the camera chunks are kept, in blocks and levels. Wide, so a
+/// walk leaves the land behind it standing.
+const RETAIN_RADIUS: i32 = 40;
+const RETAIN_DEPTH: i32 = 60;
+
+/// Remeshes the chunks that arrived and every loaded neighbour of theirs.
+fn remesh_touched(
+    df: &Session,
+    mut library: Option<&mut TileLibrary>,
+    opts: MeshOptions,
+    events: &Sender<Event>,
+    arrived: &[(i32, i32, i32)],
+) -> Result<()> {
+    const BATCH: usize = 48;
+    let mut keys: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
+    for &(x, y, z) in arrived {
+        for (dx, dy, dz) in [(0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            keys.insert((x + dx, y + dy, z + dz));
+        }
+    }
+    let mut batch = Vec::with_capacity(BATCH);
+    for key in keys {
+        let Some(chunk) = df.world.chunk(key.0, key.1, key.2) else { continue };
+        let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
+        batch.push((key, mesh));
+        if batch.len() == BATCH {
+            events.send(Event::Chunks(std::mem::take(&mut batch)))?;
+            batch.reserve(BATCH);
+        }
+    }
+    if !batch.is_empty() {
+        events.send(Event::Chunks(batch))?;
+    }
+    Ok(())
+}
+
 fn remesh_all(
     df: &Session,
     mut library: Option<&mut TileLibrary>,

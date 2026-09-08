@@ -23,7 +23,10 @@ struct CloudShadow {
     // Height the map was baked at.
     ground: f32,
     enabled: f32,
-    padding: vec3<f32>,
+    // One on the horizon material, which yields to loaded blocks.
+    horizon: f32,
+    // Block coordinate of the mask's first texel.
+    mask_origin: vec2<f32>,
 }
 
 // Bevy substitutes the material group index; it is 3 in this version, and
@@ -31,6 +34,20 @@ struct CloudShadow {
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> cloud: CloudShadow;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var shadow_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var shadow_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var block_mask: texture_2d<f32>;
+
+// Whether a horizon fragment stands where a fine chunk is loaded.
+fn masked(world: vec3<f32>) -> bool {
+    if cloud.horizon < 0.5 {
+        return false;
+    }
+    let block = vec2<i32>(floor(world.xz / 16.0)) - vec2<i32>(cloud.mask_origin);
+    let size = vec2<i32>(textureDimensions(block_mask));
+    if any(block < vec2(0)) || any(block >= size) {
+        return false;
+    }
+    return textureLoad(block_mask, block, 0).r > 0.5;
+}
 
 // Fraction of sunlight reaching a point on the ground.
 fn transmittance(world: vec3<f32>) -> f32 {
@@ -47,6 +64,9 @@ fn transmittance(world: vec3<f32>) -> f32 {
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+    if masked(in.world_position.xyz) {
+        discard;
+    }
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);

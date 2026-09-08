@@ -169,6 +169,11 @@ impl Palette {
             .unwrap_or(TiletypeMaterial::NoMaterial)
     }
 
+    /// The material's own colour, if DF reports one.
+    pub fn material_color(&self, pair: &MatPair) -> Option<Rgb> {
+        self.colors.get(&(pair.mat_type, pair.mat_index)).copied()
+    }
+
     pub fn material_name(&self, pair: &MatPair) -> Option<&str> {
         self.names.get(&(pair.mat_type, pair.mat_index)).map(String::as_str)
     }

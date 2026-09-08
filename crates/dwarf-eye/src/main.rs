@@ -84,6 +84,7 @@ fn main() {
                 poll_weather,
                 poll_clock,
                 request_blocks,
+                refresh_mask,
                 update_hud,
             ),
         )
@@ -129,12 +130,29 @@ struct Status {
 #[derive(Component)]
 struct Hud;
 
+/// The coarse terrain beyond the loaded map.
+#[derive(Component)]
+struct Horizon;
+
 #[derive(Component)]
 struct ChunkTag(#[allow(dead_code)] ChunkKey);
 
 /// Reused by every chunk, since colour lives in the vertex data.
 #[derive(Resource)]
 pub struct TerrainMaterial(pub Handle<TerrainMat>);
+
+/// The horizon's copy of the terrain material: the same shading, flagged to
+/// yield wherever a fine chunk is loaded.
+#[derive(Resource)]
+pub struct HorizonMaterial(pub Handle<TerrainMat>);
+
+/// One texel per block, marking where fine chunks are loaded. Rebuilt from the
+/// chunk set whenever it changes.
+#[derive(Resource)]
+pub struct BlockMask {
+    image: Handle<Image>,
+    dirty: bool,
+}
 
 fn setup(
     mut commands: Commands,
@@ -148,6 +166,8 @@ fn setup(
 
     commands.spawn((
         Camera3d::default(),
+        // Far enough to take in the outer terrain.
+        Projection::Perspective(PerspectiveProjection { far: 8000.0, ..default() }),
         Transform::from_xyz(0.0, 40.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
         AtmosphereSettings {
             // Raymarching integrates the sky directly, which removes the seams
@@ -187,7 +207,9 @@ fn setup(
         Transform::from_xyz(60.0, 120.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    commands.insert_resource(TerrainMaterial(materials.add(TerrainMat {
+    let mask = images.add(empty_mask());
+    let shadow = images.add(clouds::flat_shadow(255));
+    let terrain = |horizon: f32| TerrainMat {
         base: StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.92,
@@ -196,12 +218,20 @@ fn setup(
             ..default()
         },
         extension: CloudShadow {
-            uniform: ShadowUniform::default(),
+            uniform: ShadowUniform {
+                horizon,
+                mask_origin: Vec2::splat(-(shadow::MASK_BLOCKS as f32) / 2.0),
+                ..default()
+            },
             // Always bound: an unbound texture leaves the binding out of the
             // pipeline layout entirely.
-            map: images.add(clouds::flat_shadow(255)),
+            map: shadow.clone(),
+            mask: mask.clone(),
         },
-    })));
+    };
+    commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
+    commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
+    commands.insert_resource(BlockMask { image: mask, dirty: false });
 
     commands.spawn((
         Text::new("connecting to DFHack…"),
@@ -226,6 +256,9 @@ fn drain_worker(
     mut weather: ResMut<Weather>,
     mut ground: ResMut<clouds::GroundLevel>,
     mut camera: Query<(&mut Transform, &mut FlyCamera)>,
+    horizon: Query<Entity, With<Horizon>>,
+    horizon_material: Res<HorizonMaterial>,
+    mut mask: ResMut<BlockMask>,
 ) {
     for event in bridge.rx.try_iter() {
         match event {
@@ -282,7 +315,21 @@ fn drain_worker(
                 ground.0 = center.2 as f32 * Z_SCALE;
                 settings.placed = true;
             }
+            Event::Horizon(data) => {
+                for entity in &horizon {
+                    commands.entity(entity).despawn();
+                }
+                let triangles = data.indices.len() / 3;
+                status.detail = format!("horizon: {triangles} triangles");
+                commands.spawn((
+                    Mesh3d(meshes.add(to_bevy_mesh(data))),
+                    MeshMaterial3d(horizon_material.0.clone()),
+                    Transform::IDENTITY,
+                    Horizon,
+                ));
+            }
             Event::Chunks(batch) => {
+                mask.dirty = true;
                 for (key, data) in batch {
                     if let Some((entity, _)) = entities.0.remove(&key) {
                         commands.entity(entity).despawn();
@@ -309,6 +356,41 @@ fn drain_worker(
                 status.detail = format!("DFHack error: {err}");
                 error!("{err}");
             }
+        }
+    }
+}
+
+/// A mask with nothing loaded.
+fn empty_mask() -> Image {
+    let n = shadow::MASK_BLOCKS;
+    Image::new(
+        Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        vec![0u8; (n * n) as usize],
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+}
+
+/// Rewrites the block mask from the chunk set after it changed.
+fn refresh_mask(
+    mut mask: ResMut<BlockMask>,
+    entities: Res<ChunkEntities>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if !mask.dirty {
+        return;
+    }
+    let Some(mut image) = images.get_mut(&mask.image) else { return };
+    mask.dirty = false;
+    let n = shadow::MASK_BLOCKS as i32;
+    let half = n / 2;
+    let Some(data) = image.data.as_mut() else { return };
+    data.fill(0);
+    for &(bx, by, _) in entities.0.keys() {
+        let (x, y) = (bx + half, by + half);
+        if x >= 0 && y >= 0 && x < n && y < n {
+            data[(y * n + x) as usize] = 255;
         }
     }
 }
