@@ -30,7 +30,7 @@ rebuilds as you play.
 
 [Architecture](docs/architecture/README.md) · [Gallery](docs/gallery/README.md)
 
-![crowns and the far band](docs/horizon.png)
+![forest to the horizon: the live window at centre, region-map land and box crowns beyond](docs/horizon.png)
 
 Grown crowns over the live window, then the region maps carrying the land to the
 horizon.
