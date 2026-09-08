@@ -1,7 +1,9 @@
-//! The terrain material, extended so the cloud deck shades the ground.
+//! The terrain material, extended so the clouds shade the ground.
 //!
-//! Bevy's volumetric fog lights fog but never shadows scene geometry, so
-//! without this the clouds float over a fully lit landscape.
+//! The clouds are a transparent volume, so they never enter the shadow map.
+//! Instead `clouds::bake_shadow` marches the cloud field toward the sun on the
+//! CPU and hands the result here as a transmittance map, which the terrain
+//! shader looks up along the sun's slant.
 
 use bevy::asset::embedded_asset;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
@@ -13,38 +15,37 @@ use bevy::shader::ShaderRef;
 /// next to wherever it happens to be run from.
 const SHADER: &str = "embedded://dwarf_eye/cloud_shadow.wgsl";
 
-/// Terrain shading, plus a cloud shadow pass.
+/// Terrain shading, plus a cloud shadow lookup.
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, CloudShadow>;
 
-/// What the shader needs to march the cloud volume toward the sun.
+/// Where the shadow map came from, and how to read it.
 #[derive(Clone, Copy, Debug, Default, Reflect, ShaderType)]
-pub struct CloudUniform {
-    /// Direction from the world toward the sun.
+pub struct ShadowUniform {
+    /// Direction toward the sun the map was baked for.
     pub sun: Vec3,
-    /// How much light a fully opaque cloud takes away, 0..1.
+    /// Fraction of light a fully opaque cloud takes away, 0..1.
     pub strength: f32,
-    /// Centre of the cloud deck in world space.
-    pub centre: Vec3,
-    pub density_scale: f32,
-    /// Full extent of the deck in world space.
-    pub size: Vec3,
-    /// Zero when the sky is clear, so the march is skipped outright.
+    /// Wind offset in tiles: the field is sampled at world + wind.
+    pub wind: Vec2,
+    /// The map covers one period of the field.
+    pub period: f32,
+    /// Height the map was baked at.
+    pub ground: f32,
+    /// Zero when the sky is clear, so the lookup is skipped.
     pub enabled: f32,
-    /// Wind offset applied to the density texture.
-    pub offset: Vec3,
-    pub padding: f32,
+    pub padding: Vec3,
 }
 
 /// Bindings start at 100; the base `StandardMaterial` owns everything below.
-#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 pub struct CloudShadow {
     #[uniform(100)]
-    pub uniform: CloudUniform,
+    pub uniform: ShadowUniform,
     /// Never optional: leaving a texture unbound drops its binding from the
     /// pipeline layout, and the shader then fails validation.
-    #[texture(101, dimension = "3d")]
+    #[texture(101)]
     #[sampler(102)]
-    pub density: Handle<Image>,
+    pub map: Handle<Image>,
 }
 
 /// Registers the material and embeds its shader.

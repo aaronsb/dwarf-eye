@@ -4,8 +4,9 @@
 //! Start Dwarf Fortress with DFHack, load a fort or an adventurer, then run this.
 
 mod camera;
-mod cloud_material;
+mod capture;
 mod clouds;
+mod noise;
 mod shadow;
 mod sky;
 mod stars;
@@ -18,16 +19,17 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
 use bevy::camera::Exposure;
+use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::light::{
-    Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, VolumetricFog, VolumetricLight,
-    atmosphere::ScatteringMedium, light_consts::lux,
+    Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, atmosphere::ScatteringMedium,
+    light_consts::lux,
 };
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
 use clouds::Weather;
-use shadow::{CloudShadow, CloudUniform, TerrainMaterial as TerrainMat};
+use shadow::{CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat};
 use sky::Clock;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
@@ -55,7 +57,8 @@ fn main() {
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(shadow::CloudShadowPlugin)
-        .add_plugins(cloud_material::CloudMaterialPlugin)
+        .add_plugins(clouds::CloudPlugin)
+        .add_plugins(capture::CapturePlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<ChunkEntities>()
@@ -63,11 +66,8 @@ fn main() {
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
         .insert_resource(Weather::from_env().unwrap_or_default())
-        .init_resource::<clouds::BuiltFor>()
-        .init_resource::<clouds::GroundLevel>()
-        .init_resource::<clouds::CloudField>()
         .insert_non_send(Bridge::spawn())
-        .add_systems(Startup, (setup, stars::setup, clouds::setup))
+        .add_systems(Startup, (setup, stars::setup))
         .add_systems(
             Update,
             (
@@ -76,9 +76,6 @@ fn main() {
                 camera::fly,
                 sky::drive_sun,
                 stars::drive,
-                clouds::drive,
-                sync_cloud_shadow,
-                sync_cloud_light,
                 poll_weather,
                 poll_clock,
                 request_blocks,
@@ -132,7 +129,7 @@ struct ChunkTag(#[allow(dead_code)] ChunkKey);
 
 /// Reused by every chunk, since colour lives in the vertex data.
 #[derive(Resource)]
-struct TerrainMaterial(Handle<TerrainMat>);
+pub struct TerrainMaterial(pub Handle<TerrainMat>);
 
 fn setup(
     mut commands: Commands,
@@ -166,16 +163,8 @@ fn setup(
         // dusk read as dusk. Raised above the physical default because there is
         // no bounce lighting to fill the shadows.
         AtmosphereEnvironmentMapLight { intensity: 2.6, size: UVec2::splat(1024), ..default() },
-        // Light shafts, and the ambient that keeps cloud undersides from going
-        // black: seen from below, a cloud is lit by scattered sky, not by the
-        // sun it is blocking.
-        VolumetricFog {
-            // Well above the physical default: inside a cloud the shadow map
-            // reports full occlusion, so ambient is all the light there is.
-            ambient_intensity: 3.2,
-            ambient_color: Color::srgb(0.62, 0.72, 0.88),
-            ..default()
-        },
+        // The cloud volume reads scene depth to stop its march at terrain.
+        DepthPrepass,
         FlyCamera::default(),
     ));
 
@@ -187,7 +176,6 @@ fn setup(
         },
         // A real 32-arcminute disk, so it reads as the sun rather than a glare.
         SunDisk::EARTH,
-        VolumetricLight,
         Transform::from_xyz(60.0, 120.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
@@ -200,10 +188,10 @@ fn setup(
             ..default()
         },
         extension: CloudShadow {
-            uniform: CloudUniform { strength: 0.55, density_scale: 26.0, ..default() },
-            // Always bound: an unbound 3D texture leaves the binding out of the
+            uniform: ShadowUniform::default(),
+            // Always bound: an unbound texture leaves the binding out of the
             // pipeline layout entirely.
-            density: images.add(clouds::empty_density()),
+            map: images.add(clouds::flat_shadow(255)),
         },
     })));
 
@@ -229,7 +217,7 @@ fn drain_worker(
     mut clock: ResMut<Clock>,
     mut weather: ResMut<Weather>,
     mut ground: ResMut<clouds::GroundLevel>,
-    mut camera: Query<&mut Transform, With<FlyCamera>>,
+    mut camera: Query<(&mut Transform, &mut FlyCamera)>,
 ) {
     for event in bridge.rx.try_iter() {
         match event {
@@ -259,7 +247,8 @@ fn drain_worker(
                 status.detail = format!("map {} x {} x {} tiles", size.0, size.1, size.2);
 
                 // Drop the camera just above and south of the player's position.
-                if let Ok(mut transform) = camera.single_mut() {
+                if let Ok((mut transform, mut fly)) = camera.single_mut() {
+                    capture::apply_view(&mut fly);
                     let target = Vec3::new(
                         center.0 as f32,
                         center.2 as f32 * Z_SCALE,
@@ -433,53 +422,6 @@ fn request_blocks(
         opts: settings.mesh_options(),
         force,
     });
-}
-
-/// Hands the terrain shader the sun and the cloud volume, so the deck's shadow
-/// lands on the ground rather than staying up in the sky with the clouds.
-fn sync_cloud_shadow(
-    clock: Res<Clock>,
-    weather: Res<Weather>,
-    field: Res<clouds::CloudField>,
-    material: Res<TerrainMaterial>,
-    mut materials: ResMut<Assets<TerrainMat>>,
-) {
-    let Some(mut terrain) = materials.get_mut(&material.0) else { return };
-
-    if let Some(density) = field.density.clone() {
-        terrain.extension.density = density;
-    }
-    let uniform = &mut terrain.extension.uniform;
-    uniform.sun = clock.sun_direction();
-    uniform.centre = field.centre;
-    uniform.size = field.size;
-    uniform.offset = field.offset;
-    uniform.enabled = if weather.is_clear() || field.density.is_none() { 0.0 } else { 1.0 };
-}
-
-/// Keeps the cloud shading in step with the sun.
-fn sync_cloud_light(
-    clock: Res<Clock>,
-    mut materials: ResMut<Assets<cloud_material::CloudMaterial>>,
-) {
-    let sun = clock.sun_direction();
-    // Sunlight reddens and dims as it grazes the horizon, and the sky that
-    // fills the shadowed side goes with it.
-    let elevation = sun.y.clamp(-1.0, 1.0);
-    let day = elevation.max(0.0).powf(0.45);
-    let warmth = (1.0 - elevation.max(0.0)).powf(2.0);
-
-    for (_, material) in materials.iter_mut() {
-        let u = &mut material.extension.uniform;
-        u.sun = sun;
-        u.sun_color = Vec3::new(
-            1.0,
-            0.97 - warmth * 0.30,
-            0.92 - warmth * 0.62,
-        ) * (0.15 + day * 1.5);
-        u.sky_color = Vec3::new(0.42, 0.52, 0.72) * (0.06 + day * 0.95);
-        u.ground_color = Vec3::new(0.26, 0.28, 0.24) * (0.05 + day * 0.7);
-    }
 }
 
 /// Asks for the world's cloud cover now and then. The map message is large and
