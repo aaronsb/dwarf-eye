@@ -35,16 +35,6 @@ use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
 
-/// How far around the camera to keep map loaded, in 16-tile blocks.
-/// `DWARF_EYE_RADIUS` overrides it.
-const LOAD_RADIUS: i32 = 5;
-
-fn load_radius() -> i32 {
-    std::env::var("DWARF_EYE_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(LOAD_RADIUS)
-}
-/// How many z-levels below the cut plane to keep loaded.
-const LOAD_DEPTH: i32 = 22;
-
 /// Where the cut plane starts, relative to the player's z-level.
 ///
 /// A tree stands several levels above the ground it grows from, so a plane just
@@ -67,6 +57,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<ChunkEntities>()
+        .init_resource::<PendingChunks>()
         .init_resource::<Status>()
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
@@ -77,6 +68,7 @@ fn main() {
             Update,
             (
                 drain_worker,
+                upload_chunks,
                 handle_input,
                 camera::fly,
                 sky::drive_sun,
@@ -116,6 +108,16 @@ impl ViewSettings {
 #[derive(Resource, Default)]
 struct ChunkEntities(HashMap<ChunkKey, (Entity, usize)>);
 
+/// Meshes that have arrived from the worker and not yet reached the GPU.
+/// Uploads are budgeted per frame, nearest to the camera first, so a burst of
+/// chunks never stalls a frame. A later mesh for the same chunk replaces an
+/// earlier one still waiting.
+#[derive(Resource, Default)]
+struct PendingChunks(HashMap<ChunkKey, MeshData>);
+
+/// Chunk meshes uploaded per frame.
+const UPLOAD_BUDGET: usize = 24;
+
 /// Set when the cut plane moves, so the next frame reloads the new z range.
 #[derive(Resource, Default, Deref, DerefMut)]
 struct NeedsFetch(bool);
@@ -146,11 +148,12 @@ pub struct TerrainMaterial(pub Handle<TerrainMat>);
 #[derive(Resource)]
 pub struct HorizonMaterial(pub Handle<TerrainMat>);
 
-/// One texel per block, marking where fine chunks are loaded. Rebuilt from the
-/// chunk set whenever it changes.
+/// One texel per block, marking where fine chunks reach the ground. The worker
+/// decides which blocks qualify; this only paints them.
 #[derive(Resource)]
 pub struct BlockMask {
     image: Handle<Image>,
+    blocks: Vec<(i32, i32)>,
     dirty: bool,
 }
 
@@ -231,7 +234,7 @@ fn setup(
     };
     commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
     commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
-    commands.insert_resource(BlockMask { image: mask, dirty: false });
+    commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });
 
     commands.spawn((
         Text::new("connecting to DFHack…"),
@@ -249,7 +252,6 @@ fn drain_worker(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<TerrainMat>>,
     material: Res<TerrainMaterial>,
-    mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
     mut settings: ResMut<ViewSettings>,
     mut clock: ResMut<Clock>,
@@ -259,6 +261,7 @@ fn drain_worker(
     horizon: Query<Entity, With<Horizon>>,
     horizon_material: Res<HorizonMaterial>,
     mut mask: ResMut<BlockMask>,
+    mut pending: ResMut<PendingChunks>,
 ) {
     for event in bridge.rx.try_iter() {
         match event {
@@ -319,28 +322,14 @@ fn drain_worker(
                     Horizon,
                 ));
             }
-            Event::Chunks(batch) => {
+            Event::Coverage(blocks) => {
+                mask.blocks = blocks;
                 mask.dirty = true;
+            }
+            Event::Chunks(batch) => {
                 for (key, data) in batch {
-                    if let Some((entity, _)) = entities.0.remove(&key) {
-                        commands.entity(entity).despawn();
-                    }
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let triangles = data.triangle_count();
-                    let handle = meshes.add(to_bevy_mesh(data));
-                    let entity = commands
-                        .spawn((
-                            Mesh3d(handle),
-                            MeshMaterial3d(material.0.clone()),
-                            Transform::IDENTITY,
-                            ChunkTag(key),
-                        ))
-                        .id();
-                    entities.0.insert(key, (entity, triangles));
+                    pending.0.insert(key, data);
                 }
-                status.triangles = entities.0.values().map(|(_, t)| t).sum();
             }
             Event::Status(text) => status.detail = text,
             Event::Failed(err) => {
@@ -349,6 +338,54 @@ fn drain_worker(
             }
         }
     }
+}
+
+/// Moves a budget of pending meshes onto the GPU, nearest the camera first.
+fn upload_chunks(
+    mut commands: Commands,
+    mut pending: ResMut<PendingChunks>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    material: Res<TerrainMaterial>,
+    mut entities: ResMut<ChunkEntities>,
+    mut status: ResMut<Status>,
+    camera: Query<&Transform, With<FlyCamera>>,
+) {
+    if pending.0.is_empty() {
+        return;
+    }
+    let eye = camera.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let mut keys: Vec<ChunkKey> = pending.0.keys().copied().collect();
+    let distance = |k: &ChunkKey| {
+        let centre = Vec3::new(
+            (k.0 * BLOCK + BLOCK / 2) as f32,
+            k.2 as f32 * Z_SCALE,
+            (k.1 * BLOCK + BLOCK / 2) as f32,
+        );
+        centre.distance_squared(eye)
+    };
+    keys.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+
+    for key in keys.into_iter().take(UPLOAD_BUDGET) {
+        let Some(data) = pending.0.remove(&key) else { continue };
+        if let Some((entity, _)) = entities.0.remove(&key) {
+            commands.entity(entity).despawn();
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let triangles = data.triangle_count();
+        let handle = meshes.add(to_bevy_mesh(data));
+        let entity = commands
+            .spawn((
+                Mesh3d(handle),
+                MeshMaterial3d(material.0.clone()),
+                Transform::IDENTITY,
+                ChunkTag(key),
+            ))
+            .id();
+        entities.0.insert(key, (entity, triangles));
+    }
+    status.triangles = entities.0.values().map(|(_, t)| t).sum();
 }
 
 /// A mask with nothing loaded.
@@ -363,12 +400,8 @@ fn empty_mask() -> Image {
     )
 }
 
-/// Rewrites the block mask from the chunk set after it changed.
-fn refresh_mask(
-    mut mask: ResMut<BlockMask>,
-    entities: Res<ChunkEntities>,
-    mut images: ResMut<Assets<Image>>,
-) {
+/// Rewrites the block mask after the worker sent a new set of grounded blocks.
+fn refresh_mask(mut mask: ResMut<BlockMask>, mut images: ResMut<Assets<Image>>) {
     if !mask.dirty {
         return;
     }
@@ -378,7 +411,7 @@ fn refresh_mask(
     let half = n / 2;
     let Some(data) = image.data.as_mut() else { return };
     data.fill(0);
-    for &(bx, by, _) in entities.0.keys() {
+    for &(bx, by) in &mask.blocks {
         let (x, y) = (bx + half, by + half);
         if x >= 0 && y >= 0 && x < n && y < n {
             data[(y * n + x) as usize] = 255;
@@ -498,8 +531,6 @@ fn request_blocks(
 
     let _ = bridge.tx.send(Command::Fetch {
         center,
-        radius: load_radius(),
-        depth: LOAD_DEPTH,
         opts: settings.mesh_options(),
         force,
     });

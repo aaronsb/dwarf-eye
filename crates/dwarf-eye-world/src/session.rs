@@ -62,11 +62,32 @@ impl Session {
 
     /// Brings every cached chunk of this world into the render space. Returns
     /// their keys.
+    ///
+    /// A column whose lowest cached chunk is sparse holds canopy with no
+    /// ground under it, from a fetch that did not reach down far enough. Those
+    /// are left out and their files removed, so they are fetched afresh when
+    /// the window returns.
     pub fn restore_cache(&mut self) -> Vec<(i32, i32, i32)> {
         let Some(cache) = &self.cache else { return Vec::new() };
-        let Ok(entries) = cache.load_all() else { return Vec::new() };
+        let Ok(mut entries) = cache.load_all() else { return Vec::new() };
+        entries.sort_by_key(|(key, _)| *key);
+
+        let mut lowest: std::collections::HashMap<(i32, i32), (i32, bool)> = std::collections::HashMap::new();
+        for (key, voxels) in &entries {
+            let filled = voxels.iter().filter(|v| !v.solid.is_empty()).count();
+            let grounded = filled * 2 >= voxels.len();
+            let entry = lowest.entry((key.0, key.1)).or_insert((key.2, grounded));
+            if key.2 < entry.0 {
+                *entry = (key.2, grounded);
+            }
+        }
+
         let mut keys = Vec::new();
         for (absolute, voxels) in entries {
+            if !lowest.get(&(absolute.0, absolute.1)).is_some_and(|(_, grounded)| *grounded) {
+                cache.remove(absolute);
+                continue;
+            }
             let key = self.relative(absolute);
             if self.world.restore(key, voxels) {
                 keys.push(key);
@@ -117,6 +138,21 @@ impl Session {
         ))
     }
 
+    /// The whole live window in render-space blocks, between two render
+    /// levels. Everything Dwarf Fortress currently holds sits inside it.
+    pub fn window_bounds(&self, z_lo: i32, z_hi: i32) -> BlockBounds {
+        let (sx, sy, sz) = self.shift();
+        let (bx, by) = (sx.div_euclid(BLOCK), sy.div_euclid(BLOCK));
+        BlockBounds {
+            min_x: bx,
+            max_x: bx + self.map_info.block_size_x(),
+            min_y: by,
+            max_y: by + self.map_info.block_size_y(),
+            min_z: z_lo.max(sz),
+            max_z: z_hi.min(sz + self.map_info.block_size_z()),
+        }
+    }
+
     /// Fetches the blocks of `bounds` (render-space blocks and levels) that
     /// fall inside the window, and folds them into the world. Returns the keys
     /// of the chunks that arrived.
@@ -137,21 +173,31 @@ impl Session {
         if local.min_x >= local.max_x || local.min_y >= local.max_y || local.min_z >= local.max_z {
             return Ok(Vec::new());
         }
-        let blocks_needed = ((local.max_x - local.min_x)
-            * (local.max_y - local.min_y)
-            * (local.max_z - local.min_z))
-            .max(1);
-        let request = rfr::BlockRequest {
-            blocks_needed: Some(blocks_needed),
-            min_x: Some(local.min_x),
-            max_x: Some(local.max_x),
-            min_y: Some(local.min_y),
-            max_y: Some(local.max_y),
-            min_z: Some(local.min_z),
-            max_z: Some(local.max_z),
-            force_reload: Some(force),
-        };
-        let list: rfr::BlockList = self.client.call(methods::GET_BLOCK_LIST, &request)?;
-        Ok(self.world.absorb(list, shift_blocks))
+
+        // DFHack refuses any reply over 64 MiB with a link failure, and a
+        // busy block can run tens of kilobytes, so requests go up in slabs.
+        const MAX_BLOCKS_PER_REQUEST: i32 = 500;
+        let footprint = (local.max_x - local.min_x) * (local.max_y - local.min_y);
+        let levels_per_slab = (MAX_BLOCKS_PER_REQUEST / footprint.max(1)).max(1);
+
+        let mut arrived = Vec::new();
+        let mut z = local.min_z;
+        while z < local.max_z {
+            let top = (z + levels_per_slab).min(local.max_z);
+            let request = rfr::BlockRequest {
+                blocks_needed: Some(footprint * (top - z)),
+                min_x: Some(local.min_x),
+                max_x: Some(local.max_x),
+                min_y: Some(local.min_y),
+                max_y: Some(local.max_y),
+                min_z: Some(z),
+                max_z: Some(top),
+                force_reload: Some(force),
+            };
+            let list: rfr::BlockList = self.client.call(methods::GET_BLOCK_LIST, &request)?;
+            arrived.extend(self.world.absorb(list, shift_blocks));
+            z = top;
+        }
+        Ok(arrived)
     }
 }

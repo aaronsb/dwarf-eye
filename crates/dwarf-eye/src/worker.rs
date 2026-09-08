@@ -18,7 +18,9 @@ pub type ChunkKey = (i32, i32, i32);
 
 pub enum Command {
     /// Pull blocks around a tile position and remesh what they touch.
-    Fetch { center: (i32, i32, i32), radius: i32, depth: i32, opts: MeshOptions, force: bool },
+    /// Collect what the live window holds. `center` is where the camera is, in
+    /// render tiles and level, for retiring far chunks.
+    Fetch { center: (i32, i32, i32), opts: MeshOptions, force: bool },
     /// Remesh what is already loaded, without going back to DFHack.
     Remesh { opts: MeshOptions },
     /// Read the game's calendar.
@@ -42,6 +44,8 @@ pub enum Event {
     Chunks(Vec<(ChunkKey, MeshData)>),
     /// Coarse terrain beyond the loaded map, sent once the map's surface is known.
     Horizon(MeshData),
+    /// Blocks whose fine chunks reach the ground, where the horizon must yield.
+    Coverage(Vec<(i32, i32)>),
     Status(String),
     Failed(String),
 }
@@ -119,6 +123,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
         df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
     );
     if !restored.is_empty() {
+        events.send(Event::Coverage(grounded_blocks(&df.world)))?;
         events.send(Event::Status(format!(
             "{} chunks restored from {}",
             restored.len(),
@@ -149,61 +154,22 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 }
             }
             Command::Weather => {
-                let map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP)?;
-                events.send(Event::Weather(read_weather(&map)))?;
+                if let Ok(map) = df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP) {
+                    events.send(Event::Weather(read_weather(&map)))?;
+                }
             }
             Command::Clock => {
-                let map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP_CENTER)?;
-                events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
+                if let Ok(map) = df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP_CENTER) {
+                    events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
+                }
             }
-            Command::Fetch { center, radius, depth, opts, force } => {
-                // The game's window follows the character; a move changes what
-                // every local coordinate means, so the next request must be
-                // a full one.
-                let window_moved = df.refresh_window()?;
-                let bounds =
-                    BlockBounds::under_ceiling(center.0, center.1, center.2, radius, depth);
-                let window = (
-                    bounds.min_x, bounds.max_x, bounds.min_y,
-                    bounds.max_y, bounds.min_z, bounds.max_z, df.shift(),
-                );
-                let moved = last_window != Some(window);
-                last_window = Some(window);
-
-                let arrived = df.fetch(bounds, force || moved)?;
-
-                // Chunks stay as the character travels, so the map paints in.
-                // Only what is far behind the camera is retired.
-                let keep = BlockBounds::under_ceiling(
-                    center.0, center.1, center.2, RETAIN_RADIUS, RETAIN_DEPTH,
-                );
-                let dropped = df.world.retain_within(keep);
-                if !dropped.is_empty() {
-                    events.send(Event::Chunks(
-                        dropped.into_iter().map(|k| (k, MeshData::default())).collect(),
-                    ))?;
-                }
-
-                if !arrived.is_empty() {
-                    df.persist(&arrived);
-                    events.send(Event::Status(format!(
-                        "{} blocks fetched, {} chunks held",
-                        arrived.len(),
-                        df.world.chunk_count()
-                    )))?;
-                    // A new block changes its neighbours' culling, so those
-                    // remesh along with it.
-                    remesh_touched(&df, library.as_mut(), opts, events, &arrived)?;
-                }
-
-                // The outer terrain needs the map's own surface to meet it, so
-                // it waits for the first blocks, and follows the window after.
-                if df.world.chunk_count() > 0 && (!horizon_sent || window_moved) {
-                    horizon_sent = true;
-                    match build_horizon(&mut df) {
-                        Ok(mesh) => events.send(Event::Horizon(mesh))?,
-                        Err(e) => events.send(Event::Status(format!("no horizon: {e:#}")))?,
-                    }
+            Command::Fetch { center, opts, force } => {
+                // Travel mode and loading screens leave no map behind, and
+                // DFHack answers with a link failure. Wait it out.
+                if let Err(err) = collect(
+                    &mut df, center, opts, force, &mut last_window, &mut horizon_sent, library.as_mut(), events,
+                ) {
+                    events.send(Event::Status(format!("waiting for the map: {err:#}")))?;
                 }
             }
         }
@@ -281,6 +247,98 @@ fn build_horizon(df: &mut Session) -> Result<MeshData> {
         &df.world,
         transpose,
     ))
+}
+
+/// Levels collected around the character: the window is fetched whole in x/y,
+/// and this deep in z, so everything Dwarf Fortress discloses is kept.
+const COLLECT_ABOVE: i32 = 20;
+const COLLECT_BELOW: i32 = 32;
+
+/// One collection pass: pull what the live window holds, cache it, mesh what
+/// changed, and keep the horizon in step.
+#[allow(clippy::too_many_arguments)]
+fn collect(
+    df: &mut Session,
+    center: (i32, i32, i32),
+    opts: MeshOptions,
+    force: bool,
+    last_window: &mut Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))>,
+    horizon_sent: &mut bool,
+    mut library: Option<&mut TileLibrary>,
+    events: &Sender<Event>,
+) -> Result<()> {
+    // The game's window follows the character; a move changes what every
+    // local coordinate means, so the next request must be a full one.
+    let window_moved = df.refresh_window()?;
+    let view = df.view_center()?;
+    let bounds = df.window_bounds(view.2 - COLLECT_BELOW, view.2 + COLLECT_ABOVE);
+    let window = (
+        bounds.min_x, bounds.max_x, bounds.min_y,
+        bounds.max_y, bounds.min_z, bounds.max_z, df.shift(),
+    );
+    let moved = *last_window != Some(window);
+    *last_window = Some(window);
+
+    let arrived = df.fetch(bounds, force || moved)?;
+
+    // Chunks stay as the character travels, so the map paints in. Only what
+    // is far behind the camera is retired.
+    let keep = BlockBounds::under_ceiling(center.0, center.1, center.2, RETAIN_RADIUS, RETAIN_DEPTH);
+    let dropped = df.world.retain_within(keep);
+    if !dropped.is_empty() {
+        events.send(Event::Chunks(
+            dropped.iter().map(|&k| (k, MeshData::default())).collect(),
+        ))?;
+    }
+
+    if !arrived.is_empty() || !dropped.is_empty() {
+        events.send(Event::Coverage(grounded_blocks(&df.world)))?;
+    }
+    if !arrived.is_empty() {
+        df.persist(&arrived);
+        events.send(Event::Status(format!(
+            "{} blocks fetched, {} chunks held",
+            arrived.len(),
+            df.world.chunk_count()
+        )))?;
+        // A new block changes its neighbours' culling, so those remesh along
+        // with it.
+        remesh_touched(df, library.as_deref_mut(), opts, events, &arrived)?;
+    }
+
+    // The outer terrain needs the map's own surface to meet it, so it waits
+    // for the first blocks, and follows the window after.
+    if df.world.chunk_count() > 0 && (!*horizon_sent || window_moved) {
+        *horizon_sent = true;
+        match build_horizon(df) {
+            Ok(mesh) => events.send(Event::Horizon(mesh))?,
+            Err(e) => events.send(Event::Status(format!("no horizon: {e:#}")))?,
+        }
+    }
+    Ok(())
+}
+
+/// Blocks whose lowest loaded chunk is mostly solid: the fine data there
+/// reaches the ground, so the coarse horizon can give way. A column whose
+/// lowest chunk is sparse holds only canopy, and the ground under it is not
+/// loaded yet.
+fn grounded_blocks(world: &dwarf_eye_world::World) -> Vec<(i32, i32)> {
+    let mut lowest: std::collections::HashMap<(i32, i32), &dwarf_eye_world::Chunk> =
+        std::collections::HashMap::new();
+    for chunk in world.chunks() {
+        let entry = lowest.entry((chunk.block_x, chunk.block_y)).or_insert(chunk);
+        if chunk.z < entry.z {
+            *entry = chunk;
+        }
+    }
+    lowest
+        .into_iter()
+        .filter(|(_, chunk)| {
+            let filled = chunk.voxels.iter().filter(|v| !v.solid.is_empty()).count();
+            filled * 2 >= chunk.voxels.len()
+        })
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// How far from the camera chunks are kept, in blocks and levels. Wide, so a

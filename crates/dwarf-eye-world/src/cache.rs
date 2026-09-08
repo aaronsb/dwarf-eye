@@ -94,6 +94,11 @@ impl Cache {
         Ok(())
     }
 
+    /// Deletes one chunk's file, if present.
+    pub fn remove(&self, key: (i32, i32, i32)) {
+        let _ = fs::remove_file(self.path(key));
+    }
+
     /// Reads every chunk in the cache, with its absolute key.
     pub fn load_all(&self) -> Result<Vec<((i32, i32, i32), Vec<Voxel>)>> {
         let mut out = Vec::new();
