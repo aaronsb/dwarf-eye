@@ -33,8 +33,18 @@ pub const MAX_DISTANCE: f32 = 1200.0;
 pub const WEATHER_PERIOD: f32 = 2048.0;
 pub const BASE_PERIOD: f32 = 256.0;
 pub const DETAIL_PERIOD: f32 = 24.0;
-/// Wind, in tiles per second.
+/// Wind, in tiles per second. `DWARF_EYE_WIND=x,z` overrides it.
 pub const WIND: Vec2 = Vec2::new(0.9, 0.32);
+
+fn wind() -> Vec2 {
+    std::env::var("DWARF_EYE_WIND")
+        .ok()
+        .and_then(|spec| {
+            let (x, z) = spec.split_once(',')?;
+            Some(Vec2::new(x.trim().parse().ok()?, z.trim().parse().ok()?))
+        })
+        .unwrap_or(WIND)
+}
 
 const BASE_RESOLUTION: usize = 128;
 const DETAIL_RESOLUTION: usize = 32;
@@ -140,7 +150,7 @@ impl Default for Tuning {
             ambient_gain: 1.0,
             haze: 0.0006,
             cirrus_opacity: 0.5,
-            shadow_strength: 0.65,
+            shadow_strength: 0.85,
             steps: 64.0,
         }
     }
@@ -459,7 +469,7 @@ pub fn drive(
         camera.translation.z,
     );
 
-    state.params.wind += WIND * time.delta_secs();
+    state.params.wind += wind() * time.delta_secs();
     state.params.bottom = ground.0 + LAYER_BOTTOM;
     state.params.top = ground.0 + LAYER_TOP;
     state.params.cirrus_height = ground.0 + CIRRUS_HEIGHT;

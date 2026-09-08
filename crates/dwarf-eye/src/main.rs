@@ -36,7 +36,12 @@ use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
 
 /// How far around the camera to keep map loaded, in 16-tile blocks.
+/// `DWARF_EYE_RADIUS` overrides it.
 const LOAD_RADIUS: i32 = 5;
+
+fn load_radius() -> i32 {
+    std::env::var("DWARF_EYE_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(LOAD_RADIUS)
+}
 /// How many z-levels below the cut plane to keep loaded.
 const LOAD_DEPTH: i32 = 22;
 
@@ -153,7 +158,10 @@ fn setup(
         },
         // RAW_SUNLIGHT is pre-scattering, so the exposure has to be raised to
         // bring the scene back into range.
-        Exposure { ev100: 13.0 },
+        // DWARF_EYE_EV100 overrides it, for finding the right stop.
+        Exposure {
+            ev100: std::env::var("DWARF_EYE_EV100").ok().and_then(|v| v.parse().ok()).unwrap_or(13.0),
+        },
         Tonemapping::AcesFitted,
         // A dark sky gradient bands badly at 8 bits; dithering breaks up the
         // steps that otherwise read as seams.
@@ -417,7 +425,7 @@ fn request_blocks(
 
     let _ = bridge.tx.send(Command::Fetch {
         center,
-        radius: LOAD_RADIUS,
+        radius: load_radius(),
         depth: LOAD_DEPTH,
         opts: settings.mesh_options(),
         force,
