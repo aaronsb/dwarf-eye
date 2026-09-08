@@ -105,6 +105,26 @@ const SNAP: f32 = 5.0;
 /// more than one cell from the confirmed tile, so this is generous.
 const GROUND_RADIUS: i32 = 4;
 
+/// The longest gap between two moves the game drove that still reads as one
+/// run. A little over a poll apart is travel; further apart is two separate
+/// nudges, and turning the camera for a nudge would only make it seasick.
+const RUN_GAP: f32 = 1.2;
+
+/// Moves in a run before the camera turns for it. One move is a shove; two in
+/// quick succession is a direction of travel.
+const RUN_STEPS: usize = 2;
+
+/// How many recent moves the heading is drawn from.
+const RUN_MEMORY: usize = 4;
+
+/// How much less each older move counts than the one after it, so a corner is
+/// followed rather than averaged away.
+const RUN_DECAY: f32 = 0.5;
+
+/// The time constant of the turn onto a new heading: most of the swing happens
+/// inside it, and the tail of it dies away over about twice as long again.
+const TURN: f32 = 0.3;
+
 /// How often the walk thread reads the character's position.
 const POLL: Duration = Duration::from_millis(125);
 
@@ -318,6 +338,145 @@ fn obstructs(solid: Solid) -> bool {
     matches!(solid, Solid::Cube | Solid::Fortification)
 }
 
+// --------------------------------------------------------------- the heading
+
+/// What a position report means, set against the step the camera was waiting
+/// for. Everything that is not a step of ours is the game moving the character.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fix {
+    /// The first report after entering the mode: the camera drops into it.
+    First,
+    /// Our step has not landed yet.
+    Waiting,
+    /// Our step, taken.
+    Ordered,
+    /// The character has not moved.
+    Still,
+    /// The game moved the character without being asked: travel, a click on a
+    /// distant tile, arrow keys in the game's own window, being shoved.
+    Driven,
+}
+
+/// Reads a report against what the camera asked for. `pending` is the step
+/// waiting to land, as the tile it left and its horizontal direction.
+fn classify(confirmed: Option<IVec3>, pending: Option<(IVec3, IVec2)>, tile: IVec3) -> Fix {
+    let Some(confirmed) = confirmed else { return Fix::First };
+    if let Some((from, dir)) = pending {
+        if tile == from {
+            return Fix::Waiting;
+        }
+        // A staircase moves only the level, so it is matched on the column.
+        let landed = if dir == IVec2::ZERO {
+            tile.x == from.x && tile.y == from.y
+        } else {
+            tile.x == from.x + dir.x && tile.y == from.y + dir.y
+        };
+        if landed {
+            return Fix::Ordered;
+        }
+    }
+    if confirmed == tile { Fix::Still } else { Fix::Driven }
+}
+
+/// The direction of travel, read off a run of moves the game drove.
+///
+/// Levels are left out of it. A ramp or a staircase changes z without saying
+/// anything about which way the character is facing, and a run that crosses
+/// one has to survive the crossing, so only the ground plan counts.
+#[derive(Default)]
+struct Heading {
+    /// The last few moves, oldest first, as unit vectors east and south.
+    steps: Vec<Vec2>,
+    /// Seconds since the last move the game drove.
+    since: f32,
+    /// Whether a run is long enough to steer by.
+    live: bool,
+    /// Yaw velocity the ease is carrying.
+    turn: f32,
+}
+
+impl Heading {
+    /// Ages the run. A gap longer than `RUN_GAP` ends it, and the camera is
+    /// simply left facing wherever the turn had reached.
+    fn tick(&mut self, dt: f32) {
+        if self.steps.is_empty() {
+            return;
+        }
+        self.since += dt;
+        if self.since > RUN_GAP {
+            *self = Self::default();
+        }
+    }
+
+    /// A move the game drove, as a tile delta on the ground plan.
+    fn drove(&mut self, delta: IVec2) {
+        if self.since > RUN_GAP {
+            *self = Self::default();
+        }
+        self.since = 0.0;
+        let step = Vec2::new(delta.x as f32, delta.y as f32).normalize_or_zero();
+        // Straight up or down a staircase: the run carries on, but there is no
+        // direction in this one to add to it.
+        if step == Vec2::ZERO {
+            return;
+        }
+        self.steps.push(step);
+        if self.steps.len() > RUN_MEMORY {
+            self.steps.remove(0);
+        }
+        self.live = self.steps.len() >= RUN_STEPS;
+    }
+
+    /// The player took the wheel, so the run is over at once rather than
+    /// fading: walking with the client's own keys is the client's heading.
+    fn ordered(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The yaw the run points at, weighted toward the newest moves, or `None`
+    /// while nothing is live.
+    fn aim(&self) -> Option<f32> {
+        if !self.live {
+            return None;
+        }
+        let mut sum = Vec2::ZERO;
+        let mut weight = 1.0;
+        for step in self.steps.iter().rev() {
+            sum += *step * weight;
+            weight *= RUN_DECAY;
+        }
+        let sum = sum.normalize_or_zero();
+        if sum == Vec2::ZERO {
+            return None;
+        }
+        // Render x runs east and render z runs south, while yaw has north at
+        // zero and swings west as it grows.
+        Some((-sum.x).atan2(-sum.y))
+    }
+}
+
+/// An angle folded onto the short way round, in `-PI..=PI`.
+fn wrap(angle: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    (angle + PI).rem_euclid(TAU) - PI
+}
+
+/// Eases an angle toward another, critically damped: it comes round in about
+/// `TURN` seconds, never overshoots, and the result does not depend on the
+/// frame rate.
+fn ease_angle(yaw: f32, aim: f32, speed: &mut f32, dt: f32) -> f32 {
+    let omega = 2.0 / TURN;
+    let x = omega * dt;
+    let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+    let gap = wrap(yaw - aim);
+    // Aim for the nearest turn of the same heading, so the camera never takes
+    // the long way round.
+    let aim = yaw - gap;
+    let carried = (*speed + omega * gap) * dt;
+    *speed = (*speed - omega * carried) * decay;
+    aim + (gap + carried) * decay
+}
+
 // ------------------------------------------------------------------ the mode
 
 /// A step asked for and not yet seen in the game.
@@ -357,6 +516,8 @@ pub struct WalkMode {
     ground: Option<Ground>,
     /// A position report waiting to be reconciled.
     fix: Option<(IVec3, Ground)>,
+    /// The direction of travel while the game is doing the driving.
+    heading: Heading,
     /// Scripted legs still to walk, from the environment. Current first.
     drive: Vec<Leg>,
     /// Set once the environment has been read.
@@ -623,6 +784,9 @@ pub fn walk(
     let (mut transform, mut fly) = camera.into_inner();
     let dt = time.delta_secs();
 
+    // Ageing the run before the new report is read is what makes a gap end it:
+    // a report that arrives in time resets the clock straight afterwards.
+    walk.heading.tick(dt);
     reconcile(&mut walk);
 
     let (Some(confirmed), Some(origin)) = (walk.confirmed, walk.origin) else {
@@ -675,10 +839,20 @@ pub fn walk(
         }
     }
 
+    // While the game is driving a run of moves, the direction of travel owns
+    // the yaw: the mouse can still nod, but it cannot turn. When the run stops
+    // the yaw simply stays where the turn left it and the mouse has it back on
+    // its next movement.
+    let aim = if scripted { None } else { walk.heading.aim() };
     if buttons.pressed(MouseButton::Right) {
-        fly.yaw -= motion.delta.x * fly.sensitivity;
+        if aim.is_none() {
+            fly.yaw -= motion.delta.x * fly.sensitivity;
+        }
         fly.pitch = (fly.pitch - motion.delta.y * fly.sensitivity)
             .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
+    }
+    if let Some(aim) = aim {
+        fly.yaw = ease_angle(fly.yaw, aim, &mut walk.heading.turn, dt);
     }
     transform.rotation = Quat::from_euler(EulerRot::YXZ, fly.yaw, fly.pitch, 0.0);
 
@@ -800,10 +974,12 @@ pub fn walk(
         .to_string(),
     };
     let tile = confirmed - origin;
+    let facing = if aim.is_some() { "df" } else { "free" };
     // The eye's height against the ground it is riding, which is what says
     // whether a slope is being followed or cut through.
     walk.line = format!(
-        "walk    character tile ({}, {}, {})   eye {eye:.2} over ground {surface:.2}   {state}",
+        "walk    character tile ({}, {}, {})   eye {eye:.2} over ground {surface:.2}   \
+         heading: {facing}   {state}",
         tile.x, tile.y, tile.z
     );
 }
@@ -811,57 +987,49 @@ pub fn walk(
 /// Settles the camera against what the game says, once a position report is in.
 fn reconcile(walk: &mut WalkMode) {
     let Some((tile, ground)) = walk.fix.take() else { return };
+    let pending = walk.pending.as_ref().map(|p| (p.from, p.dir));
 
-    // The first fix after entering the mode drops the camera into the tile.
-    if walk.confirmed.is_none() {
-        walk.ground = Some(ground);
-        walk.cell = tile;
-        walk.offset = Vec2::splat(0.5);
-        walk.glide = Vec2::ZERO;
-        walk.moved(tile);
-        return;
-    }
-
-    match walk.pending.take() {
-        // Nothing has landed yet; keep waiting for it.
-        Some(pending) if tile == pending.from => {
+    match classify(walk.confirmed, pending, tile) {
+        // The first fix after entering the mode drops the camera into the tile.
+        Fix::First => {
             walk.ground = Some(ground);
-            walk.pending = Some(pending);
+            walk.cell = tile;
+            walk.offset = Vec2::splat(0.5);
+            walk.glide = Vec2::ZERO;
+            walk.moved(tile);
+        }
+        // Nothing has landed yet; keep waiting for it.
+        Fix::Waiting => {
+            walk.ground = Some(ground);
         }
         // Our step, confirmed. The camera is already in the cell; only the
-        // level is news, and it comes from a ramp.
-        Some(pending)
-            if pending.dir != IVec2::ZERO
-                && tile.x == pending.from.x + pending.dir.x
-                && tile.y == pending.from.y + pending.dir.y =>
-        {
+        // level is news, and it comes from a ramp or a staircase. The player is
+        // steering, so any run of the game's own is over.
+        Fix::Ordered => {
+            walk.pending = None;
+            walk.heading.ordered();
             walk.moved(tile);
             walk.jump(|w| {
                 w.ground = Some(ground);
                 w.cell = tile;
             });
         }
-        // A staircase, confirmed.
-        Some(pending)
-            if pending.dir == IVec2::ZERO && tile.x == pending.from.x && tile.y == pending.from.y =>
-        {
-            walk.moved(tile);
-            walk.jump(|w| {
-                w.ground = Some(ground);
-                w.cell = tile;
-            });
-        }
-        _ if walk.confirmed == Some(tile) => {
+        Fix::Still => {
+            walk.pending = None;
             walk.ground = Some(ground);
         }
-        _ => {
+        Fix::Driven => {
             // The game moved the character somewhere of its own accord, so any
             // step of ours is moot and the camera just goes along, keeping the
-            // player's place in the cell and their heading. A long jump —
-            // travel — is taken outright rather than slid through.
+            // player's place in the cell. A long jump — travel — is taken
+            // outright rather than slid through. Where such moves come one
+            // after another the camera also turns to face the way they lead.
             //
             // A scripted route, though, no longer means what it meant: it was
             // aimed from a tile the character has left, so it stops here.
+            let from = walk.confirmed.unwrap_or(tile);
+            walk.pending = None;
+            walk.heading.drove(IVec2::new(tile.x - from.x, tile.y - from.y));
             walk.abandon("the character was moved from outside");
             walk.blocked = [0.0; 9];
             walk.moved(tile);
@@ -915,6 +1083,184 @@ mod tests {
             assert!(height >= last, "the slope stepped back down on the way up");
             last = height;
         }
+    }
+
+    /// A step the camera ordered has to be told apart from the game moving the
+    /// character, because only the second kind turns the camera.
+    #[test]
+    fn a_step_we_ordered_is_not_the_game_driving() {
+        let here = IVec3::new(10, 20, 3);
+        let east = IVec2::new(1, 0);
+        // No confirmed tile yet: the very first report just places the camera.
+        assert_eq!(classify(None, None, here), Fix::First);
+        // Waiting on a step that has not landed.
+        assert_eq!(classify(Some(here), Some((here, east)), here), Fix::Waiting);
+        // The step, taken — the level may change under it, off a ramp.
+        let landed = IVec3::new(11, 20, 3);
+        assert_eq!(classify(Some(here), Some((here, east)), landed), Fix::Ordered);
+        assert_eq!(
+            classify(Some(here), Some((here, east)), IVec3::new(11, 20, 4)),
+            Fix::Ordered
+        );
+        // A staircase: the column stays, the level moves.
+        assert_eq!(
+            classify(Some(here), Some((here, IVec2::ZERO)), IVec3::new(10, 20, 4)),
+            Fix::Ordered
+        );
+        // Nothing moved at all.
+        assert_eq!(classify(Some(here), None, here), Fix::Still);
+        // Somewhere we never asked for, with a step out and without one.
+        assert_eq!(classify(Some(here), None, IVec3::new(10, 19, 3)), Fix::Driven);
+        assert_eq!(
+            classify(Some(here), Some((here, east)), IVec3::new(10, 19, 3)),
+            Fix::Driven
+        );
+        // Travel, a long way off in one report.
+        assert_eq!(classify(Some(here), None, IVec3::new(60, 90, 3)), Fix::Driven);
+    }
+
+    /// Turns the yaw a heading aims at back into the tile step it faces, so the
+    /// tests can talk in compass directions.
+    fn faces(yaw: f32) -> IVec2 {
+        let forward = Quat::from_euler(EulerRot::YXZ, yaw, 0.0, 0.0) * Vec3::NEG_Z;
+        IVec2::new(forward.x.round() as i32, forward.z.round() as i32)
+    }
+
+    /// One shove is not a direction of travel; two in quick succession are.
+    #[test]
+    fn a_run_needs_more_than_one_move_to_steer_by() {
+        let mut heading = Heading::default();
+        heading.drove(IVec2::new(1, 0));
+        assert_eq!(heading.aim(), None, "a single move turned the camera");
+        heading.tick(0.125);
+        heading.drove(IVec2::new(1, 0));
+        assert_eq!(faces(heading.aim().expect("two moves make a run")), IVec2::new(1, 0));
+    }
+
+    /// The heading follows a corner rather than averaging it away, and old
+    /// moves fall out of memory entirely.
+    #[test]
+    fn the_heading_leans_on_the_newest_moves() {
+        let mut heading = Heading::default();
+        for step in [IVec2::new(0, -1), IVec2::new(0, -1), IVec2::new(1, 0), IVec2::new(1, 0)] {
+            heading.tick(0.125);
+            heading.drove(step);
+        }
+        // Two north then two east: an even average would face north-east, the
+        // weighting has to have swung it past that toward east.
+        let yaw = heading.aim().expect("a run of four moves");
+        let forward = Quat::from_euler(EulerRot::YXZ, yaw, 0.0, 0.0) * Vec3::NEG_Z;
+        assert!(forward.x > -forward.z, "the corner was averaged away: {forward:?}");
+        // Two more east and the north is out of memory altogether.
+        for _ in 0..2 {
+            heading.tick(0.125);
+            heading.drove(IVec2::new(1, 0));
+        }
+        assert_eq!(faces(heading.aim().unwrap()), IVec2::new(1, 0));
+    }
+
+    /// A gap ends the run, and the next move starts a fresh one.
+    #[test]
+    fn a_gap_ends_the_run() {
+        let mut heading = Heading::default();
+        heading.drove(IVec2::new(1, 0));
+        heading.tick(0.125);
+        heading.drove(IVec2::new(1, 0));
+        assert!(heading.aim().is_some());
+        // Aged past the window a frame at a time, as the system does.
+        for _ in 0..((RUN_GAP / 0.016) as i32 + 2) {
+            heading.tick(0.016);
+        }
+        assert_eq!(heading.aim(), None, "the run outlived its gap");
+        // One move on its own does not bring it back.
+        heading.drove(IVec2::new(0, 1));
+        assert_eq!(heading.aim(), None);
+        heading.tick(0.125);
+        heading.drove(IVec2::new(0, 1));
+        assert_eq!(faces(heading.aim().unwrap()), IVec2::new(0, 1), "the fresh run kept the old moves");
+    }
+
+    /// A ramp or a staircase changes the level without saying anything about
+    /// the way the character faces, and must not break a run that crosses it.
+    #[test]
+    fn levels_do_not_break_the_run() {
+        let mut heading = Heading::default();
+        // East up a ramp, then straight up a staircase, then east again.
+        for step in [IVec2::new(1, 0), IVec2::new(1, 0), IVec2::ZERO, IVec2::new(1, 0)] {
+            heading.tick(0.125);
+            heading.drove(step);
+        }
+        assert_eq!(faces(heading.aim().expect("the run survived the level change")), IVec2::new(1, 0));
+        // The staircase held the run open past what would otherwise be a gap.
+        let mut stairs = Heading::default();
+        stairs.drove(IVec2::new(1, 0));
+        stairs.tick(0.125);
+        stairs.drove(IVec2::new(1, 0));
+        for _ in 0..8 {
+            stairs.tick(0.125);
+            stairs.drove(IVec2::ZERO);
+        }
+        assert!(stairs.aim().is_some(), "climbing in place dropped the heading");
+    }
+
+    /// The player's own keys are the player's heading, so a confirmed step of
+    /// ours ends whatever run the game had going.
+    #[test]
+    fn our_own_step_hands_the_heading_back() {
+        let mut heading = Heading::default();
+        heading.drove(IVec2::new(1, 0));
+        heading.tick(0.125);
+        heading.drove(IVec2::new(1, 0));
+        assert!(heading.aim().is_some());
+        heading.ordered();
+        assert_eq!(heading.aim(), None);
+    }
+
+    /// The turn eases: most of the swing inside `TURN`, all of it shortly
+    /// after, and never a step past the heading it is aiming at. The result
+    /// must not depend on the frame rate either, so both rates are walked.
+    #[test]
+    fn the_turn_comes_round_without_overshooting() {
+        for aim in [1.2f32, -1.2, 3.0, -3.0] {
+            for dt in [1.0 / 60.0, 1.0 / 15.0] {
+                let (mut yaw, mut speed) = (0.0f32, 0.0f32);
+                let whole = wrap(0.0 - aim);
+                let (mut near, mut done) = (0.0, 0.0);
+                let frames = (1.0 / dt) as i32;
+                for frame in 1..=frames {
+                    yaw = ease_angle(yaw, aim, &mut speed, dt);
+                    let left = wrap(yaw - aim);
+                    assert!(
+                        left * whole >= -1e-3,
+                        "the turn overshot at frame {frame}: yaw {yaw}, aim {aim}"
+                    );
+                    let at = frame as f32 * dt;
+                    if at <= TURN {
+                        near = 1.0 - left.abs() / whole.abs();
+                    }
+                    done = 1.0 - left.abs() / whole.abs();
+                }
+                assert!(near > 0.45, "only {near:.2} of the way round after {TURN}s at dt {dt}");
+                assert!(done > 0.97, "still {:.2} short after a second at dt {dt}", 1.0 - done);
+            }
+        }
+    }
+
+    /// A turn across the compass seam behind the camera goes the short way, not
+    /// the long way round.
+    #[test]
+    fn the_turn_takes_the_short_way_round() {
+        use std::f32::consts::PI;
+        // Both a little to one side of due south, on opposite sides of the cut.
+        let (mut yaw, mut speed) = (PI - 0.2, 0.0f32);
+        let aim = -PI + 0.2;
+        for _ in 0..60 {
+            let before = yaw;
+            yaw = ease_angle(yaw, aim, &mut speed, 1.0 / 60.0);
+            assert!(yaw >= before, "the turn set off the long way round: {before} to {yaw}");
+        }
+        assert!(wrap(yaw - aim).abs() < 0.02, "the turn did not arrive: {yaw}");
+        assert_eq!(faces(yaw), IVec2::new(0, 1), "it did not end up facing south");
     }
 
     #[test]
