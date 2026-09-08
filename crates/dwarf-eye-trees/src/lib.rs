@@ -210,6 +210,26 @@ mod tests {
     }
 
     #[test]
+    fn no_wood_stands_above_the_foliage() {
+        // A leader that outgrows its crown reads as a bare pole with a tuft.
+        for preset in [Preset::Oak, Preset::Spruce, Preset::Birch, Preset::Pine] {
+            let mut params = TreeParams::preset(preset);
+            for height in [6.0f32, 10.0, 20.0] {
+                params.height = height;
+                let tree = grow(&params, 11, None);
+                let wood = tree.segments.iter().fold(f32::MIN, |t, s| t.max(s.a.y).max(s.b.y));
+                // Not just under the crown's geometric top: under the dense
+                // part of it, or the stub still shows against the sky.
+                let limit = tree.crown_top - tree.dome() * 0.5;
+                assert!(
+                    wood <= limit + 0.01,
+                    "{preset:?} at {height}: wood to {wood}, dense crown to {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn meshing_culls_interior_faces() {
         // A solid 4x4x4 block has 6 sides; greedy merging should give 12
         // triangles, not 6 per voxel face.
