@@ -9,7 +9,7 @@ pub mod raws;
 
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
-use raws::{GraphicsIndex, SpriteRef};
+use raws::{GraphicsIndex, SpriteRef, TreeGrowth};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -127,6 +127,8 @@ impl Grid {
 /// Sprite sheets and the index that addresses them.
 pub struct Art {
     pub index: GraphicsIndex,
+    /// How each species grows, from the plant object raws.
+    pub growth: HashMap<String, TreeGrowth>,
     sheets: HashMap<usize, RgbaImage>,
     cache: HashMap<(usize, u32, u32), Sprite>,
 }
@@ -173,7 +175,12 @@ impl Art {
             index.load_dir(dir)?;
         }
 
-        Ok(Self { index, sheets: HashMap::new(), cache: HashMap::new() })
+        Ok(Self {
+            growth: raws::load_growth(&vanilla),
+            index,
+            sheets: HashMap::new(),
+            cache: HashMap::new(),
+        })
     }
 
     pub fn page_count(&self) -> usize {

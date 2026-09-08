@@ -286,3 +286,93 @@ impl GraphicsIndex {
         }
     }
 }
+
+/// A species' tree growth tokens, from the plant object raws.
+///
+/// DF grows every tree from these, and reading them is how a renderer can put
+/// limbs where the species would put them instead of where a generic rule
+/// would. Radii are DF's own units; density is a percentage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeGrowth {
+    pub max_trunk_height: u32,
+    pub trunk_branching: u32,
+    pub branch_density: u32,
+    pub branch_radius: u32,
+    pub heavy_branch_density: u32,
+    pub heavy_branch_radius: u32,
+    pub max_trunk_diameter: u32,
+}
+
+/// Reads the growth tokens for every plant under a `data/vanilla/*/objects`
+/// tree, keyed by plant raw id.
+pub fn load_growth(vanilla: &Path) -> HashMap<String, TreeGrowth> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(vanilla) else { return out };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path().join("objects")))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        let mut paths: Vec<PathBuf> = files
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("plant_") && n.ends_with(".txt"))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            read_growth(&text, &mut out);
+        }
+    }
+    out
+}
+
+fn read_growth(text: &str, out: &mut HashMap<String, TreeGrowth>) {
+    let mut plant: Option<String> = None;
+    for line in text.lines() {
+        for fields in tags(line) {
+            let value = |v: &str| v.parse::<u32>().unwrap_or(0);
+            match fields.as_slice() {
+                ["PLANT", id] => plant = Some((*id).to_string()),
+                [name, v] => {
+                    let Some(id) = plant.as_ref() else { continue };
+                    let slot = out.entry(id.clone()).or_default();
+                    match *name {
+                        "MAX_TRUNK_HEIGHT" => slot.max_trunk_height = value(v),
+                        "TRUNK_BRANCHING" => slot.trunk_branching = value(v),
+                        "BRANCH_DENSITY" => slot.branch_density = value(v),
+                        "BRANCH_RADIUS" => slot.branch_radius = value(v),
+                        "HEAVY_BRANCH_DENSITY" => slot.heavy_branch_density = value(v),
+                        "HEAVY_BRANCH_RADIUS" => slot.heavy_branch_radius = value(v),
+                        "MAX_TRUNK_DIAMETER" => slot.max_trunk_diameter = value(v),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_tokens_that_shape_a_tree() {
+        let mut out = HashMap::new();
+        read_growth(
+            "[PLANT:WILLOW]\n\t[BRANCH_DENSITY:60]\n\t[BRANCH_RADIUS:3]\n[PLANT:PINE]\n\t[BRANCH_RADIUS:2]\n",
+            &mut out,
+        );
+        assert_eq!(out["WILLOW"].branch_density, 60);
+        assert_eq!(out["WILLOW"].branch_radius, 3);
+        assert_eq!(out["PINE"].branch_radius, 2);
+        assert_eq!(out["PINE"].branch_density, 0);
+    }
+}
