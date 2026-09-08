@@ -403,13 +403,18 @@ impl Forest {
                     loaded += 1;
                 }
                 eprintln!(
-                    "tree {:?} species {species} envelope z {}..{} truncated {} loaded top {loaded} voxels y {}..{}",
+                    "tree {:?} species {species} envelope z {}..{} truncated {} loaded top {loaded} \
+                     voxels y {}..{} leaf {} bark {} height {} cap {:.1}",
                     env.origin,
                     env.z0,
                     env.z1,
                     env.truncated,
                     grown.gy as f32 / DETAIL as f32,
                     (grown.gy + grown.ny) as f32 / DETAIL as f32,
+                    grown.leaf_voxels,
+                    grown.bark_voxels,
+                    env.height(),
+                    crate::tree::cap_radius(&env),
                 );
             }
             Arc::new(grown)

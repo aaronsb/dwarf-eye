@@ -210,6 +210,26 @@ mod tests {
     }
 
     #[test]
+    fn no_wood_stands_above_the_foliage() {
+        // A leader that outgrows its crown reads as a bare pole with a tuft.
+        for preset in [Preset::Oak, Preset::Spruce, Preset::Birch, Preset::Pine] {
+            let mut params = TreeParams::preset(preset);
+            for height in [6.0f32, 10.0, 20.0] {
+                params.height = height;
+                let tree = grow(&params, 11, None);
+                let wood = tree.segments.iter().fold(f32::MIN, |t, s| t.max(s.a.y).max(s.b.y));
+                // Not just under the crown's geometric top: under the dense
+                // part of it, or the stub still shows against the sky.
+                let limit = tree.crown_top - tree.dome() * 0.5;
+                assert!(
+                    wood <= limit + 0.01,
+                    "{preset:?} at {height}: wood to {wood}, dense crown to {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn meshing_culls_interior_faces() {
         // A solid 4x4x4 block has 6 sides; greedy merging should give 12
         // triangles, not 6 per voxel face.
@@ -226,5 +246,27 @@ mod tests {
         }
         let tree = VoxelTree { voxels, streamers: Vec::new(), voxels_per_tile: 1 };
         assert_eq!(mesh(&tree).indices.len() / 3, 12);
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// What a preset costs at a given height, for comparing the game against
+    /// the lab. `cargo test -p dwarf-eye-trees -- --nocapture reference`
+    #[test]
+    fn leaf_voxels_by_height() {
+        for height in [8.0f32, 10.0, 12.0, 15.0, 20.0] {
+            for preset in [Preset::Oak, Preset::Spruce] {
+                let mut params = TreeParams::preset(preset);
+                params.height = height;
+                let mut leaf = 0;
+                for seed in 0..4u64 {
+                    leaf += rasterise(&grow(&params, seed, None), 4).counts().leaf;
+                }
+                println!("{} at height {height}: {} leaf voxels", preset.name(), leaf / 4);
+            }
+        }
     }
 }

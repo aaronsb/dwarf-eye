@@ -59,6 +59,15 @@ pub struct Skeleton {
     pub height: f32,
 }
 
+impl Skeleton {
+    /// How deep the crown's dome is, in tiles: the band below [`Self::crown_top`]
+    /// over which foliage thins to tufts. The rasteriser fades leaves across it,
+    /// and wood is kept out of most of it.
+    pub fn dome(&self) -> f32 {
+        ((self.crown_top - self.crown_center.y) * 0.55).max(0.1)
+    }
+}
+
 /// Distance grown between skeleton segments, in tiles.
 const STEP: f32 = 0.5;
 
@@ -116,6 +125,7 @@ pub fn grow(params: &TreeParams, seed: u64, envelope: Option<&Envelope>) -> Skel
         normalise_height(&mut skeleton, params.height);
     }
     measure(&mut skeleton);
+    trim_bare_wood(&mut skeleton);
     // Streamers need the crown measured first: they hang from its edge and its
     // underside, and how far out a cluster sits decides whether it grows one.
     hang_streamers(&mut skeleton, &mut rng);
@@ -581,6 +591,39 @@ fn top_of(skeleton: &Skeleton) -> f32 {
         }
     }
     top
+}
+
+/// Cuts back wood that stands above the foliage.
+///
+/// A leader that outgrows its own crown reads as a bare pole with a tuft on
+/// top. Trimming to the highest leaf leaves a deciduous leader inside the dome
+/// and a conifer's spike ending in its tip tuft, which is what each should do.
+fn trim_bare_wood(skeleton: &mut Skeleton) {
+    if skeleton.leaves.is_empty() {
+        return;
+    }
+    // Not the crown's geometric top: the dome up there is tufts and gaps, and
+    // wood taken that far reads as a bare stub standing on the canopy.
+    let top = skeleton.crown_top - skeleton.dome() * 0.6;
+    skeleton.segments.retain_mut(|s| {
+        let low = s.a.y.min(s.b.y);
+        if low >= top {
+            return false;
+        }
+        // Clip the end that pokes out, keeping the taper.
+        let keep = |end: Vec3| ((top - low) / (end.y - low).max(1e-4)).clamp(0.0, 1.0);
+        if s.b.y > top {
+            let t = keep(s.b);
+            s.b = s.a.lerp(s.b, t);
+            s.radius_b *= t.max(0.2);
+        }
+        if s.a.y > top {
+            let t = keep(s.a);
+            s.a = s.b.lerp(s.a, t);
+            s.radius_a *= t.max(0.2);
+        }
+        true
+    });
 }
 
 /// Distance from the crown's centre with the vertical axis scaled, so a tall

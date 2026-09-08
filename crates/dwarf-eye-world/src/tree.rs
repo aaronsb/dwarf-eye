@@ -316,15 +316,15 @@ pub fn extent(env: &Envelope) -> f32 {
     reach
 }
 
-/// The crown's typical radius in tiles, which is what the species is grown to.
+/// The widest the game says this tree's crown gets, in tiles.
 ///
-/// [`extent`] is a worst case and makes a fat blob of every leaning tree; the
-/// mean of the levels the game calls crown is the size it actually reports.
-pub fn spread(env: &Envelope) -> f32 {
+/// A ceiling on the preset's own spread, not a size to grow to.
+pub fn cap_radius(env: &Envelope) -> f32 {
     let from = (env.crown_z0 - env.z0).max(0) as usize;
-    let levels = &env.radius[from.min(env.radius.len().saturating_sub(1))..];
-    let wide: f32 = levels.iter().sum();
-    (wide / levels.len().max(1) as f32).max(1.0)
+    env.radius[from.min(env.radius.len().saturating_sub(1))..]
+        .iter()
+        .copied()
+        .fold(1.0f32, f32::max)
 }
 
 /// Extra levels a crown may rise into, a quarter of its own depth.
@@ -379,7 +379,7 @@ pub fn envelope(env: &Envelope) -> trees::Envelope {
 /// knows about this tree then overrides them.
 pub fn params(
     env: &Envelope,
-    growth: TreeGrowth,
+    _growth: TreeGrowth,
     habit: Habit,
     library: &mut TileLibrary,
 ) -> trees::TreeParams {
@@ -398,34 +398,33 @@ pub fn params(
         }
     };
 
-    params.height = (env.height() + headroom(env)) as f32;
-    // A tall tree carries a thicker trunk, kept under a tile across either way.
-    let tall = ((env.height() - 2) as f32 / 12.0).clamp(0.0, 1.0);
-    params.trunk_width = 0.32 + 0.38 * tall;
+    // Everything below this line is the whole of what the game contributes to
+    // the shape: how tall the tree is and how wide it may be. The preset keeps
+    // its own clear trunk, crown depth, dome and porosity, so a tree of this
+    // species at this height is the tree the lab draws at that height.
+    let natural_height = params.height;
+    let natural_limb = params.limb_frac;
+    let height = env.height() as f32;
+    params.height = height;
 
-    // Where the crown starts is the game's own answer, not the preset's.
-    let clear = (env.crown_z0 - env.z0) as f32 / params.height.max(1.0);
-    params.clear_frac = clear.clamp(0.08, 0.7);
+    // The trunk thickens with the tree, in the preset's own proportion.
+    params.trunk_width *= (height / natural_height).clamp(0.45, 2.2);
 
-    // Limbs reach for the extent the game gives, so the preset grows to this
-    // tree's size rather than pressing against the bounds.
-    params.limb_frac = (spread(env) * 0.75 / params.height.max(1.0)).clamp(0.12, 0.4);
+    // The radius is a cap, never a target. A tree DF says is slim grows a
+    // narrower crown; one it gives room to keeps the preset's own spread.
+    let cap = cap_radius(env) / height.max(1.0);
+    params.limb_frac = natural_limb.min(cap.max(0.08));
 
-    // DF's branch density is a percentage; it decides how full the crown is and
-    // how much light comes through a leaf face.
-    if growth.branch_density > 0 {
-        let d = (growth.branch_density as f32 / 100.0).clamp(0.0, 1.0);
-        params.leaf_density = (0.34 + 0.34 * d).clamp(0.3, 0.68);
-        params.cutout_openness = (0.52 - 0.24 * d).clamp(0.22, 0.55);
-    }
-    if growth.max_trunk_diameter > 1 {
-        params.trunk_width = params.trunk_width.max(growth.max_trunk_diameter as f32 * 0.45);
-    }
-
-    let leaf: Vec<trees::Rgb> =
-        library.leaf_tones(env.species, 3).into_iter().map(|c| trees::Rgb(c[0], c[1], c[2])).collect();
-    let bark: Vec<trees::Rgb> =
-        library.bark_tones(env.species, 2).into_iter().map(|c| trees::Rgb(c[0], c[1], c[2])).collect();
+    let leaf: Vec<trees::Rgb> = library
+        .leaf_tones(env.species, 3)
+        .into_iter()
+        .map(|c| trees::Rgb(c[0], c[1], c[2]))
+        .collect();
+    let bark: Vec<trees::Rgb> = library
+        .bark_tones(env.species, 2)
+        .into_iter()
+        .map(|c| trees::Rgb(c[0], c[1], c[2]))
+        .collect();
     // `leaf_tones` hands back the darkest first, so the last is the lit one.
     let tip = leaf.last().copied().unwrap_or(trees::Rgb(132, 172, 58));
     if !leaf.is_empty() {

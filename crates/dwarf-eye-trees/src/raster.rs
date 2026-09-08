@@ -116,7 +116,7 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
     // The crown ends in a dome: over the top fifth of it the leaves thin to
     // tufts, so no tree finishes in a flat slab of foliage.
     let apex = skeleton.crown_top * scale;
-    let dome = ((skeleton.crown_top - skeleton.crown_center.y) * scale * 0.55).max(1.0);
+    let dome = (skeleton.dome() * scale).max(1.0);
 
     for cluster in &skeleton.leaves {
         let center = cluster.center * scale;
