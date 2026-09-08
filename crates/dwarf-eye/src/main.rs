@@ -89,13 +89,15 @@ struct ViewSettings {
     show_hidden: bool,
     /// Set once the first map position arrives, so the camera starts on the map.
     placed: bool,
+    /// The player's level at connect, where a cut plane starts from.
+    player_z: i32,
 }
 
 impl Default for ViewSettings {
     fn default() -> Self {
         // Adventure mode leaves nearly the whole map undiscovered, so drawing
         // only what the player has seen shows almost nothing. Start revealed.
-        Self { z_ceiling: i32::MAX, show_hidden: true, placed: false }
+        Self { z_ceiling: i32::MAX, show_hidden: true, placed: false, player_z: 0 }
     }
 }
 
@@ -322,13 +324,17 @@ fn drain_worker(
                         Transform::from_translation(target + Vec3::new(0.0, 18.0, 28.0) * back)
                             .looking_at(target, Vec3::Y);
                 }
-                // DWARF_EYE_Z_OFFSET drops the starting cut plane, for looking
-                // straight into the underground rather than at the surface.
-                let offset: i32 = std::env::var("DWARF_EYE_Z_OFFSET")
+                // No cut plane by default: the whole volume renders, so trees
+                // are never sliced by the view. DWARF_EYE_Z_OFFSET starts one
+                // relative to the player, for looking into the underground.
+                settings.player_z = center.2;
+                settings.z_ceiling = match std::env::var("DWARF_EYE_Z_OFFSET")
                     .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(CEILING_ABOVE_PLAYER);
-                settings.z_ceiling = center.2 + offset;
+                    .and_then(|v| v.parse::<i32>().ok())
+                {
+                    Some(offset) => center.2 + offset,
+                    None => i32::MAX,
+                };
                 ground.0 = center.2 as f32 * Z_SCALE;
                 settings.placed = true;
             }
@@ -498,11 +504,16 @@ fn handle_input(
 
     let mut changed = false;
 
+    // With no cut plane, the first press brings one in just above the player.
     if keys.just_pressed(KeyCode::BracketLeft) {
-        settings.z_ceiling -= 1;
+        settings.z_ceiling = if settings.z_ceiling == i32::MAX {
+            settings.player_z + CEILING_ABOVE_PLAYER
+        } else {
+            settings.z_ceiling - 1
+        };
         changed = true;
     }
-    if keys.just_pressed(KeyCode::BracketRight) {
+    if keys.just_pressed(KeyCode::BracketRight) && settings.z_ceiling != i32::MAX {
         settings.z_ceiling += 1;
         changed = true;
     }

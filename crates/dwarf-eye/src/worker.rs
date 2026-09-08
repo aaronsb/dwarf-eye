@@ -253,7 +253,7 @@ fn build_horizon(df: &mut Session) -> Result<MeshData> {
 
 /// Levels collected around the character: the window is fetched whole in x/y,
 /// and this deep in z, so everything Dwarf Fortress discloses is kept.
-const COLLECT_ABOVE: i32 = 20;
+const COLLECT_ABOVE: i32 = 200;
 const COLLECT_BELOW: i32 = 32;
 
 /// One collection pass: pull what the live window holds, cache it, mesh what
@@ -349,7 +349,7 @@ fn grounded_blocks(world: &dwarf_eye_world::World) -> Vec<(i32, i32)> {
 /// How far from the camera chunks are kept, in blocks and levels. Wide, so a
 /// walk leaves the land behind it standing.
 const RETAIN_RADIUS: i32 = 40;
-const RETAIN_DEPTH: i32 = 60;
+const RETAIN_DEPTH: i32 = 120;
 
 /// Remeshes the chunks that arrived and every loaded neighbour of theirs.
 fn remesh_touched(
