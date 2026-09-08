@@ -121,7 +121,7 @@ Four treatments, chosen from `TiletypeShape`:
 | Extrude | trunks, cap walls | full-height mask |
 | Thin extrude | branches, twigs | a slab through the middle |
 | Billboard | saplings, shrubs, boulders | two crossed vertical planes |
-| Flat tile | floors, pebbles | a textured slab *(not wired yet)* |
+| Flat tile | floors, pebbles | a textured slab from the atlas |
 
 Caps come from vertical continuity: a trunk with more trunk above it has no
 visible top, so that face is skipped. Models are cached per tiletype, species
@@ -195,12 +195,12 @@ Sky colour comes from Bevy's Bruneton atmosphere (Rayleigh and Mie scattering),
 raymarched rather than sampled from lookup textures. The sun is a real
 32-arcminute disk, and the same sky lights the scene through an environment map,
 which is what makes shade under a tree read as sky-blue rather than black.
-Light shafts need no deferred pipeline — a `VolumetricLight` on the sun and a
-`VolumetricFog` on the camera are enough.
+Light shafts are a fullscreen pass of our own (`god_rays.rs`), lit by the shadow
+cascades and the baked cloud shadow map, with density driven by the weather.
 
 Stars are one mesh of emissive quads on a sphere, spun by the clock and faded by
-the sun's elevation. They sit at 620 units because the camera's default far
-plane is 1000; past that they are simply clipped away.
+the sun's elevation. The field is recentred on the camera every frame, so it
+never parallaxes against the land.
 
 ### Clouds
 
@@ -318,9 +318,7 @@ The pink is rock salt. That one is DF's own colour, and it is correct.
 - Fortifications draw as plain cubes.
 - Water and magma get vertex alpha, but the material is opaque, so they render
   solid.
-- Sprite-derived models are 98.8% of triangles (`cargo run --release -p
-  dwarf-eye-world --example budget`); canopies as merged volumes are in
-  progress.
+- Shrubs, saplings and dead trees are still crossed billboards; the tree crate
+  will grow them (issue #1).
 - Cached chunks far from the camera stay at full detail; a mid LOD is planned.
-- The coarse horizon has no rivers or sites yet, and meets the fine map with a
-  bare step.
+- The coarse horizon meets the fine map with a bare step (issue #9).
