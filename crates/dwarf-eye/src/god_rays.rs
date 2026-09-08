@@ -163,7 +163,7 @@ fn drive(
     let low_sun = 1.0 - (elevation * 4.0).min(1.0);
     rays.density = over
         .density
-        .unwrap_or(0.005 + low_sun * 0.008 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002);
+        .unwrap_or(0.006 + low_sun * 0.014 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002);
     let height = 60.0 - 44.0 * fog.clamp(0.0, 1.0);
     rays.falloff = over.falloff.unwrap_or(1.0 / height);
     rays.g = over.g.unwrap_or(0.6);
@@ -175,7 +175,8 @@ fn drive(
     // No sun, no shafts.
     let sun = clock.sun_direction();
     let daylight = (sun.y * 6.0).clamp(0.0, 1.0);
-    rays.strength = over.strength.unwrap_or(0.35) * daylight;
+    // Shafts read strongest when the sun is low and the light comes in sideways.
+    rays.strength = over.strength.unwrap_or(0.45 + 0.35 * low_sun) * daylight;
 
     if let Some(material) = materials.get(&terrain.0) {
         let u = &material.extension.uniform;
