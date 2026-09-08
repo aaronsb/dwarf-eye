@@ -198,9 +198,25 @@ which is what makes shade under a tree read as sky-blue rather than black.
 Light shafts are a fullscreen pass of our own (`god_rays.rs`), lit by the shadow
 cascades and the baked cloud shadow map, with density driven by the weather.
 
-Stars are one mesh of emissive quads on a sphere, spun by the clock and faded by
-the sun's elevation. The field is recentred on the camera every frame, so it
-never parallaxes against the land.
+Stars are one mesh of unlit quads on a sphere, spun by the clock and faded by
+the sun's elevation. They sit at 20000 units, beyond the horizon mesh and inside
+the camera's far plane; nearer than the terrain they show through distant hills.
+Unlit means their colour comes from `base_color` and the vertex attribute alone.
+The lit path's `emissive` is never read, which also keeps them clear of the
+exposure, so they hold steady while the scene's own stop opens.
+
+Night is a second directional light on the far side of the sun's arc, dim and
+cool, with no shadow cascades of its own. It lags the sun by the moon's phase,
+which Dwarf Fortress's 28-day month supplies, so a full moon rises as the sun
+sets. Under it sits a starlight ambient floor, and over both an exposure metered
+off whichever light is up: the daylit scene keeps its stop exactly, and night
+opens about five. The sun's own light fades out three degrees either side of the
+horizon rather than switching off, so nothing is lit sideways by a set sun.
+
+`DWARF_EYE_HOUR=22` (also `21:30` or `21.5`) pins the hour the view is lit at
+and leaves the game's clock where the player left it, the way to look at night
+without stepping the world. The date stays the game's own, so the season and the
+moon's phase are real.
 
 ### Clouds
 

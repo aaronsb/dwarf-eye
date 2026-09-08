@@ -167,6 +167,24 @@ fn sun_transmittance(r: f32, mu: f32) -> vec3<f32> {
 }
 #endif
 
+// The sky's brightest directional light. Bevy sorts the lights by their shadow
+// flags rather than by entity, so with a moon in the scene index 0 is as likely
+// to be the moon as the sun; the clouds take their light from whichever is
+// brighter, which at night is the moon.
+fn brightest_light() -> u32 {
+    var best = 0u;
+    var best_lum = -1.0;
+    for (var i = 0u; i < lights.n_directional_lights; i = i + 1u) {
+        let c = lights.directional_lights[i].color.rgb;
+        let lum = c.r + c.g + c.b;
+        if lum > best_lum {
+            best_lum = lum;
+            best = i;
+        }
+    }
+    return best;
+}
+
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     let t = 2.0 * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
@@ -193,7 +211,7 @@ fn sky_radiance(direction: vec3<f32>, diffuse: bool) -> vec3<f32> {
     }
 #endif
     // No sky map: a pale blue fraction of the sun.
-    return lights.directional_lights[0].color.rgb * vec3(0.05, 0.07, 0.10);
+    return lights.directional_lights[brightest_light()].color.rgb * vec3(0.05, 0.07, 0.10);
 }
 
 // Interleaved gradient noise, to break the march into grain rather than bands.
@@ -239,7 +257,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     t1 = min(t1, t_scene);
 
-    let light = lights.directional_lights[0];
+    let light = lights.directional_lights[brightest_light()];
     let sun = light.direction_to_light;
     var sun_radiance = light.color.rgb;
 #ifdef ATMOSPHERE

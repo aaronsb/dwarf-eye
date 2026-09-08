@@ -22,7 +22,7 @@ origin, so the rays read parallel.
 `Tonemapping::AcesFitted`, `DebandDither` and `Bloom::NATURAL`.
 
 `stars.rs:build_star_mesh` makes one mesh of 1800 emissive quads on a sphere of
-radius 620, each billboarded toward the centre, brightness and warmth baked into
+radius 20000, each billboarded toward the centre, brightness and warmth baked into
 vertex colour, from an LCG seeded `0x5EED5741` so the sky is the same every run.
 `stars.rs:drive` spins the field by the day fraction about an axis tilted
 `AXIS_TILT` 0.62 radians, recentres it on the camera every frame, and fades it
@@ -36,8 +36,16 @@ with `(-sun.y * 6).clamp(0, 1)`.
   parallax choice rather than a range limit. The camera's far plane is 40000.
 - The environment light is raised above the physical default because there is no
   bounce lighting to fill the shadows.
-- Ambient at night is the environment map plus star emissive. There is no moon
-  light and no emissive material path, so a night scene is black. Issue #14.
+- Night: a second directional light without shadow cascades lags the sun by the
+  moon's phase from DF's 28-day month (`sky.rs:moon_phase`), 350 lux at full; a
+  cool ambient floor weighted by `Clock::night` and held against the exposure;
+  exposure metered off whichever light is up (day ev100 13, full-moon night
+  8.2, no moon 7.6), eased with a 0.7 s time constant. The sun's illuminance
+  fades over 3 degrees either side of the horizon. `DWARF_EYE_HOUR=hh[:mm]`
+  pins the hour for lighting and disables the clock keys.
+- Shaders that need "the sun" scan for the brightest directional light; Bevy
+  sorts a shadowless moon to index 0.
+- Emissive materials are still a follow-up (issue #14).
 - Star fade completes once the sun is a sixth of a radian up, which is why the
   field is gone well before full daylight.
 
