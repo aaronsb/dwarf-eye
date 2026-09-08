@@ -11,6 +11,7 @@ mod shadow;
 mod sky;
 mod stars;
 mod texture;
+mod walk;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
@@ -64,6 +65,7 @@ fn main() {
         .init_resource::<Status>()
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
+        .init_resource::<walk::WalkMode>()
         .insert_resource(Weather::from_env().unwrap_or_default())
         .insert_non_send(Bridge::spawn())
         .add_systems(Startup, (setup, stars::setup))
@@ -73,7 +75,7 @@ fn main() {
                 drain_worker,
                 upload_chunks,
                 handle_input,
-                camera::fly,
+                camera::fly.run_if(walk::flying),
                 sky::drive_sun,
                 stars::drive,
                 poll_weather,
@@ -81,6 +83,13 @@ fn main() {
                 request_blocks,
                 refresh_mask,
                 update_hud,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                walk::toggle,
+                (walk::receive, walk::poll, walk::walk).chain().run_if(walk::walking),
             ),
         )
         .run();
@@ -618,6 +627,7 @@ fn request_blocks(
     bridge: NonSend<Bridge>,
     settings: Res<ViewSettings>,
     camera: Query<&Transform, With<FlyCamera>>,
+    walk: Res<walk::WalkMode>,
     mut last: Local<Option<(i32, i32, i32)>>,
     mut cooldown: Local<f32>,
     mut primed: Local<bool>,
@@ -653,7 +663,9 @@ fn request_blocks(
     let force = !*primed;
     *primed = true;
     *last = Some(block);
-    *cooldown = 1.0;
+    // Walking crosses a tile every fraction of a second, so the land ahead has
+    // to stream in at the character's pace rather than the flier's.
+    *cooldown = if walk.active { 0.3 } else { 1.0 };
 
     let _ = bridge.tx.send(Command::Fetch {
         center,
@@ -690,6 +702,7 @@ fn update_hud(
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
+    walk: Res<walk::WalkMode>,
     camera: Query<(&Transform, &FlyCamera)>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
@@ -705,10 +718,12 @@ fn update_hud(
     text.0 = format!(
         "{}\n{}\n{}  {}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
+         {}\n\
          chunks  {}   triangles {}   {:.0} fps\n\
          z-ceiling {ceiling}   hidden tiles {}   sky {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
+         tab  fly / walk sync (walk: WASD steps the character, QE on stairs)\n\
          [ ]  cut plane    H  undiscovered tiles\n\
          , .  step the game clock (shift: six hours)    1 2 3  clear / rain / snow",
         status.world,
@@ -719,6 +734,7 @@ fn update_hud(
         transform.translation.z,
         transform.translation.y / Z_SCALE,
         fly.speed,
+        if walk.active { walk.line.as_str() } else { "fly     tab to walk with the character" },
         entities.0.len(),
         status.triangles,
         diagnostics

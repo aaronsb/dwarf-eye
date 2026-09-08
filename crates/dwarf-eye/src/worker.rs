@@ -5,6 +5,7 @@
 //! and it is cheaper to mesh next to the data than to ship the data across.
 
 use crate::clouds::Weather;
+use crate::walk::Ground;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
@@ -28,6 +29,12 @@ pub enum Command {
     Clock,
     /// Run a DFHack console command, for driving the world while testing.
     Run { command: String, args: Vec<String> },
+    /// Read where the adventurer stands, for walk mode.
+    Adventurer,
+    /// Press one adventure-mode movement key, moving the character a tile and
+    /// letting the game take its turn. `key` is the suffix of
+    /// `df.interface_key.A_MOVE_*`: `N`, `SE`, `UP` and so on.
+    Step { key: String },
     /// Read the world's cloud cover.
     Weather,
     Shutdown,
@@ -53,9 +60,19 @@ pub enum Event {
     Failed(String),
 }
 
+/// Where the adventurer stands, in render tiles and level, with the shape of
+/// the ground around them so the camera can judge its own steps. Polled only
+/// while walk mode is on, and on its own channel: it arrives many times a
+/// second and has nothing to do with the map stream.
+pub struct Report {
+    pub tile: (i32, i32, i32),
+    pub ground: Ground,
+}
+
 pub struct Bridge {
     pub tx: Sender<Command>,
     pub rx: Receiver<Event>,
+    pub reports: Receiver<Report>,
 }
 
 impl Bridge {
@@ -63,19 +80,24 @@ impl Bridge {
     pub fn spawn() -> Self {
         let (tx, command_rx) = channel();
         let (event_tx, rx) = channel();
+        let (report_tx, reports) = channel();
         thread::Builder::new()
             .name("dfhack".into())
             .spawn(move || {
-                if let Err(err) = run(command_rx, &event_tx) {
+                if let Err(err) = run(command_rx, &event_tx, &report_tx) {
                     let _ = event_tx.send(Event::Failed(format!("{err:#}")));
                 }
             })
             .expect("spawning the DFHack worker thread");
-        Self { tx, rx }
+        Self { tx, rx, reports }
     }
 }
 
-fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
+fn run(
+    commands: Receiver<Command>,
+    events: &Sender<Event>,
+    reports: &Sender<Report>,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let mut df = Session::connect_local()?;
     bevy::log::info!("startup: connected and raws fetched in {:.1}s", started.elapsed().as_secs_f32());
@@ -173,6 +195,24 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 match df.client.run_command(&command, &borrowed) {
                     Ok(()) => events.send(Event::Status(format!("ran `{command}`")))?,
                     Err(e) => events.send(Event::Status(format!("`{command}` failed: {e}")))?,
+                }
+            }
+            Command::Adventurer => {
+                // The window follows the character, so where it sits has to be
+                // re-read alongside the position: a stale window would convert
+                // the same tile to somewhere 48 tiles away.
+                let _ = df.refresh_window();
+                if let Ok(tile) = df.view_center() {
+                    let ground = Ground::sample(&df.world, tile);
+                    reports.send(Report { tile, ground })?;
+                }
+            }
+            Command::Step { key } => {
+                let expr = format!(
+                    "local s=dfhack.gui.getCurViewscreen(); s:feed_key(df.interface_key.A_MOVE_{key})"
+                );
+                if let Err(e) = df.client.run_command("lua", &[&expr]) {
+                    events.send(Event::Status(format!("move {key} failed: {e}")))?;
                 }
             }
             Command::Weather => {
@@ -302,7 +342,8 @@ fn collect(
 ) -> Result<()> {
     // The game's window follows the character; a move changes what every
     // local coordinate means, so the next request must be a full one.
-    let window_moved = df.refresh_window()?;
+    df.refresh_window()?;
+    let window_moved = df.take_window_moved();
     let view = df.view_center()?;
     let bounds = df.window_bounds(view.2 - COLLECT_BELOW, view.2 + COLLECT_ABOVE);
     let window = (
