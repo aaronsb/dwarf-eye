@@ -1,18 +1,18 @@
 # Level of detail
 
-Status: fine chunks landed (`crates/dwarf-eye-world/src/mesh.rs`); coarse
-horizon landed (`crates/dwarf-eye-world/src/horizon.rs`); near, mid and far
-canopy bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); mid
-terrain heightfield planned (issue #10); far band from region data in flight
-(issue #31); seam skirt planned (issue #9).
+Status: fine chunks landed (`crates/dwarf-eye-world/src/mesh.rs`); near, mid and
+far canopy bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); the
+far band from region data landed (`crates/dwarf-eye-world/src/horizon/`, issue
+#31); mid terrain heightfield planned (issue #10); seam skirt past the region
+details planned (issue #9).
 
 ## What it does
 
 Draws three tiers of ground: full voxel detail where DF has tiles, nothing yet
-in between, and a coarse heightfield from the region and world maps out to the
-horizon. Crowns are the exception: they already have three bands, because the
-canopy is where the triangles are — about five thousand a chunk, nearly all of
-them alpha-masked leaf voxels.
+in between, and, out to the horizon, a terraced heightfield from the region and
+world maps carrying forests, rivers and sites. Crowns have three bands of their
+own, because the canopy is where the triangles are: about five thousand a chunk,
+nearly all of them alpha-masked leaf voxels.
 
 ## Principle
 
@@ -27,8 +27,10 @@ location:
 The factory classifies from whichever source it has, so a tree is a tree whether
 it came from a tiletype or from a region tile's tree materials and vegetation
 density. Every band renders the same objects: L-system trees and bushes at the
-resolution the band needs, from full voxels down to one canonical crown per
-species; building prefabs from site footprints or from construction tiles;
+resolution the band needs, in five stages — full voxels, quarter-resolution
+opaque, one canonical crown per species
+(`dwarf_eye_trees::crown`), its bounding box (`crown_box`), and finally the
+canopy colour baked into the heightfield; building prefabs from site footprints or from construction tiles;
 water and rivers as surfaces. Approximation lives in the placement rule, seeded
 from absolute coordinates, so a horizon tree keeps its place as the camera
 approaches and is replaced in place when fine data arrives. The band is chosen
@@ -40,8 +42,13 @@ by projected tile size on screen, not by which source fed it.
 |---|---|---|---|
 | fine | `GetBlockList` and the disk cache | 1 tile | landed |
 | mid | simplified cached chunks | 4 tiles | planned, issue #10 |
-| coarse ring | `GetRegionMapsNew` | 48 tiles | landed |
-| far world | `GetWorldMap`, interpolated | 768 tiles | landed |
+| near coarse | `GetRegionMapsNew`, interpolated | 6 tiles | landed |
+| middle coarse | `GetRegionMapsNew`, interpolated | 24 tiles | landed |
+| region | `GetRegionMapsNew` | 48 tiles | landed |
+| far world | `GetWorldMap` | 768 tiles | landed |
+
+The three coarse bands are terraced to whole z-levels, so they step the way fine
+tiles do; only the world grid, where a level is under a pixel, stays smooth.
 
 Canopy bands, all built from the same growth and spawned together. The edge is
 where that band's own leaf voxel falls to two pixels (`canopy.rs:Band::edge`);
@@ -126,13 +133,14 @@ tiles beyond `world.map.block_index`
 
 | Page | |
 |---|---|
-| [horizon.md](horizon.md) | region and world maps, rivers, sites, the block mask and the seam |
+| [horizon.md](horizon.md) | the terraced far band: region and world maps, crowns, rivers, sites, the block mask and the stitch |
 
 ## Invariants and gotchas
 
 - The block mask is the whole of the arbitration between tiers. Fine geometry
   never yields; the coarse mesh discards over any block whose fine chunks reach
-  the ground.
+  the ground, and at the rim of it a coarse cell snaps to the fine column's own
+  z-level (`horizon/terrace.rs:cell_level`), so the two surfaces are one plane.
 - `worker.rs:grounded_blocks` decides that: the lowest loaded chunk of a column
   must be at least half non-empty. A sparse lowest chunk is canopy with no
   ground under it.
@@ -158,5 +166,6 @@ tiles beyond `world.map.block_index`
 
 ## Related issues
 
-#10 (mid detail), #9 (confirm rivers and sites, then the seam skirt), #6
-(heightfield ground would change what the fine tier is).
+#10 (mid detail), #9 (the seam skirt where the terraces meet the world grid),
+#6 (a smoothed fine tier would turn the terracing off and keep the boundary
+snap), #31 (the far band, landed).

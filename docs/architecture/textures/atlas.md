@@ -16,7 +16,7 @@ each side, giving a stride of 64 and a side of 2048 (`atlas.rs:SIDE`).
 onto a backdrop colour, then bleeds the cell's edge outward through all 16 rings
 of padding. `Atlas::rect` returns UVs with a half-texel inset. Slot 0 is white,
 so vertex-coloured geometry points at `atlas::WHITE_UV` and shares the material
-(`mesh.rs:push_quad`, `horizon.rs`).
+(`mesh.rs:push_quad`, `horizon/`).
 
 `library.rs` fills the atlas once during `TileLibrary::load`, in the order
 `pack_leaves`, `pack_ground`, `pack_under`, `pack_ramps`, `pack_walls`. The
