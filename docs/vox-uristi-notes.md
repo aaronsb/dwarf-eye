@@ -40,6 +40,25 @@ The limitation they accepted: ramps are not walls, so a run of adjacent ramps
 stays flat and reads as steps. `RampTop` draws nothing and only feeds the
 hidden-tile computation.
 
+### Where dwarf-eye differs
+
+vox-uristi voxelises a whole z-level, so its ramp spans the level exactly:
+level 1 sits on the boundary and level 5 on the one above. dwarf-eye draws a
+floor as a slab `FLOOR_HEIGHT` (0.12) thick standing *on* the boundary, so the
+same range has to ride on the slab: a corner's height is
+`(FLOOR_HEIGHT + fraction) * Z_SCALE`, from the surface of the slab beside the
+ramp to the surface of the slab a level up. Ending the slope on the boundary
+instead leaves a lip of exactly one floor thickness at the top of every ramp,
+which is what walking off one used to feel like — walk mode reads the same
+fractions out of `ramp::slopes` and adds the same `FLOOR_HEIGHT`.
+
+The skirt under a raised corner has no counterpart there — vox-uristi's
+neighbouring floor fills a whole level, so nothing shows. Here the drop is
+real, and the face carries the ground texture on past the lip: along the tile
+edge it samples what the surface samples, and downward it walks into the tile,
+a texel of texture per texel of drop. Repeating the edge texel down each column
+paints the skirt in vertical stripes instead.
+
 ## Fortifications and stairs
 
 Fortifications (`generic.rs:174`) use four-neighbour wall connectivity:
