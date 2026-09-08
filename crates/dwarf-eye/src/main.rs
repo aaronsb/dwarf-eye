@@ -6,6 +6,7 @@
 mod camera;
 mod capture;
 mod clouds;
+mod god_rays;
 mod noise;
 mod shadow;
 mod sky;
@@ -56,6 +57,7 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(shadow::CloudShadowPlugin)
         .add_plugins(clouds::CloudPlugin)
+        .add_plugins(god_rays::GodRaysPlugin)
         .add_plugins(capture::CapturePlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
