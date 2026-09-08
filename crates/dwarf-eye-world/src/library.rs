@@ -240,6 +240,8 @@ pub struct TileLibrary {
     canopy_color: HashMap<i32, [u8; 3]>,
     /// Species index -> the colour of its wood.
     bark: HashMap<i32, [u8; 3]>,
+    /// Species index -> where its leaf cutout sits in the atlas.
+    leaf_uv: HashMap<i32, Rect>,
     /// Species index -> the tones its leaves and its wood are painted in.
     leaf_tones: HashMap<i32, Vec<[u8; 3]>>,
     bark_tones: HashMap<i32, Vec<[u8; 3]>>,
@@ -320,11 +322,13 @@ impl TileLibrary {
             under_model: HashMap::new(),
             canopy_color: HashMap::new(),
             bark: HashMap::new(),
+            leaf_uv: HashMap::new(),
             leaf_tones: HashMap::new(),
             bark_tones: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
         };
+        library.pack_leaves();
         library.pack_ground();
         library.pack_under();
         library.pack_ramps();
@@ -632,6 +636,51 @@ impl TileLibrary {
             .unwrap_or(DEFAULT_BARK);
         self.bark.insert(mat_index, color);
         color
+    }
+
+    /// How many species have a leaf cutout packed.
+    pub fn leaf_cells(&self) -> usize {
+        self.leaf_uv.len()
+    }
+
+    /// Where a species' leaf cutout sits in the atlas.
+    pub fn leaf_uv(&self, mat_index: i32) -> Option<Rect> {
+        self.leaf_uv
+            .get(&mat_index)
+            .or_else(|| self.leaf_uv.get(&-1))
+            .copied()
+    }
+
+    /// Packs one leaf cutout per species up front.
+    ///
+    /// Alpha is kept rather than flattened, because the holes in a twig sprite
+    /// are the point: a leaf face masked by it lets sky and sun through at texel
+    /// scale, and the shadow it casts comes out finely dappled. The atlas is
+    /// uploaded once after load, so this cannot wait until a tree is meshed.
+    fn pack_leaves(&mut self) {
+        let species: Vec<String> = self.art.index.plants.keys().cloned().collect();
+        let mut subjects: Vec<(i32, String)> = species
+            .iter()
+            .map(|id| (plant_index_of(&self.plants, id), id.clone()))
+            .collect();
+        subjects.push((-1, String::new()));
+        subjects.sort();
+
+        for (index, plant_id) in subjects {
+            let found = ["TREE_TWIGS", "TREE_BRANCH", "TREE_CAP_FLOOR_1"]
+                .into_iter()
+                .find_map(|family| {
+                    let sprite = self.art.tree_sprite(&plant_id, family, 0)?;
+                    // A sprite with almost nothing in it would mask the whole
+                    // face away, so pass over it.
+                    (sprite.coverage() > 0.12).then(|| (family, sprite.clone()))
+                });
+            let Some((family, sprite)) = found else { continue };
+            let key = atlas_key(family, 0, &plant_id);
+            if let Some(rect) = self.atlas.insert(key, &sprite, None) {
+                self.leaf_uv.insert(index, rect);
+            }
+        }
     }
 
     /// The tones a species' leaves are drawn in, darkest first.

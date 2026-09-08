@@ -300,8 +300,9 @@ pub fn build_chunk_budgeted(
 
             // A sprite-derived model, when this tiletype has one.
             if let Some(lib) = library.as_deref_mut() {
-                // Crowns are voxelised separately, onto their own material.
-                if lib.canopy_part(voxel.tile_id).is_some() {
+                // Trees are grown and voxelised separately, onto their own
+                // material, so no tile of one is drawn from its sprite here.
+                if lib.canopy_part(voxel.tile_id).is_some() || lib.is_trunk(voxel.tile_id) {
                     continue;
                 }
                 if lib.handles(voxel.tile_id) {
