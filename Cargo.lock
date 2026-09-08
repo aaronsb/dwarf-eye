@@ -2388,11 +2388,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwarf-eye-art"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+]
+
+[[package]]
 name = "dwarf-eye-world"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "dfhack-remote",
+ "dwarf-eye-art",
 ]
 
 [[package]]

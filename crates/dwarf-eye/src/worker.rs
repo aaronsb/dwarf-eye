@@ -5,6 +5,8 @@
 //! and it is cheaper to mesh next to the data than to ship the data across.
 
 use anyhow::Result;
+use dfhack_remote::{methods, rfr};
+use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
@@ -53,6 +55,24 @@ impl Bridge {
 
 fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
     let mut df = Session::connect_local()?;
+
+    // Dwarf Fortress's own sprites, indexed by tiletype and species.
+    let tiletypes: rfr::TiletypeList = df.client.call_empty(methods::GET_TILETYPE_LIST)?;
+    let plants: rfr::PlantRawList = df.client.call_empty(methods::GET_PLANT_RAWS)?;
+    let mut library = match TileLibrary::load(&tiletypes, &plants) {
+        Ok(lib) => {
+            events.send(Event::Status(format!(
+                "sprite models at {0}x{0} sub-voxels",
+                lib.grid_size()
+            )))?;
+            Some(lib)
+        }
+        Err(err) => {
+            events.send(Event::Status(format!("no DF sprites ({err:#}); drawing plain blocks")))?;
+            None
+        }
+    };
+
     let center = df.view_center()?;
     events.send(Event::Connected {
         world_name: df.map_info.world_name_english().to_string(),
@@ -77,7 +97,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
 
         match command {
             Command::Shutdown => return Ok(()),
-            Command::Remesh { opts } => remesh_all(&df, opts, events)?,
+            Command::Remesh { opts } => remesh_all(&df, library.as_mut(), opts, events)?,
             Command::Fetch { center, radius, depth, opts, force } => {
                 let bounds =
                     BlockBounds::under_ceiling(center.0, center.1, center.2, radius, depth);
@@ -100,7 +120,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                     )))?;
                     // A new block changes its neighbours' culling, so remesh the
                     // whole loaded set rather than only what just arrived.
-                    remesh_all(&df, opts, events)?;
+                    remesh_all(&df, library.as_mut(), opts, events)?;
                 }
             }
         }
@@ -108,13 +128,19 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
 }
 
 /// Meshes every loaded chunk and ships the results in batches.
-fn remesh_all(df: &Session, opts: MeshOptions, events: &Sender<Event>) -> Result<()> {
+fn remesh_all(
+    df: &Session,
+    mut library: Option<&mut TileLibrary>,
+    opts: MeshOptions,
+    events: &Sender<Event>,
+) -> Result<()> {
     const BATCH: usize = 48;
     let mut batch = Vec::with_capacity(BATCH);
 
     for chunk in df.world.chunks() {
         let key = (chunk.block_x, chunk.block_y, chunk.z);
-        batch.push((key, build_chunk(&df.world, chunk, opts)));
+        let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
+        batch.push((key, mesh));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
             batch.reserve(BATCH);

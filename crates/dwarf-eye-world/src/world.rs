@@ -12,6 +12,10 @@ pub const TILES_PER_BLOCK: usize = (BLOCK * BLOCK) as usize;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Voxel {
     pub solid: Solid,
+    /// DFHack tiletype id, for looking up a sprite-derived model.
+    pub tile_id: i32,
+    /// Material index of the tile, which for plants selects the species.
+    pub mat_index: i32,
     pub color: Rgb,
     /// Not yet discovered by the player.
     pub hidden: bool,
@@ -158,6 +162,8 @@ impl World {
             };
             voxels[i] = Voxel {
                 solid: solid_for_shape(shape),
+                tile_id,
+                mat_index: block.materials.get(i).map(|m| m.mat_index).unwrap_or(-1),
                 color,
                 hidden: block.hidden.get(i).copied().unwrap_or(false),
                 outside: block.outside.get(i).copied().unwrap_or(false),

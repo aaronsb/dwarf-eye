@@ -1,6 +1,8 @@
 //! Turns DFHack map blocks into a voxel model that a renderer can mesh.
 
+pub mod library;
 pub mod mesh;
+pub mod model;
 pub mod palette;
 pub mod session;
 pub mod world;

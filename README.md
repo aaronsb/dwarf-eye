@@ -42,6 +42,7 @@ looking straight into the rock.
 | Crate | |
 |---|---|
 | `dfhack-remote` | the DFHack RPC protocol: handshake, method binding, generated protobuf types |
+| `dwarf-eye-art` | reads DF's own sprite sheets and the raws that index them |
 | `dwarf-eye-world` | decodes map blocks into voxels and meshes them; no engine dependency |
 | `dwarf-eye` | the Bevy renderer |
 
@@ -66,6 +67,44 @@ Both headers are raw C structs, so byte layout matters:
 `.proto` files under `crates/dfhack-remote/proto/` are vendored from DFHack at
 tag `53.16-r1.1`.
 
+### Sprites as voxels
+
+![sprite-derived trees](docs/sprites.png)
+
+A DF tile sprite is drawn looking straight down, so its opaque region is a
+horizontal cross-section of whatever fills the tile. `TREE_TRUNK_PILLAR` is a
+disc, so extruding its alpha mask gives a round trunk — the shape is already in
+the art, and nothing has to be modelled.
+
+Four treatments, chosen from `TiletypeShape`:
+
+| Mode | Tiles | Geometry |
+|---|---|---|
+| Extrude | trunks, cap walls | full-height mask |
+| Thin extrude | branches, twigs | a slab through the middle |
+| Billboard | saplings, shrubs, boulders | two crossed vertical planes |
+| Flat tile | floors, pebbles | a textured slab *(not wired yet)* |
+
+Caps come from vertical continuity: a trunk with more trunk above it has no
+visible top, so that face is skipped. Models are cached per tiletype, species
+and cap pair, then stamped into the chunk mesh.
+
+`DWARF_EYE_GRID` sets sub-voxels per tile edge (default 12, range 4–32).
+
+Resolving a tile to a sprite closes a four-link chain:
+
+```
+DFHack tiletype  TreeTrunkPillar + direction "--------"
+material index   419:203  ->  plant raw WILLOW
+graphics raw     [PLANT_GRAPHICS:WILLOW]
+                 [TREE_TILE:TREE_TRUNK_PILLAR:TREE_WILLOW:11:12]
+tile page        [TILE_PAGE:TREE_WILLOW] images/tree_willow.png, 32x32
+```
+
+Only 20 of 72 tree species ship their own sheet; the rest fall back to the
+generic `TILE_GRAPHICS` table, which spells absent connections in lowercase
+(`TREE_TRUNK_S_nwe` is the same tile as `TREE_TRUNK_S`).
+
 ### Colour
 
 DF's `state_color` describes a material as a substance, not as terrain: loam is
@@ -78,6 +117,9 @@ The pink is rock salt. That one is DF's own colour, and it is correct.
 
 ## Not done yet
 
+- Terrain still draws as flat-coloured blocks. The sprites are there —
+  `PEBBLES_FLOOR_1..5`, `GRASS_1..5`, `BOULDER`, `ENGRAVED_STONE_WALL` — but
+  they use a third naming convention that needs its own tiletype mapping.
 - Units, buildings and items are fetched but not drawn.
 - Ramps are half-height blocks rather than wedges; the tile's facing direction
   is available in `Tiletype::direction` and unused.

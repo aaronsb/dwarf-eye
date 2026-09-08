@@ -1,0 +1,10 @@
+[package]
+name = "dwarf-eye-art"
+description = "Reads Dwarf Fortress tile sprites and the raws that index them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }

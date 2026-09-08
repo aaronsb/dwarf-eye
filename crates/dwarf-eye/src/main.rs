@@ -7,6 +7,7 @@ mod camera;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use camera::FlyCamera;
@@ -28,6 +29,7 @@ fn main() {
             }),
             ..default()
         }))
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<ChunkEntities>()
@@ -284,6 +286,7 @@ fn request_blocks(
 }
 
 fn update_hud(
+    diagnostics: Res<DiagnosticsStore>,
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
@@ -302,7 +305,7 @@ fn update_hud(
     text.0 = format!(
         "{}\n{}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
-         chunks  {}   triangles {}\n\
+         chunks  {}   triangles {}   {:.0} fps\n\
          z-ceiling {ceiling}   hidden tiles {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
@@ -315,6 +318,10 @@ fn update_hud(
         fly.speed,
         entities.0.len(),
         status.triangles,
+        diagnostics
+            .get(&FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0),
         if settings.show_hidden { "shown" } else { "hidden" },
     );
 }

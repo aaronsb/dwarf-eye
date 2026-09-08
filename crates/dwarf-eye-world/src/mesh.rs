@@ -1,6 +1,8 @@
 //! Turns chunks into triangle soup. Engine-agnostic: the renderer only has to
 //! copy the four output arrays into its own mesh type.
 
+use crate::library::TileLibrary;
+use crate::model::{Caps, RenderMode};
 use crate::palette::{Rgb, Solid};
 use crate::world::{BLOCK, Chunk, World};
 
@@ -28,7 +30,7 @@ impl MeshData {
     }
 
     /// Appends a quad wound counter-clockwise when seen from `normal`.
-    fn quad(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 4]) {
+    pub fn push_quad(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 4]) {
         let base = self.positions.len() as u32;
         for c in corners {
             self.positions.push(c);
@@ -39,48 +41,65 @@ impl MeshData {
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// Appends another mesh translated by `offset`, for stamping a cached tile
+    /// model into a chunk.
+    pub fn stamp(&mut self, model: &MeshData, offset: [f32; 3], tint: f32) {
+        let base = self.positions.len() as u32;
+        self.positions.extend(model.positions.iter().map(|p| {
+            [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2]]
+        }));
+        self.normals.extend_from_slice(&model.normals);
+        self.colors.extend(
+            model
+                .colors
+                .iter()
+                .map(|c| [c[0] * tint, c[1] * tint, c[2] * tint, c[3]]),
+        );
+        self.indices.extend(model.indices.iter().map(|i| i + base));
+    }
+
     /// Appends a box spanning `lo`..`hi`, skipping the faces marked in `skip`.
     fn cuboid(&mut self, lo: [f32; 3], hi: [f32; 3], color: [f32; 4], skip: Faces) {
         let [x0, y0, z0] = lo;
         let [x1, y1, z1] = hi;
 
         if !skip.top {
-            self.quad(
+            self.push_quad(
                 [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
                 [0.0, 1.0, 0.0],
                 shade(color, 1.0),
             );
         }
         if !skip.bottom {
-            self.quad(
+            self.push_quad(
                 [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
                 [0.0, -1.0, 0.0],
                 shade(color, 0.55),
             );
         }
         if !skip.north {
-            self.quad(
+            self.push_quad(
                 [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
                 [0.0, 0.0, -1.0],
                 shade(color, 0.8),
             );
         }
         if !skip.south {
-            self.quad(
+            self.push_quad(
                 [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]],
                 [0.0, 0.0, 1.0],
                 shade(color, 0.8),
             );
         }
         if !skip.west {
-            self.quad(
+            self.push_quad(
                 [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
                 [-1.0, 0.0, 0.0],
                 shade(color, 0.68),
             );
         }
         if !skip.east {
-            self.quad(
+            self.push_quad(
                 [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
                 [1.0, 0.0, 0.0],
                 shade(color, 0.68),
@@ -143,7 +162,15 @@ impl Default for MeshOptions {
 }
 
 /// Builds the geometry for one chunk, culling faces against its neighbours.
-pub fn build_chunk(world: &World, chunk: &Chunk, opts: MeshOptions) -> MeshData {
+///
+/// When `library` is given, tiles that have a Dwarf Fortress sprite are stamped
+/// from that sprite's extruded mask instead of drawn as plain blocks.
+pub fn build_chunk(
+    world: &World,
+    chunk: &Chunk,
+    opts: MeshOptions,
+    mut library: Option<&mut TileLibrary>,
+) -> MeshData {
     let mut mesh = MeshData::default();
     if chunk.z > opts.z_ceiling {
         return mesh;
@@ -175,6 +202,27 @@ pub fn build_chunk(world: &World, chunk: &Chunk, opts: MeshOptions) -> MeshData 
             };
 
             let color = shade(to_linear(voxel.color, 1.0), jitter(x, y, z));
+
+            // A sprite-derived model, when this tiletype has one.
+            if let Some(lib) = library.as_deref_mut() {
+                if lib.handles(voxel.tile_id) {
+                    // A trunk with more trunk above it has no visible top. This
+                    // is the whole reason a forest stays affordable.
+                    let extruded = lib.mode(voxel.tile_id) == Some(RenderMode::Extrude);
+                    let continues = |dz: i32| {
+                        extruded
+                            && world
+                                .voxel(x, y, z + dz)
+                                .is_some_and(|n| lib.mode(n.tile_id) == Some(RenderMode::Extrude))
+                    };
+                    let caps = Caps { top: !continues(1), bottom: !continues(-1) };
+
+                    if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, caps) {
+                        mesh.stamp(&model, [fx, fy, fz], jitter(x, y, z));
+                        continue;
+                    }
+                }
+            }
             let full = Faces {
                 top: occluded(0, 0, 1),
                 bottom: occluded(0, 0, -1),
