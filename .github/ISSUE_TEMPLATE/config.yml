@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Bug reports are not open yet
+    url: https://github.com/aaronsb/dwarf-eye/blob/main/docs/architecture/README.md
+    about: >-
+      dwarf-eye is in heavy development and is not taking bug or problem reports
+      from outside yet. The architecture pages say what each subsystem does and
+      what is known rough; the open issues say what is in flight. Feature
+      requests are welcome.

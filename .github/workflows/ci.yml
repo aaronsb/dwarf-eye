@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build, test, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Bevy 0.19 links against ALSA, udev and the Wayland/xkb client libraries
+      # on Linux, none of which ship on the runner image.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The Makefile targets, so CI and a developer run the same commands.
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+      # Warnings are reported, not fatal: the tree carries known lints.
+      - name: Clippy
+        run: make clippy
+
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    # The house style is not rustfmt default and the tree is known dirty, so
+    # this job reports drift without failing the build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
