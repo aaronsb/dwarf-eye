@@ -1,0 +1,53 @@
+name: Feature request
+description: Something you want dwarf-eye to show or do
+title: "[request] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Requests are welcome. Bug and problem reports are not being taken during
+        early development.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What you want to see
+      description: The view, behaviour or control you are after.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it lets you do that you cannot do now.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Subsystem
+      description: >-
+        Which page under docs/architecture it touches, as far as you can tell.
+      options:
+        - pipeline
+        - factory
+        - textures
+        - preload
+        - lod
+        - sky
+        - walk
+        - testing
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: reference
+    attributes:
+      label: Reference image
+      description: Optional. A screenshot or a picture of the look you mean.
+    validations:
+      required: false

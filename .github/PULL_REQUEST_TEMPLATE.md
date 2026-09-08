@@ -1,0 +1,3 @@
+- What this changes:
+- docs/architecture page updated:
+- Testing layers touched (unit, probe, live, visual):
