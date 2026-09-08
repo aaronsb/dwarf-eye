@@ -27,8 +27,13 @@ const PER_TILE: f32 = 20.0;
 pub const NEAR: f32 = 720.0;
 /// None at or beyond this radius, which is also the edge of the region details.
 pub const REACH: f32 = 1920.0;
-/// Size jitter around the preset's own height.
+/// Size jitter around the height a Dwarf Fortress tree stands at.
 const SCALE: (f32, f32) = (0.72, 1.35);
+/// The height, in levels, a far tree is normalised to before the jitter. The
+/// lab presets stand 13 to 22 tiles; the fine map shrinks them to the height
+/// the game reports per tree, which runs about 4 to 10 levels, and the horizon
+/// has no per-tree height, so it takes the middle of that range.
+pub const DF_TREE_HEIGHT: f32 = 7.0;
 /// Share of a patch that grows a noticeably taller emergent, and how much
 /// taller: real woodland is not one storey.
 const EMERGENT: f32 = 0.05;
@@ -110,11 +115,13 @@ pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<
         }
         let Some(level) = terrain.level_at(tx, tz) else { continue };
         let preset = pick(patch, radius, unit(5), seed(2) as usize);
-        let mut scale = SCALE.0 + (SCALE.1 - SCALE.0) * unit(3);
+        let mut jitter = SCALE.0 + (SCALE.1 - SCALE.0) * unit(3);
         if unit(6) < EMERGENT {
-            scale *= EMERGENT_SCALE;
+            jitter *= EMERGENT_SCALE;
         }
-        let height = TreeParams::preset(preset).height * scale;
+        let natural = TreeParams::preset(preset).height.max(0.5);
+        let scale = DF_TREE_HEIGHT / natural * jitter;
+        let height = natural * scale;
         let stage = if radius < height * DETAIL_RATIO { Stage::Crown } else { Stage::Box };
         out.push((
             preset,
