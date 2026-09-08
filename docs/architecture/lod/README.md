@@ -24,10 +24,15 @@ them alpha-masked leaf voxels.
 
 Canopy bands, both built from the same growth and spawned together:
 
-| Band | Voxels per tile | Carries | Material |
-|---|---|---|---|
-| near | 4 (`tree.rs:DETAIL`) | trees, plants, tufts, strands | bark, broadleaf and needle cutouts, leaflet strip |
-| mid | 1 (`canopy.rs:MID_DETAIL`) | trees only | bark, opaque leaf |
+| Band | Voxels per tile | Carries | Meshes per chunk | Material |
+|---|---|---|---|---|
+| near | 4 (`tree.rs:DETAIL`) | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
+| mid | 1 (`canopy.rs:MID_DETAIL`) | trees only | 1 | one opaque leaf material, bark included |
+
+`canopy.rs:Band::slot` is what merges the mid band into one mesh: one mesh on
+one material is one entity and one draw call for a chunk's whole crown, and at
+that distance there is no bark grain or leaf hole left to tell apart.
+`canopy.rs:Band::coats` says what each mesh wears.
 
 ## The projected-size rule
 

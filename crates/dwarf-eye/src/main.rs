@@ -452,6 +452,10 @@ fn setup(
     // a long way off is a solid crown rather than a masked one.
     let mut solid_leaf = cutout(broadleaf.clone());
     solid_leaf.base.base_color_texture = None;
+    // The cutout's own texels are a light grey, around 224 of 255, so dropping
+    // the texture would leave the mid band a shade brighter than the near one
+    // right where the two meet.
+    solid_leaf.base.base_color = Color::srgb(0.88, 0.88, 0.88);
     solid_leaf.base.alpha_mode = AlphaMode::Opaque;
     solid_leaf.base.double_sided = false;
     solid_leaf.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
