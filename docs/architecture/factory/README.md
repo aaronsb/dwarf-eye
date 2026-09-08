@@ -96,6 +96,16 @@ resolved `FlatTile` to an atlas cell since the ground atlas landed.
 - `Class::Built` is what someone raised: nothing vegetal is grown into it, and
   a crown's envelope is clipped by it (`tree.rs:Envelope::blocked`).
 
+## The treatment is a chain
+
+Planned (issues #5, #10, #31): `resolve` returns a chain of stages, each a
+builder and the projected-size threshold it holds down to. A tree's chain is
+full voxels, quarter-resolution opaque voxels, one canonical crown per preset,
+a green box, then nothing per tree with the canopy baked into the coarse
+heightfield. The factory caches meshes per (preset, stage), so a fine chunk at
+mid range and a region tile at the horizon draw the same crown. Region tiles
+enter `classify` as a coarse source and receive the same classes as fine tiles.
+
 ## Related issues
 
 #5 (the registry), #1 (shrubs, saplings, dead trees, streamers), #7 (ground
