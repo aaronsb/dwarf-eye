@@ -8,7 +8,9 @@ mod worker;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
 use camera::FlyCamera;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
@@ -17,8 +19,14 @@ use worker::{Bridge, ChunkKey, Command, Event};
 
 /// How far around the camera to keep map loaded, in 16-tile blocks.
 const LOAD_RADIUS: i32 = 5;
-/// How many z-levels above and below the camera to keep loaded.
-const LOAD_DEPTH: i32 = 12;
+/// How many z-levels below the cut plane to keep loaded.
+const LOAD_DEPTH: i32 = 22;
+
+/// Where the cut plane starts, relative to the player's z-level.
+///
+/// A tree stands several levels above the ground it grows from, so a plane just
+/// overhead would shear the canopy off.
+const CEILING_ABOVE_PLAYER: i32 = 16;
 
 fn main() {
     App::new()
@@ -116,6 +124,7 @@ fn setup(
         base_color: Color::WHITE,
         perceptual_roughness: 0.92,
         reflectance: 0.03,
+        alpha_mode: AlphaMode::Mask(0.5),
         ..default()
     })));
 
@@ -132,6 +141,8 @@ fn drain_worker(
     mut commands: Commands,
     bridge: NonSend<Bridge>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     material: Res<TerrainMaterial>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
@@ -140,6 +151,21 @@ fn drain_worker(
 ) {
     for event in bridge.rx.try_iter() {
         match event {
+            Event::Atlas { width, height, pixels } => {
+                let mut image = Image::new(
+                    Extent3d { width, height, depth_or_array_layers: 1 },
+                    TextureDimension::D2,
+                    pixels,
+                    TextureFormat::Rgba8UnormSrgb,
+                    RenderAssetUsages::RENDER_WORLD,
+                );
+                // DF's art is pixel art; smoothing it would defeat the point.
+                image.sampler = ImageSampler::nearest();
+                let handle = images.add(image);
+                if let Some(mut m) = materials.get_mut(&material.0) {
+                    m.base_color_texture = Some(handle);
+                }
+            }
             Event::Connected { world_name, save, center, size } => {
                 status.world = format!("{world_name} ({save})");
                 status.detail = format!("map {} x {} x {} tiles", size.0, size.1, size.2);
@@ -151,15 +177,22 @@ fn drain_worker(
                         center.2 as f32 * Z_SCALE,
                         center.1 as f32,
                     );
-                    *transform = Transform::from_translation(target + Vec3::new(0.0, 18.0, 28.0))
-                        .looking_at(target, Vec3::Y);
+                    // DWARF_EYE_CAM scales how far back the camera starts, for
+                    // getting down among the tiles.
+                    let back: f32 = std::env::var("DWARF_EYE_CAM")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1.0);
+                    *transform =
+                        Transform::from_translation(target + Vec3::new(0.0, 18.0, 28.0) * back)
+                            .looking_at(target, Vec3::Y);
                 }
                 // DWARF_EYE_Z_OFFSET drops the starting cut plane, for looking
                 // straight into the underground rather than at the surface.
                 let offset: i32 = std::env::var("DWARF_EYE_Z_OFFSET")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(2);
+                    .unwrap_or(CEILING_ABOVE_PLAYER);
                 settings.z_ceiling = center.2 + offset;
                 settings.placed = true;
             }
@@ -202,6 +235,7 @@ fn to_bevy_mesh(data: MeshData) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, data.positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, data.colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, data.uvs);
     mesh.insert_indices(Indices::U32(data.indices));
     mesh
 }

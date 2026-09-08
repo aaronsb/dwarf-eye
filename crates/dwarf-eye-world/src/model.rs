@@ -7,6 +7,7 @@
 
 use crate::mesh::{MeshData, Z_SCALE};
 use dwarf_eye_art::Grid;
+use dwarf_eye_art::atlas::Rect;
 
 /// How a tile's mask becomes geometry.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -56,6 +57,38 @@ fn to_linear(rgb: [u8; 3]) -> [f32; 4] {
 
 fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
     [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
+}
+
+/// A textured slab on the ground: one quad for the surface, four thin sides.
+///
+/// The sprite is a picture rather than a cross-section, so it is sampled from
+/// the atlas instead of voxelised. Twelve triangles replace about three hundred,
+/// and the texture keeps its full resolution.
+pub fn build_flat_tile(uv: Rect, height: f32) -> MeshData {
+    let mut mesh = MeshData::default();
+    let y = height * Z_SCALE;
+    let white = [1.0, 1.0, 1.0, 1.0];
+
+    mesh.push_textured_quad(
+        [[0.0, y, 0.0], [0.0, y, 1.0], [1.0, y, 1.0], [1.0, y, 0.0]],
+        [0.0, 1.0, 0.0],
+        white,
+        [
+            [uv.u0, uv.v0],
+            [uv.u0, uv.v1],
+            [uv.u1, uv.v1],
+            [uv.u1, uv.v0],
+        ],
+    );
+
+    // The rim is too shallow to be worth texturing; shade it off the surface.
+    let side = shade(white, 0.72);
+    mesh.push_quad([[0.0, 0.0, 0.0], [0.0, y, 0.0], [1.0, y, 0.0], [1.0, 0.0, 0.0]], [0.0, 0.0, -1.0], side);
+    mesh.push_quad([[1.0, 0.0, 1.0], [1.0, y, 1.0], [0.0, y, 1.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 1.0], side);
+    mesh.push_quad([[0.0, 0.0, 1.0], [0.0, y, 1.0], [0.0, y, 0.0], [0.0, 0.0, 0.0]], [-1.0, 0.0, 0.0], side);
+    mesh.push_quad([[1.0, 0.0, 0.0], [1.0, y, 0.0], [1.0, y, 1.0], [1.0, 0.0, 1.0]], [1.0, 0.0, 0.0], side);
+
+    mesh
 }
 
 /// Builds a tile's geometry in local space: x and z span 0..1, y spans the

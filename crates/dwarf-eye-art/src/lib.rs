@@ -4,6 +4,7 @@
 //! in the game's `data/vanilla/*/graphics/` trees, indexed by raws that this
 //! crate parses.
 
+pub mod atlas;
 pub mod raws;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +30,25 @@ impl Sprite {
     pub fn coverage(&self) -> f32 {
         let solid = self.pixels.iter().filter(|p| p[3] >= 128).count();
         solid as f32 / self.pixels.len().max(1) as f32
+    }
+
+    /// Mean saturation of the opaque pixels, 0.0 to 1.0.
+    ///
+    /// DF draws some terrain in its final colour (grass is green) and some as a
+    /// near-grey pattern meant to be tinted by the tile's material (stone,
+    /// soil, pebbles). This is how to tell which is which without a hand table.
+    pub fn saturation(&self) -> f32 {
+        let (mut total, mut count) = (0.0f32, 0u32);
+        for p in self.pixels.iter().filter(|p| p[3] >= 128) {
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            if max > 0.0 {
+                total += (max - min) / max;
+            }
+            count += 1;
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
     }
 
     /// Reduces the sprite to an `n` x `n` occupancy-and-colour grid.

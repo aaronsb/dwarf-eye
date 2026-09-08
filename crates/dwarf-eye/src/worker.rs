@@ -24,6 +24,8 @@ pub enum Command {
 }
 
 pub enum Event {
+    /// The packed ground texture, sent once before any geometry.
+    Atlas { width: u32, height: u32, pixels: Vec<u8> },
     Connected { world_name: String, save: String, center: (i32, i32, i32), size: (i32, i32, i32) },
     /// Geometry for chunks that changed; an empty `data` means "despawn this one".
     Chunks(Vec<(ChunkKey, MeshData)>),
@@ -61,8 +63,15 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
     let plants: rfr::PlantRawList = df.client.call_empty(methods::GET_PLANT_RAWS)?;
     let mut library = match TileLibrary::load(&tiletypes, &plants) {
         Ok(lib) => {
+            let atlas = lib.atlas();
+            events.send(Event::Atlas {
+                width: atlas.width,
+                height: atlas.height,
+                pixels: atlas.pixels.clone(),
+            })?;
             events.send(Event::Status(format!(
-                "sprite models at {0}x{0} sub-voxels",
+                "{} ground sprites packed, models at {1}x{1} sub-voxels",
+                atlas.capacity_used(),
                 lib.grid_size()
             )))?;
             Some(lib)

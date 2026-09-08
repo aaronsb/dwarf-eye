@@ -2402,6 +2402,7 @@ dependencies = [
  "anyhow",
  "dfhack-remote",
  "dwarf-eye-art",
+ "image",
 ]
 
 [[package]]

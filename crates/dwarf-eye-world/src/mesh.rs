@@ -12,12 +12,24 @@ use crate::world::{BLOCK, Chunk, World};
 pub const Z_SCALE: f32 = 1.0;
 
 /// Buffers for one chunk's geometry, in Bevy's Y-up convention.
-#[derive(Default)]
 pub struct MeshData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+}
+
+impl Default for MeshData {
+    fn default() -> Self {
+        Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            colors: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
 }
 
 impl MeshData {
@@ -31,11 +43,24 @@ impl MeshData {
 
     /// Appends a quad wound counter-clockwise when seen from `normal`.
     pub fn push_quad(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 4]) {
+        self.push_textured_quad(corners, normal, color, [dwarf_eye_art::atlas::WHITE_UV; 4]);
+    }
+
+    /// Appends a quad that samples the atlas, for geometry whose look comes from
+    /// a sprite rather than from vertex colour.
+    pub fn push_textured_quad(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        normal: [f32; 3],
+        color: [f32; 4],
+        uvs: [[f32; 2]; 4],
+    ) {
         let base = self.positions.len() as u32;
-        for c in corners {
+        for (c, uv) in corners.into_iter().zip(uvs) {
             self.positions.push(c);
             self.normals.push(normal);
             self.colors.push(color);
+            self.uvs.push(uv);
         }
         self.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -43,17 +68,18 @@ impl MeshData {
 
     /// Appends another mesh translated by `offset`, for stamping a cached tile
     /// model into a chunk.
-    pub fn stamp(&mut self, model: &MeshData, offset: [f32; 3], tint: f32) {
+    pub fn stamp(&mut self, model: &MeshData, offset: [f32; 3], tint: [f32; 3]) {
         let base = self.positions.len() as u32;
         self.positions.extend(model.positions.iter().map(|p| {
             [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2]]
         }));
         self.normals.extend_from_slice(&model.normals);
+        self.uvs.extend_from_slice(&model.uvs);
         self.colors.extend(
             model
                 .colors
                 .iter()
-                .map(|c| [c[0] * tint, c[1] * tint, c[2] * tint, c[3]]),
+                .map(|c| [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2], c[3]]),
         );
         self.indices.extend(model.indices.iter().map(|i| i + base));
     }
@@ -123,6 +149,21 @@ struct Faces {
 /// still reads as a lit scene.
 fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
     [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
+}
+
+/// Pulls a colour partway toward its own brightness.
+///
+/// DF's material colours are far more saturated than its rendering of them:
+/// rock salt is `[255, 192, 203]`, and a floor of it in-game reads as grey
+/// stone, not pink. Damping keeps one stone distinguishable from another
+/// without painting the ground in raw material colour.
+fn damp(rgb: [f32; 3], keep: f32) -> [f32; 3] {
+    let luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    [
+        luma + (rgb[0] - luma) * keep,
+        luma + (rgb[1] - luma) * keep,
+        luma + (rgb[2] - luma) * keep,
+    ]
 }
 
 /// A deterministic per-tile brightness wobble, so a hillside of one material
@@ -217,8 +258,31 @@ pub fn build_chunk(
                     };
                     let caps = Caps { top: !continues(1), bottom: !continues(-1) };
 
+                    // A shrub or boulder fills its tile outright, with no floor
+                    // tile of its own, so give it ground to stand on.
+                    if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
+                        let wobble = jitter(x, y, z);
+                        let tint = if ground.tint {
+                            let base = damp([color[0], color[1], color[2]], 0.35);
+                            [base[0] * wobble, base[1] * wobble, base[2] * wobble]
+                        } else {
+                            [wobble, wobble, wobble]
+                        };
+                        mesh.stamp(&ground.mesh, [fx, fy, fz], tint);
+                    }
+
                     if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, caps) {
-                        mesh.stamp(&model, [fx, fy, fz], jitter(x, y, z));
+                        let wobble = jitter(x, y, z);
+                        // A near-grey sprite is a pattern; the tile's material
+                        // supplies the colour, so granite still reads unlike
+                        // marble under the same stone texture.
+                        let tint = if model.tint {
+                            let base = damp([color[0], color[1], color[2]], 0.35);
+                            [base[0] * wobble, base[1] * wobble, base[2] * wobble]
+                        } else {
+                            [wobble, wobble, wobble]
+                        };
+                        mesh.stamp(&model.mesh, [fx, fy, fz], tint);
                         continue;
                     }
                 }

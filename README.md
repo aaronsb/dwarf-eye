@@ -32,8 +32,10 @@ cargo run --release -p dwarf-eye
 | `[` `]` | lower / raise the cut plane |
 | `H` | show or hide undiscovered tiles |
 
-`DWARF_EYE_Z_OFFSET=-8` starts the cut plane eight levels below the player, for
-looking straight into the rock.
+`DWARF_EYE_Z_OFFSET` moves the starting cut plane relative to the player
+(default +16, high enough to clear a tree canopy); `-8` starts it below ground,
+for looking straight into the rock. `DWARF_EYE_CAM` scales how far back the
+camera starts.
 
 ![cutaway](docs/cutaway.png)
 
@@ -115,6 +117,37 @@ closest variant by direction bits.
 `cargo run --release -p dwarf-eye-world --example coverage` reports which tiles
 in view get a sprite and which fall back to plain blocks.
 
+### Ground
+
+![textured ground](docs/ground.png)
+
+Floors take a different path from trees. A floor sprite is a picture, not a
+cross-section, and voxelising it destroys the detail that made it worth using —
+a 32x32 texture downsampled to a 12x12 grid costs about three hundred triangles
+per tile and looks flat. Ground is packed into a texture atlas and drawn as one
+quad instead: twelve triangles, full resolution.
+
+Both share the atlas. Voxel geometry points at a white cell and keeps its vertex
+colour, so there is one material and one mesh per chunk.
+
+Three things about the environment sheets are not obvious:
+
+- **The numbered families are not variants.** `GRASS_1` through `GRASS_9` are the
+  nine slices of one interlocking 3x3 edge pattern, and only the centre (`_5`)
+  is fully opaque — the rest run 0-13%. DF picks a slice per tile from its
+  neighbours so grass interlocks. A voxel view wants the centre everywhere.
+  The centre's own variants (`_5`, `_5B`, `_5C`, `_5D`) line up with DFHack's
+  four floor variants, so the variety survives.
+- **Some sprites are colours, others are patterns.** Grass is drawn green;
+  stone, soil and pebbles are near-grey and meant to be tinted by the material.
+  `Sprite::saturation` decides which without a hand table. Material colours are
+  then damped toward their own brightness, because DF's `state_color` is far more
+  saturated than DF's rendering of it — rock salt is `[255, 192, 203]`, and a
+  floor of it in-game reads as grey stone, not pink.
+- **A shrub owns its whole tile.** DFHack reports no floor under a shrub,
+  sapling or boulder, so each one has ground synthesised beneath it from its
+  material class. Without that, every crop row is a hole with sky behind it.
+
 ### Colour
 
 DF's `state_color` describes a material as a substance, not as terrain: loam is
@@ -127,9 +160,7 @@ The pink is rock salt. That one is DF's own colour, and it is correct.
 
 ## Not done yet
 
-- Terrain still draws as flat-coloured blocks. The sprites are there —
-  `PEBBLES_FLOOR_1..5`, `GRASS_1..5`, `BOULDER`, `ENGRAVED_STONE_WALL` — but
-  they use a third naming convention that needs its own tiletype mapping.
+- Walls still draw as flat-coloured blocks; only floors are textured.
 - Units, buildings and items are fetched but not drawn.
 - Ramps are half-height blocks rather than wedges; the tile's facing direction
   is available in `Tiletype::direction` and unused.
