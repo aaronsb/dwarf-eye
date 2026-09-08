@@ -119,6 +119,33 @@ fn class_wins(material: TiletypeMaterial) -> bool {
 /// Leaves, wherever they hang.
 const FOLIAGE: Rgb = [82, 138, 58];
 
+/// A hand's depth of water, and water deep enough that the bottom is gone.
+///
+/// DF paints a murky pool teal and shades its shallows lighter, which is the
+/// look; the tiletype's own `Pool` blue is the colour of the tile, not of the
+/// liquid standing in it.
+pub const WATER_SHALLOW: Rgb = [122, 186, 184];
+pub const WATER_DEEP: Rgb = [18, 68, 92];
+
+/// How deep water has to stand before it reads as fully deep, in tiles.
+const WATER_RANGE: f32 = 2.5;
+
+/// Colour and opacity of a water surface over `depth` tiles of water.
+///
+/// A shore is nearly clear so the ground under it shows through; a metre or
+/// two out the bottom has gone. Depth is the surface height plus whatever is
+/// stacked below, so it climbs both across a pool and down a shaft.
+pub fn water_color(depth: f32) -> (Rgb, f32) {
+    let t = (depth / WATER_RANGE).clamp(0.0, 1.0).powf(0.7);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    let rgb = [
+        mix(WATER_SHALLOW[0], WATER_DEEP[0]),
+        mix(WATER_SHALLOW[1], WATER_DEEP[1]),
+        mix(WATER_SHALLOW[2], WATER_DEEP[2]),
+    ];
+    (rgb, 0.22 + 0.62 * t)
+}
+
 /// Everything needed to give a tile a shape and a colour.
 pub struct Palette {
     tiletypes: HashMap<i32, Tiletype>,

@@ -131,6 +131,7 @@ struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 /// and what they cost together.
 struct Spawned {
     terrain: Option<Entity>,
+    water: Option<Entity>,
     canopy: [Option<Entity>; 4],
     triangles: usize,
 }
@@ -174,6 +175,12 @@ pub struct TerrainMaterial(pub Handle<TerrainMat>);
 /// yield wherever a fine chunk is loaded.
 #[derive(Resource)]
 pub struct HorizonMaterial(pub Handle<TerrainMat>);
+
+/// Water surfaces: blended rather than masked, so the ground shows through the
+/// shallows, and glossy enough to catch the sun. Its own material keeps the
+/// terrain opaque, which is what lets the sorted transparent pass work at all.
+#[derive(Resource)]
+pub struct WaterMaterial(pub Handle<TerrainMat>);
 
 /// Tree crowns. Their own material so they can be shaded as leaves rather than
 /// as stone, and so cloud shadows still reach them: `clouds::bake_shadow`
@@ -303,6 +310,19 @@ fn setup(
     };
     commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
     commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
+
+    // Blend, which in Bevy also stops the surface writing depth, so what is
+    // under the water still draws. Both sides, because the camera walks into
+    // the pool. The colour and how opaque it is come from the vertex data,
+    // which is where the depth of the water is worked out
+    // (`dwarf_eye_world::water`).
+    let mut water = terrain(0.0);
+    water.base.alpha_mode = AlphaMode::Blend;
+    water.base.double_sided = true;
+    water.base.cull_mode = None;
+    water.base.perceptual_roughness = 0.1;
+    water.base.reflectance = 0.5;
+    commands.insert_resource(WaterMaterial(materials.add(water)));
 
     // Leaf faces carry a procedural cutout at Dwarf Fortress's own texel
     // density, which is what lets sky through the crown and dapples the shadow
@@ -463,6 +483,7 @@ fn upload_chunks(
     mut pending: ResMut<PendingChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Res<TerrainMaterial>,
+    water_material: Res<WaterMaterial>,
     canopy_materials: Res<CanopyMaterials>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
@@ -484,18 +505,23 @@ fn upload_chunks(
     keys.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
 
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
-        let Some((data, crown)) = pending.0.remove(&key) else { continue };
+        let Some((mut data, crown)) = pending.0.remove(&key) else { continue };
+        // Water rides in with the terrain and splits off here: its own entity,
+        // its own translucent material.
+        let pool = data.take_water();
         if let Some(old) = entities.0.remove(&key) {
-            for entity in
-                std::iter::once(old.terrain).chain(old.canopy).flatten()
+            for entity in [old.terrain, old.water]
+                .into_iter()
+                .chain(old.canopy)
+                .flatten()
             {
                 commands.entity(entity).despawn();
             }
         }
-        if data.is_empty() && crown.is_empty() {
+        if data.is_empty() && pool.is_empty() && crown.is_empty() {
             continue;
         }
-        let triangles = data.triangle_count() + crown.triangle_count();
+        let triangles = data.triangle_count() + pool.triangle_count() + crown.triangle_count();
         let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>| {
             (!mesh.is_empty()).then(|| {
                 commands
@@ -509,13 +535,14 @@ fn upload_chunks(
             })
         };
         let terrain = spawn(data, material.0.clone());
+        let water = spawn(pool, water_material.0.clone());
         let crowns = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
         let materials = canopy_materials.each();
         let mut canopy = [None; 4];
         for (slot, (mesh, material)) in crowns.into_iter().zip(materials).enumerate() {
             canopy[slot] = spawn(mesh, material);
         }
-        entities.0.insert(key, Spawned { terrain, canopy, triangles });
+        entities.0.insert(key, Spawned { terrain, water, canopy, triangles });
     }
     status.triangles = entities.0.values().map(|s| s.triangles).sum();
 }

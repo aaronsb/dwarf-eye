@@ -1,7 +1,8 @@
 # Meshing
 
 Status: landed (`crates/dwarf-eye-world/src/mesh.rs`,
-`crates/dwarf-eye-world/src/canopy.rs`, `crates/dwarf-eye/src/main.rs`).
+`crates/dwarf-eye-world/src/water.rs`, `crates/dwarf-eye-world/src/canopy.rs`,
+`crates/dwarf-eye/src/main.rs`).
 
 ## What it does
 
@@ -16,6 +17,12 @@ model or a plain cuboid. `MeshData` holds positions, normals, colours, UVs and
 indices; the renderer copies them straight into a Bevy mesh
 (`main.rs:to_bevy_mesh`). `mesh.rs:build_chunk_budgeted` is the same pass with a
 `Budget` tally, which `make budget` prints.
+
+Water is meshed separately too, by `water.rs:build_chunk`, and rides back
+inside `MeshData::water`; `main.rs:upload_chunks` lifts it out with
+`MeshData::take_water` and gives it its own entity on `main.rs:WaterMaterial`.
+It travels inside the terrain buffer only so a chunk stays one value on the
+channel.
 
 Crowns are meshed separately by `canopy.rs:Forest::build_chunk` into
 `CanopyMeshes`, four buffers: bark, broadleaf, needle, streamers. Each becomes
@@ -36,7 +43,8 @@ a brightness wobble so a hillside of one material is not a painted plane
 | `Ramp` | wedge from the ramp sheet, or a half-height block with no sprite |
 | `Stair` | two stacked boxes |
 | `Foliage` | inset box, 0.85 tall |
-| liquids | box whose height is the fill level over 7, vertex alpha, opaque material |
+| magma | box whose height is the fill level over 7, opaque material |
+| water | a surface with corner heights, on its own translucent material |
 
 ## Invariants and gotchas
 
@@ -53,15 +61,38 @@ a brightness wobble so a hillside of one material is not a painted plane
   what keeps a forest affordable.
 - Terrain ramps carry no direction, so the high side comes from whichever of
   `ramp.rs:NEIGHBOURS` is a wall.
-- Water and magma get vertex alpha but the material is opaque, so they render
-  solid. That is issue #16, along with greedy-merging terrain cubes; the merge
-  already exists for crowns in `canopy.rs:emit` and in `dwarf-eye-trees::mesh`.
+- Magma still draws as an opaque box with vertex alpha the material ignores.
+  Greedy-merging terrain cubes is the rest of issue #16; the merge already
+  exists for crowns in `canopy.rs:emit` and in `dwarf-eye-trees::mesh`.
 - Natural ground is stepped terraces, not a heightfield. Issue #6.
 - Walls draw flat-coloured. `SoilWall` alone was 73,666 tiles in one view, which
   is issue #13.
 
+## Water
+
+`water.rs` meshes every wet tile of a chunk, whatever else that tile is
+drawing: a pool's rim tiles are ramps, and the sprite paths in `mesh.rs` have
+already moved on from them by the time a liquid would be emitted.
+
+Each corner of a tile takes the mean of the four tiles that touch it. A liquid
+tile contributes its own fill level; a wall, an unloaded tile, or a column that
+carries on above contributes the tile's own level, which leaves the corner
+alone; anything else — floor, ramp, open air — contributes nothing, so the
+surface sinks to the ground there. Both tiles either side of an edge average
+the same four tiles, so they agree on the two heights they share and the sheet
+has no seam. That is also why no face is needed between two liquid tiles.
+
+Faces: the top of each column, and a side only where the tile beside it is open
+air at the same level. Never between two liquids, never into a wall, never
+underneath, and none at all where the tile above is liquid too, or where a full
+surface meets a floor resting on it.
+
+Colour is vertex data: `palette.rs:water_color` reads the surface height plus
+the tiles of water stacked below and returns a teal that darkens and thickens
+with depth, so a shore is nearly clear and open water is not.
+
 ## Related issues
 
 #5 (registry lookups in place of the scattered checks), #6 (smoothed
-heightfield), #13 (wall textures), #16 (transparency and greedy meshing), #10
-(mid LOD).
+heightfield), #13 (wall textures), #16 (magma transparency and greedy meshing),
+#10 (mid LOD), #29 (closed, this water).
