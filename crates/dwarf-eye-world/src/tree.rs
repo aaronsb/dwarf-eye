@@ -34,12 +34,12 @@
 //!   fall-off and porosity are the species preset's own.
 
 use crate::canopy::CanopyPart;
+use crate::factory::{self, Class};
 use crate::library::TileLibrary;
 use crate::mesh::Z_SCALE;
 use crate::world::World;
 use dwarf_eye_art::raws::TreeGrowth;
 use dwarf_eye_trees as trees;
-use dwarf_eye_trees::rng;
 
 /// Sub-voxels per tile edge.
 pub const DETAIL: i32 = 4;
@@ -91,6 +91,15 @@ pub struct Envelope {
     pub truncated: bool,
     /// The game reports this tree's crown as cap, not as branches and twigs.
     pub cap: bool,
+    /// The game reports this tree as dead, so it carries no foliage at all.
+    pub dead: bool,
+    /// Built work inside the tree's reach, per level, over a box centred on the
+    /// trunk. Indexed `[z - z0][(y - by0) * bw + (x - bx0)]`.
+    blocked: Vec<Vec<bool>>,
+    bx0: i32,
+    by0: i32,
+    bw: i32,
+    bd: i32,
 }
 
 /// How far from its origin a tree's tiles can reach.
@@ -110,16 +119,20 @@ impl Envelope {
         let (ox, oy, oz) = origin;
         let mut tiles: Vec<(i32, i32, i32, bool)> = Vec::new();
         let mut cap = false;
+        let mut dead = false;
         for z in (oz - 4)..=(oz + SPAN + 8) {
             for x in ox..=(ox + SPAN) {
                 for y in oy..=(oy + SPAN) {
                     let Some(v) = world.voxel(x, y, z) else { continue };
-                    let trunk = library.is_trunk(v.tile_id);
-                    let part = library.canopy_part(v.tile_id);
-                    if (!trunk && part.is_none()) || v.tree_origin(x, y, z) != origin {
+                    // The factory says what belongs to a tree; DF's own crown
+                    // classification then says which part of one this is.
+                    let Some(plan) = library.plan(v.tile_id) else { continue };
+                    if !plan.of_tree() || v.tree_origin(x, y, z) != origin {
                         continue;
                     }
+                    let part = library.canopy_part(v.tile_id);
                     cap |= part == Some(CanopyPart::Cap);
+                    dead |= plan.class == Class::DeadTree;
                     tiles.push((x, y, z, part.is_some()));
                 }
             }
@@ -196,6 +209,35 @@ impl Envelope {
             radius.push(far + 0.5);
         }
 
+        // Built work bounds a tree as surely as the ground does. DF never puts
+        // a tree tile inside a wall someone raised, but the envelope a crown
+        // grows in is a cylinder of the tree's whole reach rather than its own
+        // tiles, so without this a tree standing beside a building grows
+        // through its roof.
+        let base_xy = [base.0 as f32 + 0.5, base.1 as f32 + 0.5];
+        let mut reach = 1.0f32;
+        for (n, c) in centre.iter().enumerate() {
+            let lean = ((c[0] - base_xy[0]).powi(2) + (c[1] - base_xy[1]).powi(2)).sqrt();
+            reach = reach.max(lean + radius[n]);
+        }
+        let span = reach.ceil() as i32 + 1;
+        let (bx0, by0) = (base.0 - span, base.1 - span);
+        let (bw, bd) = (2 * span + 1, 2 * span + 1);
+        let mut blocked = vec![vec![false; (bw * bd) as usize]; level.len()];
+        for (n, slab) in blocked.iter_mut().enumerate() {
+            let z = z0 + n as i32;
+            for j in 0..bd {
+                for i in 0..bw {
+                    if world
+                        .voxel(bx0 + i, by0 + j, z)
+                        .is_some_and(|v| library.is_built(v.tile_id))
+                    {
+                        slab[(j * bw + i) as usize] = true;
+                    }
+                }
+            }
+        }
+
         Some(Self {
             origin,
             species,
@@ -212,7 +254,29 @@ impl Envelope {
             radius,
             truncated,
             cap,
+            dead,
+            blocked,
+            bx0,
+            by0,
+            bw,
+            bd,
         })
+    }
+
+    /// Whether built work stands in a tile, so no crown may fill it.
+    ///
+    /// Levels above the tree's own top read the top level's mask: a roof over
+    /// the tree is still a roof for whatever rises into the headroom.
+    pub fn blocked(&self, x: i32, y: i32, z: i32) -> bool {
+        if self.blocked.is_empty() {
+            return false;
+        }
+        let (i, j) = (x - self.bx0, y - self.by0);
+        if i < 0 || j < 0 || i >= self.bw || j >= self.bd {
+            return false;
+        }
+        let level = (z - self.z0).clamp(0, self.blocked.len() as i32 - 1) as usize;
+        self.blocked[level][(j * self.bw + i) as usize]
     }
 
     pub fn height(&self) -> i32 {
@@ -299,7 +363,12 @@ pub fn anchor(env: &Envelope) -> [f32; 3] {
 /// change shape as neighbouring tiles arrive.
 pub fn seed(env: &Envelope, world_origin: (i32, i32, i32)) -> u64 {
     let (ox, oy, oz) = env.origin;
-    rng::hash3(ox + world_origin.0, oy + world_origin.1, oz + world_origin.2, env.species as u64)
+    factory::seed(
+        ox + world_origin.0,
+        oy + world_origin.1,
+        oz + world_origin.2,
+        env.species,
+    )
 }
 
 /// How far the tree's tiles reach from its trunk, in tiles.
@@ -362,7 +431,11 @@ pub fn envelope(env: &Envelope) -> trees::Envelope {
             for iz in 0..side as i32 {
                 for ix in 0..side as i32 {
                     let (dx, dz) = ((ix - r) as f32, (iz - r) as f32);
-                    if (dx * dx + dz * dz).sqrt() <= radius {
+                    // The grid is centred on the trunk's tile, so a cell is the
+                    // tile that far from it.
+                    let blocked =
+                        env.blocked(env.base.0 + ix - r, env.base.1 + iz - r, env.z0 + i);
+                    if !blocked && (dx * dx + dz * dz).sqrt() <= radius {
                         foot.cells[(iz * side as i32 + ix) as usize] = true;
                     }
                 }
@@ -386,8 +459,19 @@ pub fn params(
     // A weeping species is not something the growth tokens say; the raws only
     // name it. Its crown is an ordinary one, so all this changes is whether
     // strands hang off it.
-    let weeping = library.plant_id(env.species).contains("WILLOW");
-    let mut params = if env.cap {
+    let weeping = factory::weeping(&library.plant_id(env.species));
+    let mut params = if env.dead {
+        // What the factory resolves a dead tree to: bare limbs, no foliage.
+        // Everything below still sizes it from DF's own bounds.
+        match factory::resolve(Class::DeadTree, factory::Style::current()) {
+            factory::Treatment::Grown(kind, preset) => {
+                let mut params = *preset;
+                params.kind = kind;
+                params
+            }
+            _ => trees::dead_tree(),
+        }
+    } else if env.cap {
         trees::mushroom_tree()
     } else if weeping {
         trees::willow()
@@ -458,4 +542,75 @@ pub fn grow(
     let voxels = trees::rasterise(&skeleton, DETAIL as u32);
     PHASES.rasterise.since(started);
     voxels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-tile tree standing four levels tall, with `built` tiles marked in
+    /// a box around it.
+    fn envelope_with(built: &[(i32, i32, i32)]) -> Envelope {
+        let (base, height) = ((10, 10, 5), 4);
+        let span = 4;
+        let (bx0, by0) = (base.0 - span, base.1 - span);
+        let (bw, bd) = (2 * span + 1, 2 * span + 1);
+        let mut blocked = vec![vec![false; (bw * bd) as usize]; height as usize];
+        for &(x, y, z) in built {
+            let (i, j, level) = (x - bx0, y - by0, z - base.2);
+            blocked[level as usize][(j * bw + i) as usize] = true;
+        }
+        Envelope {
+            origin: base,
+            species: 0,
+            base,
+            z0: base.2,
+            z1: base.2 + height - 1,
+            crown_z0: base.2 + 1,
+            x0: base.0,
+            y0: base.1,
+            w: 1,
+            d: 1,
+            level: vec![vec![true]; height as usize],
+            centre: vec![[base.0 as f32 + 0.5, base.1 as f32 + 0.5]; height as usize],
+            radius: vec![2.0; height as usize],
+            truncated: false,
+            cap: false,
+            dead: false,
+            blocked,
+            bx0,
+            by0,
+            bw,
+            bd,
+        }
+    }
+
+    /// Where a tile sits in the growth crate's own footprint grid, which is
+    /// centred on the tile the trunk stands on.
+    fn cell(env: &Envelope, foot: &trees::Footprint, x: i32, y: i32) -> bool {
+        let r = foot.width as i32 / 2;
+        foot.get(x - env.base.0 + r, y - env.base.1 + r)
+    }
+
+    #[test]
+    fn built_work_is_cut_out_of_the_envelope() {
+        let plain = envelope(&envelope_with(&[]));
+        assert!(cell(&envelope_with(&[]), &plain.levels[1], 11, 10), "the crown reaches here");
+
+        // A constructed wall one tile east, on the second level.
+        let env = envelope_with(&[(11, 10, 6)]);
+        let bounds = envelope(&env);
+        assert!(!cell(&env, &bounds.levels[1], 11, 10), "the crown grew into built work");
+        assert!(cell(&env, &bounds.levels[1], 9, 10), "and stopped growing anywhere else");
+        // Only that level: the tile below the wall is still open air.
+        assert!(cell(&env, &bounds.levels[0], 11, 10), "a wall above closed the level below it");
+    }
+
+    #[test]
+    fn a_tree_with_nothing_built_near_it_is_unchanged() {
+        let env = envelope_with(&[]);
+        let bounds = envelope(&env);
+        assert!(bounds.levels.iter().any(|f| f.cells.iter().any(|c| *c)));
+        assert!(!env.blocked(11, 10, 6));
+    }
 }

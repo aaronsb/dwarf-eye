@@ -13,13 +13,23 @@
 //!
 //! Weeping species also hang streamers, which are quads rather than voxels;
 //! they are meshed by the growth crate and handed to whichever chunk holds
-//! them.
+//! them, clipped to the level that holds each quad so a strand ends at a
+//! hidden level instead of hanging through it.
+//!
+//! Plants that stand in a single tile — shrubs, saplings, dead stems — are
+//! grown here too, but on their own terms: one plant per tile, grown at the
+//! preset's natural size and then fitted into the tile DF gave it, cached by
+//! that tile so a re-mesh never regrows one. They are not sliced into the
+//! chunk's voxel volume, because a tile's worth of plant at the volume's
+//! resolution is a blob; they are meshed by the growth crate at its own
+//! resolution and stamped in.
 
+use crate::factory::{self, Class, Extent, Style, Treatment};
 use crate::library::TileLibrary;
 use crate::mesh::{MeshData, MeshOptions, Z_SCALE};
 use crate::tree::{DETAIL, Envelope, Habit};
+use crate::world::{BLOCK, Chunk, Voxel, World};
 use dwarf_eye_art::raws::TreeGrowth;
-use crate::world::{BLOCK, Chunk, World};
 use dwarf_eye_trees as trees;
 use dwarf_eye_trees::{Kind, TreeMesh};
 use std::collections::HashMap;
@@ -224,10 +234,175 @@ fn strands(grown: &trees::VoxelTree, at: [f32; 3]) -> TreeMesh {
     mesh
 }
 
+/// Sub-voxels per tile of a standing plant's own height, before it is fitted
+/// into its tile.
+///
+/// A shrub is a bit over two tiles tall in the preset's own units, so at two it
+/// lands at about the four voxels per tile a tree is cut into: a shrub is then
+/// drawn at the same density as the crown above it, which is what keeps a
+/// meadow of them affordable — they are small but there are thousands.
+///
+/// `DWARF_EYE_PLANT_VOXELS` overrides it. Three is visibly rounder close up and
+/// costs about half a second more on the first mesh of a cached map, and half
+/// again as many triangles.
+const DEFAULT_PLANT_DETAIL: u32 = 2;
+
+fn plant_detail() -> u32 {
+    static DETAIL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DETAIL.get_or_init(|| {
+        std::env::var("DWARF_EYE_PLANT_VOXELS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PLANT_DETAIL)
+            .clamp(1, 8)
+    })
+}
+
+/// Plants kept before the cache is dropped and regrown.
+///
+/// Every plant is a pure function of its tile and its species, so forgetting
+/// one costs time and never changes what is drawn. Without a bound the cache
+/// would hold every plant ever walked past.
+const PLANT_CACHE: usize = 40_000;
+
+/// One plant standing in one tile, grown once and kept by the tile it stands
+/// on.
+///
+/// Held in tile-local space — x and z span the tile, y rises from its floor —
+/// so stamping it into a chunk is a translation. The texture repeats once per
+/// world tile and the translation is whole tiles, so the surface lands at the
+/// same texel phase wherever it is stamped.
+pub struct Plant {
+    bark: MeshData,
+    leaf: MeshData,
+    pub triangles: usize,
+}
+
+/// Grows one standing plant and fits it into its tile.
+///
+/// Dwarf Fortress gives a shrub or a sapling exactly one tile: this is the
+/// whole of what it contributes. The shape inside that is the preset's, grown
+/// at the size its grammar expects and then scaled down as a whole, because a
+/// grammar asked for a plant one tile tall grows a stub rather than a small
+/// plant.
+fn sprout(
+    library: &mut TileLibrary,
+    class: Class,
+    voxel: Voxel,
+    at: (i32, i32, i32),
+) -> Option<Plant> {
+    let Treatment::Grown(kind, preset) = factory::resolve(class, Style::Grown) else {
+        return None;
+    };
+    let mut params = *preset;
+    params.kind = kind;
+    params.height = factory::standing_height(class, &params);
+    // A sapling is a tree that has not grown up yet, so its species has real
+    // foliage art to read; a shrub's sheet is DF's one generic sprite, and the
+    // colour DF paints its tile with is all that separates one from another.
+    if class == Class::Sapling {
+        let leaf: Vec<trees::Rgb> = library
+            .leaf_tones(voxel.mat_index, 3)
+            .into_iter()
+            .map(|c| trees::Rgb(c[0], c[1], c[2]))
+            .collect();
+        if let Some(&tip) = leaf.last() {
+            params.palette.tip = tip;
+            params.palette.leaf = leaf;
+        }
+        let bark: Vec<trees::Rgb> = library
+            .bark_tones(voxel.mat_index, 2)
+            .into_iter()
+            .map(|c| trees::Rgb(c[0], c[1], c[2]))
+            .collect();
+        if !bark.is_empty() {
+            params.palette.bark = bark;
+        }
+    } else {
+        factory::recolour(&mut params, class, voxel.color);
+    }
+
+    let seed = factory::seed(at.0, at.1, at.2, voxel.mat_index);
+    let started = std::time::Instant::now();
+    let grown = trees::rasterise(&trees::grow(&params, seed, None), plant_detail());
+    let bark = trees::mesh_of(&grown, Some(Kind::Bark));
+    let leaf = trees::mesh_of(&grown, Some(Kind::Leaf));
+    timing::PHASES.plants.since(started);
+
+    let (scale, floor, middle) = fitted(&[&bark, &leaf])?;
+    let bark = tile_local(&bark, scale, floor, middle);
+    let leaf = tile_local(&leaf, scale, floor, middle);
+    let triangles = bark.triangle_count() + leaf.triangle_count();
+    Some(Plant { bark, leaf, triangles })
+}
+
+/// How much to shrink a grown plant so it stands inside one tile, the height it
+/// starts from and the middle of its footprint.
+fn fitted(meshes: &[&TreeMesh]) -> Option<(f32, f32, [f32; 2])> {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for mesh in meshes {
+        for p in &mesh.positions {
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(p[axis]);
+                hi[axis] = hi[axis].max(p[axis]);
+            }
+        }
+    }
+    if lo[0] > hi[0] {
+        return None;
+    }
+    let span = |axis: usize| (hi[axis] - lo[axis]).max(0.01);
+    // Never enlarged: a plant DF gives one tile may be smaller than one, and a
+    // tuft of grass blown up to a tile tall is a hedge.
+    let scale = (1.0 / span(1)).min(1.0 / span(0).max(span(2))).min(1.0);
+    Some((scale, lo[1], [(lo[0] + hi[0]) * 0.5, (lo[2] + hi[2]) * 0.5]))
+}
+
+/// Moves a grown plant into its tile: scaled, stood on the floor and centred.
+///
+/// The texture coordinates are scaled with the geometry, so a shrunk plant
+/// still shows the same texel size as the ground it stands on.
+fn tile_local(mesh: &TreeMesh, scale: f32, floor: f32, middle: [f32; 2]) -> MeshData {
+    let mut out = MeshData::default();
+    for (n, p) in mesh.positions.iter().enumerate() {
+        out.positions.push([
+            (p[0] - middle[0]) * scale + 0.5,
+            (p[1] - floor) * scale * Z_SCALE,
+            (p[2] - middle[1]) * scale + 0.5,
+        ]);
+        let normal = mesh.normals[n];
+        out.normals.push(normal);
+        let lit = face_shade(normal);
+        let c = mesh.colors[n];
+        out.colors.push([c[0] * lit, c[1] * lit, c[2] * lit, c[3]]);
+        let uv = mesh.uvs[n];
+        out.uvs.push([uv[0] * scale, uv[1] * scale]);
+    }
+    out.indices.extend_from_slice(&mesh.indices);
+    out
+}
+
+/// How a face is lit, from the way it points: the same six shades a sliced
+/// tree's faces get, so a shrub sits in the same light as the crown above it.
+fn face_shade(normal: [f32; 3]) -> f32 {
+    if normal[1] > 0.5 {
+        FACE_SHADE[3]
+    } else if normal[1] < -0.5 {
+        FACE_SHADE[2]
+    } else if normal[0].abs() > 0.5 {
+        FACE_SHADE[0]
+    } else {
+        FACE_SHADE[4]
+    }
+}
+
 /// Trees that have been grown, kept so a chunk never regrows one.
 #[derive(Default)]
 pub struct Forest {
     trees: HashMap<(i32, i32, i32), Option<Arc<TreeVoxels>>>,
+    /// Standing plants, by the absolute tile each one stands on.
+    plants: HashMap<(i32, i32, i32), Option<Arc<Plant>>>,
 }
 
 /// One chunk's trees, split by the material each surface wants. Empty meshes
@@ -272,6 +447,8 @@ pub struct CanopyBudget {
     pub leaf_voxels: usize,
     pub bark_voxels: usize,
     pub trees: usize,
+    /// Standing plants grown into this chunk.
+    pub plants: usize,
 }
 
 impl Forest {
@@ -288,6 +465,10 @@ impl Forest {
                     && (origin.2 - z).abs() <= 20
             })
         });
+    }
+
+    pub fn plant_count(&self) -> usize {
+        self.plants.values().filter(|p| p.is_some()).count()
     }
 
     pub fn tree_count(&self) -> usize {
@@ -343,13 +524,16 @@ impl Forest {
         origins.sort_unstable();
         origins.dedup();
         timing::PHASES.nearby.since(started);
-        if origins.is_empty() {
-            return meshes;
-        }
 
         // Only the top of a column carries what rises above it.
         let (cx, cy) = (chunk.block_x, chunk.block_y);
         let above = if world.chunk(cx, cy, chunk.z + 1).is_some() { 0 } else { OVERHEAD };
+
+        self.sow(chunk, opts, library, world_origin, &mut meshes, budget);
+        if origins.is_empty() {
+            return meshes;
+        }
+
         let mut volume = Volume::new(chunk, above);
         for (origin, species) in origins {
             let grown = self.tree(world, library, origin, species, world_origin);
@@ -358,12 +542,84 @@ impl Forest {
             let started = std::time::Instant::now();
             volume.absorb(&grown);
             timing::PHASES.absorb.since(started);
-            hang(&grown.streamers, chunk, &mut meshes.streamers);
+            // What a strand may not hang through: built work and rock. Its own
+            // tree is the exception, since a strand starts inside the crown.
+            let solid = |x: i32, y: i32, z: i32| {
+                world.voxel(x, y, z).is_some_and(|v| {
+                    !library.of_tree(v.tile_id)
+                        && (library.is_built(v.tile_id) || v.solid.occludes())
+                })
+            };
+            hang(&grown.streamers, chunk, above, &solid, &mut meshes.streamers);
         }
         let started = std::time::Instant::now();
         emit(&volume, &mut meshes, budget);
         timing::PHASES.emit.since(started);
         meshes
+    }
+
+    /// Grows the plants standing in this chunk's own tiles.
+    ///
+    /// A standing plant never leaves its tile, so a chunk's plants are exactly
+    /// the ones its own tiles hold: no halo to scan, and nothing to slice.
+    fn sow(
+        &mut self,
+        chunk: &Chunk,
+        opts: MeshOptions,
+        library: &mut TileLibrary,
+        world_origin: (i32, i32, i32),
+        meshes: &mut CanopyMeshes,
+        budget: &mut CanopyBudget,
+    ) {
+        let style = Style::current();
+        if style != Style::Grown {
+            return;
+        }
+        let (ox, oy, oz) = chunk.origin();
+        for ly in 0..BLOCK {
+            for lx in 0..BLOCK {
+                let voxel = chunk.get(lx, ly);
+                if voxel.hidden && !opts.show_hidden {
+                    continue;
+                }
+                let Some(plan) = library.plan(voxel.tile_id) else { continue };
+                if plan.extent != Extent::Tile || !plan.grown(style) {
+                    continue;
+                }
+                let at = (ox + lx, oy + ly, oz);
+                let Some(plant) = self.plant(library, plan.class, voxel, at, world_origin) else {
+                    continue;
+                };
+                let offset = [at.0 as f32, at.2 as f32 * Z_SCALE, at.1 as f32];
+                meshes.bark.stamp(&plant.bark, offset, [1.0; 3]);
+                meshes.broadleaf.stamp(&plant.leaf, offset, [1.0; 3]);
+                budget.plants += 1;
+                budget.triangles += plant.triangles;
+            }
+        }
+    }
+
+    /// One tile's plant, grown on first sight and kept.
+    fn plant(
+        &mut self,
+        library: &mut TileLibrary,
+        class: Class,
+        voxel: Voxel,
+        at: (i32, i32, i32),
+        world_origin: (i32, i32, i32),
+    ) -> Option<Arc<Plant>> {
+        if let Some(found) = self.plants.get(&at) {
+            return found.clone();
+        }
+        if self.plants.len() >= PLANT_CACHE {
+            self.plants.clear();
+        }
+        // Absolute tiles, so a plant is the same plant wherever the render
+        // origin sits.
+        let absolute = (at.0 + world_origin.0, at.1 + world_origin.1, at.2 + world_origin.2);
+        let built = sprout(library, class, voxel, absolute).map(Arc::new);
+        self.plants.insert(at, built.clone());
+        built
     }
 
     /// The trees whose tiles reach into a chunk.
@@ -383,7 +639,9 @@ impl Forest {
                     if v.hidden && !opts.show_hidden {
                         continue;
                     }
-                    if !library.is_trunk(v.tile_id) && library.canopy_part(v.tile_id).is_none() {
+                    // The factory says which tiles belong to a tree; a plant
+                    // standing in one tile is not one of them.
+                    if !library.of_tree(v.tile_id) {
                         continue;
                     }
                     found.push((v.tree_origin(x, y, z), v.mat_index));
@@ -439,44 +697,78 @@ impl Forest {
     }
 }
 
-/// Copies the strands that hang inside this chunk.
+/// Copies the strands that hang inside this chunk, cut at its ceiling, its
+/// floor, and anything solid they meet.
 ///
-/// A quad goes wherever its middle falls, so a strand crossing a chunk floor is
-/// split between the two rather than drawn twice.
-fn hang(strands: &TreeMesh, chunk: &Chunk, out: &mut MeshData) {
+/// A strand is a chain of quads, and where the chain crosses a level the quad
+/// on the boundary is clipped rather than given to one side whole. That is
+/// what makes a curtain end flush with a hidden level instead of hanging
+/// through it, and it keeps neighbouring chunks from drawing the same quad
+/// twice. `above` is the extra levels this chunk carries because nothing is
+/// loaded over it, the same overhead the voxel volume gets.
+///
+/// A strand also stops at whatever it hangs into. A willow leaning over a
+/// roof would otherwise trail its curtain straight through the building, which
+/// reads as vegetation growing out of the masonry; wood and crown are the
+/// exception, because a strand starts inside its own tree.
+fn hang(
+    strands: &TreeMesh,
+    chunk: &Chunk,
+    above: i32,
+    solid: &dyn Fn(i32, i32, i32) -> bool,
+    out: &mut MeshData,
+) {
     if strands.indices.is_empty() {
         return;
     }
     let (ox, oy, oz) = chunk.origin();
-    let inside = |p: [f32; 3]| {
+    let floor = oz as f32 * Z_SCALE;
+    let ceiling = (oz + 1 + above.max(0)) as f32 * Z_SCALE;
+    let over = |p: [f32; 3]| {
         p[0] >= ox as f32
             && p[0] < (ox + BLOCK) as f32
             && p[2] >= oy as f32
             && p[2] < (oy + BLOCK) as f32
-            && p[1] >= oz as f32 * Z_SCALE
-            && p[1] < (oz + 1) as f32 * Z_SCALE
     };
-    for quad in strands.positions.chunks_exact(4).enumerate() {
-        let (n, corners) = quad;
-        let mid = [
-            (corners[0][0] + corners[2][0]) * 0.5,
-            (corners[0][1] + corners[2][1]) * 0.5,
-            (corners[0][2] + corners[2][2]) * 0.5,
-        ];
-        if !inside(mid) {
+    for (n, corners) in strands.positions.chunks_exact(4).enumerate() {
+        // A quad hangs plumb: its first two corners are the top edge, the last
+        // two the bottom, and it stands over one spot on the ground.
+        let (top, bottom) = (corners[0][1], corners[3][1]);
+        let mid = [(corners[0][0] + corners[2][0]) * 0.5, 0.0, (corners[0][2] + corners[2][2]) * 0.5];
+        if !over(mid) || top <= bottom {
+            continue;
+        }
+        let (kept_top, kept_bottom) = (top.min(ceiling), bottom.max(floor));
+        if kept_top <= kept_bottom {
+            continue;
+        }
+        let level = ((kept_top + kept_bottom) * 0.5 / Z_SCALE).floor() as i32;
+        if solid(mid[0].floor() as i32, mid[2].floor() as i32, level) {
             continue;
         }
         let base = n * 4;
+        // How far down the quad each cut falls, so the corner that moves takes
+        // its texture with it.
+        let along = |y: f32| (top - y) / (top - bottom);
+        let cut = |from: usize, to: usize, t: f32| {
+            let (a, b) = (corners[from], corners[to]);
+            let (ua, ub) = (strands.uvs[base + from], strands.uvs[base + to]);
+            (
+                [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t],
+                [ua[0] + (ub[0] - ua[0]) * t, ua[1] + (ub[1] - ua[1]) * t],
+            )
+        };
+        let (high, low) = (along(kept_top), along(kept_bottom));
+        // Corner 0 hangs to corner 3, corner 1 to corner 2.
+        let (p0, uv0) = cut(0, 3, high);
+        let (p1, uv1) = cut(1, 2, high);
+        let (p2, uv2) = cut(1, 2, low);
+        let (p3, uv3) = cut(0, 3, low);
         out.push_textured_quad(
-            [corners[0], corners[1], corners[2], corners[3]],
+            [p0, p1, p2, p3],
             strands.normals[base],
             strands.colors[base],
-            [
-                strands.uvs[base],
-                strands.uvs[base + 1],
-                strands.uvs[base + 2],
-                strands.uvs[base + 3],
-            ],
+            [uv0, uv1, uv2, uv3],
         );
     }
 }
@@ -742,6 +1034,30 @@ mod tests {
         Chunk { block_x, block_y, z, voxels: Vec::new() }
     }
 
+    /// Open air everywhere: nothing for a strand to hang into.
+    fn open(_: i32, _: i32, _: i32) -> bool {
+        false
+    }
+
+    /// One strand quad, hanging from `top` down to `bottom` over one tile.
+    fn strand(x: f32, top: f32, bottom: f32) -> TreeMesh {
+        let mut strands = TreeMesh::default();
+        let quad = [
+            [x, top, 0.5],
+            [x + 0.2, top, 0.5],
+            [x + 0.2, bottom, 0.5],
+            [x, bottom, 0.5],
+        ];
+        for (n, corner) in quad.into_iter().enumerate() {
+            strands.positions.push(corner);
+            strands.normals.push([0.0, 0.0, 1.0]);
+            strands.colors.push([1.0, 1.0, 1.0, 1.0]);
+            strands.uvs.push([0.0, if n < 2 { 0.0 } else { 1.0 }]);
+        }
+        strands.indices.extend(0..6u32);
+        strands
+    }
+
     #[test]
     fn a_shade_is_interned_once_per_surface() {
         let mut volume = Volume::new(&test_chunk(0, 0, 0), 0);
@@ -768,11 +1084,88 @@ mod tests {
         strands.indices.extend(0..12u32);
 
         let mut mesh = MeshData::default();
-        hang(&strands, &test_chunk(0, 0, 3), &mut mesh);
+        hang(&strands, &test_chunk(0, 0, 3), 0, &open, &mut mesh);
         assert_eq!(mesh.triangle_count(), 2, "only the near strand belongs here");
 
         let mut far = MeshData::default();
-        hang(&strands, &test_chunk(2, 0, 3), &mut far);
+        hang(&strands, &test_chunk(2, 0, 3), 0, &open, &mut far);
         assert_eq!(far.triangle_count(), 2, "the far strand belongs two blocks over");
+    }
+
+    #[test]
+    fn a_strand_is_cut_where_a_level_ends() {
+        // One quad hanging from 4.3 down to 3.7, across the floor of level 4.
+        let mut strands = TreeMesh::default();
+        let quad = [[4.0, 4.3, 0.5], [4.2, 4.3, 0.5], [4.2, 3.7, 0.5], [4.0, 3.7, 0.5]];
+        for (n, corner) in quad.into_iter().enumerate() {
+            strands.positions.push(corner);
+            strands.normals.push([0.0, 0.0, 1.0]);
+            strands.colors.push([1.0, 1.0, 1.0, 1.0]);
+            strands.uvs.push([0.0, if n < 2 { 0.0 } else { 1.0 }]);
+        }
+        strands.indices.extend(0..6u32);
+
+        let top = |mesh: &MeshData| {
+            mesh.positions.iter().fold(f32::MIN, |t, p| t.max(p[1]))
+        };
+        let bottom = |mesh: &MeshData| {
+            mesh.positions.iter().fold(f32::MAX, |t, p| t.min(p[1]))
+        };
+
+        let mut lower = MeshData::default();
+        hang(&strands, &test_chunk(0, 0, 3), 0, &open, &mut lower);
+        assert_eq!(lower.triangle_count(), 2);
+        assert!((top(&lower) - 4.0).abs() < 1e-5, "cut at the level's ceiling");
+        assert!((bottom(&lower) - 3.7).abs() < 1e-5, "and hangs to its own tip");
+
+        let mut upper = MeshData::default();
+        hang(&strands, &test_chunk(0, 0, 4), 0, &open, &mut upper);
+        assert_eq!(upper.triangle_count(), 2);
+        assert!((bottom(&upper) - 4.0).abs() < 1e-5, "the rest starts at that cut");
+        // The texture goes with the cut, so neither half repeats the other's
+        // strand: half the quad's v range on each side.
+        let v = |mesh: &MeshData| mesh.uvs.iter().fold(f32::MIN, |t, uv| t.max(uv[1]));
+        assert!((v(&upper) - 0.5).abs() < 1e-5, "the upper half keeps the upper texture");
+    }
+
+    #[test]
+    fn a_strand_stops_at_built_work() {
+        // A willow leaning over a roof: the strand over the built tile is
+        // dropped, the one beside it still hangs.
+        let roof = |x: i32, _y: i32, _z: i32| x == 4;
+        let mut into_roof = MeshData::default();
+        hang(&strand(4.0, 3.9, 3.4), &test_chunk(0, 0, 3), 0, &roof, &mut into_roof);
+        assert_eq!(into_roof.triangle_count(), 0, "a strand hung through the roof");
+
+        let mut beside = MeshData::default();
+        hang(&strand(5.0, 3.9, 3.4), &test_chunk(0, 0, 3), 0, &roof, &mut beside);
+        assert_eq!(beside.triangle_count(), 2, "the strand beside it was cut too");
+    }
+
+    #[test]
+    fn a_grown_plant_stands_inside_its_own_tile() {
+        // The whole of DF's contribution to a standing plant is the one tile it
+        // stands in, so nothing may leave it however the preset grew.
+        for preset in [trees::Preset::Shrub, trees::Preset::Sapling, trees::Preset::TallGrass] {
+            let params = trees::TreeParams::preset(preset);
+            for seed in 0..8u64 {
+                let grown = trees::rasterise(&trees::grow(&params, seed, None), plant_detail());
+                let bark = trees::mesh_of(&grown, Some(Kind::Bark));
+                let leaf = trees::mesh_of(&grown, Some(Kind::Leaf));
+                let (scale, floor, middle) = fitted(&[&bark, &leaf]).expect("grew nothing");
+                for mesh in [&bark, &leaf] {
+                    for p in tile_local(mesh, scale, floor, middle).positions {
+                        assert!(
+                            (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[2]),
+                            "{preset:?} seed {seed} leaned into the next tile at {p:?}"
+                        );
+                        assert!(
+                            (0.0..=Z_SCALE).contains(&p[1]),
+                            "{preset:?} seed {seed} left its level at {p:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

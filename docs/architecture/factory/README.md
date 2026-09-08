@@ -1,10 +1,11 @@
 # The entity factory
 
-Status: planned as a registry (issue #5); the first override, trees, is landed
-(`crates/dwarf-eye-world/src/{tree.rs,canopy.rs}`, 62a35e4); the rest of the
-plant work is in flight (issue #1).
+Status: the registry is landed for vegetation
+(`crates/dwarf-eye-world/src/factory.rs`); trees, shrubs, saplings, dead plants
+and tufts route through it (issue #1). Items, units and buildings are still
+unclassified (issues #15, #5).
 
-## What it will do
+## What it does
 
 Take DF's own entity stream, classify every tile, plant, item and building, and
 resolve each class to a treatment. The default treatment is the faithful
@@ -43,13 +44,33 @@ and a seed; the grammar in `dwarf-eye-trees` supplies the shape
 | [prefabs.md](prefabs.md) | voxel prefab instances such as vox-uristi's `.vox` buildings |
 | [registering.md](registering.md) | how a new override is registered |
 
-## What exists today
+## The registry
 
-Classification is scattered rather than registered. `library.rs:mode_for` maps a
-`TiletypeShape` to one of five `RenderMode` values, `library.rs:canopy_part` and
-`library.rs:is_trunk` mark tree tiles, and `mesh.rs:build_chunk_budgeted` early-outs
-on those two before anything else. Issue #5 replaces the early-outs with registry
-lookups.
+`factory.rs` is five calls and no state:
+
+```
+classify(Tile, Near) -> Class      // Tree, Shrub, Sapling, DeadTree, TallGrass, Boulder, Built, Other
+extent(Tile) -> Extent             // Tile or Tree: how much room DF gives it
+resolve(Class, Style) -> Treatment // Sprite, Grown(VegetationKind, TreeParams), Billboard
+plan(Tile, Near) -> Plan           // the pair, decided once per tiletype
+seed(x, y, z, species) -> u64      // absolute tile and species, nothing else
+```
+
+`Tile` is what DF says about a tiletype: shape, material, special, DFHack's
+name, and the species standing there. `Near` carries only what the tile cannot
+say for itself — today, whether DF links it to a tree, which is what separates
+a cap tile from masonry.
+
+`TileLibrary::load` calls `plan` once per tiletype and keeps the answer, so a
+mesher asking per tile pays one hash lookup.
+`mesh.rs:build_chunk_budgeted` asks `Plan::grown`: what the factory grows is
+skipped by the sprite path, and a one-tile plant keeps the ground slab the
+billboard used to stand on. `Style::current` reads `DWARF_EYE_PLANTS=billboard`
+once, which puts standing plants back on crossed sprites for comparison.
+
+Sprite geometry is unchanged underneath: `library.rs:mode_for` still maps a
+`TiletypeShape` to one of five `RenderMode` values for everything the factory
+leaves alone.
 
 | `RenderMode` | Tiles | Geometry |
 |---|---|---|
@@ -72,6 +93,8 @@ resolved `FlatTile` to an atlas cell since the ground atlas landed.
   coordinates and never from the tile configuration around the entity.
 - Classification also feeds the heightfield work, so a class has to say what a
   tile is, not only how to draw it.
+- `Class::Built` is what someone raised: nothing vegetal is grown into it, and
+  a crown's envelope is clipped by it (`tree.rs:Envelope::blocked`).
 
 ## Related issues
 
