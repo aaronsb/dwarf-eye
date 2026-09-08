@@ -31,6 +31,46 @@ one ground mesh plus crown instances, rebuilt whenever the window moves.
 Both land in one `field::Field`, keyed by absolute region tile: region samples
 first, then the rest filled bilinearly from the world map.
 
+## What it wears
+
+The coarse ground is drawn with **the fine map's own Dwarf Fortress sprites**,
+not with flat vertex colour. Before, the fine window read as a darker, greener
+patch in the middle of a paler band and the seam showed as a change of colour
+rather than of detail.
+
+`skin.rs` picks the sheet by biome:
+
+| surface | sheet | chosen by |
+|---|---|---|
+| turf | `GRASS_5` | vegetation at or above 20 |
+| bare ground | `DIRT_FLOOR_5` | below that |
+| bare rock | `STONE_FLOOR_5` | elevation at or above 150 |
+| snow | `ROUGH_ICE_FLOOR` | snow over 60 |
+| riser, wet and low ground | `SOIL_WALL` side strip | drainage under 60 |
+| riser, drained or mountain | `STONE_WALL` side strip | drainage 60 up, or elevation 150 up |
+
+Those are exactly the families `library.rs:pack_under` and `pack_walls` already
+fill for the fine mesher, reached through the read-only `ground_cell` and
+`wall_side_cell`; the horizon packs nothing of its own.
+
+**The tint is measured, not assumed.** `skin.rs:cell_mean` reads each packed
+cell's mean back off the atlas in linear light, and the vertex colour is the
+colour the survey asks for divided by that mean, so the surface averages to
+exactly that colour whatever the sheet is. Multiplying a near-grey sheet by the
+colour outright, the way the fine mesher does, turns every snowy cell white:
+DF's rough ice floor is near-white to begin with.
+
+**The repeat is the shader's.** A terrace slab is one quad six to forty-eight
+tiles across and the atlas has no room around a cell to tile into, so a vertex
+carries only the cell's own centre UV. `cloud_shadow.wgsl:horizon_texel` floors
+that UV into the atlas grid to recover the cell, then wraps the sprite across
+the surface by world position — one sprite to a world tile, Dwarf Fortress's own
+density and the fine map's, so the two meet without a change of scale. Gradients
+come from the unwrapped coordinate, so the mip level is continuous across a tile
+boundary. Untextured horizon geometry — the world grid, rivers, buildings, the
+blob shadows — points at the white cell and comes through as its own vertex
+colour, unchanged.
+
 ## One surface model
 
 Fine tiles step by whole z-levels. A smooth coarse surface can therefore only
@@ -68,25 +108,47 @@ into spurs. Water is left alone.
 
 The whole arbitration between tiers is the block mask, and `fine::FineSurface`
 is the horizon's half of it. It surveys the loaded chunks once per build and
-keeps, per 16-tile block column whose lowest chunk is at least half solid, the
-**30th percentile of the column's top solid z** — a z-level, not a distance, so
-a coarse slab and a fine floor at the same level are the same plane. It is the
-same grounded-column rule as `worker.rs:grounded_blocks`, which ships the same
-set to the GPU as the mask texture.
+keeps two things per 16-tile block column whose lowest chunk is at least half
+solid: the **30th percentile of the column's top solid z**, which is the
+arbitration and matches the set `worker.rs:grounded_blocks` ships to the GPU as
+the mask texture; and the **top solid z of every tile in it**, skipping tiles
+inside a tree, which is what the stitch is built from. A percentile is a
+statistic: snapped to it, a coarse slab stood two or three levels off the floor
+it was meant to meet wherever the block was not flat, with a pale riser between
+them and the fine window's own strata showing under its rim.
 
-The rule, `terrace.rs:cell_level`:
+A cell that touches the fine map is therefore **not a slab**. `stitch.rs` draws
+it as a triangle fan over its own perimeter:
 
-1. over a grounded column, the coarse band draws nothing (and the mask would
-   discard it anyway);
-2. a cell with a grounded column as one of its four neighbours takes **that
-   column's own level**, the lowest where several are adjacent, so the coarse
-   never rides over fine ground;
-3. every other cell takes the quantised survey.
+- along a side that faces fine ground the perimeter carries one vertex per
+  **tile**, at that fine tile's own top level, so the two surfaces are one plane
+  tile by tile;
+- along every other side it carries the cell's quantised level;
+- a vertex between two fine tiles takes the lower of them, so the outline is one
+  polyline rather than a staircase with gaps.
 
-At the rim a one-tile skirt hangs from the cell's edge whatever the levels say,
-because the fine floor's own rim faces cover the rest and a gap there is a hole
-in the world. Risers hang `RISER_SKIRT` 2.0 below the cell they drop to, which
-covers the case where two bands of different pitch disagree by a level.
+The level difference is then spread across the width of the cell instead of
+standing up as a riser. Consecutive perimeter vertices are shared and every one
+is a corner of a triangle, so the fan has no gaps and no T-junctions inside
+itself; `stitch.rs:fan_area` pins that in a test by checking the fan covers the
+cell's own area exactly.
+
+Terrace quantisation still applies **beyond** the strip: a stitched cell is the
+only place a coarse surface holds a level that is not a whole one, and
+`terrace.rs:cell_level` returns the stitched level there so a neighbouring
+slab's riser hangs from what the stitch actually holds.
+
+`stitch.rs:border` searches outward up to the cell's own width for the fine
+edge, because the two grids do not line up — block columns are sixteen tiles and
+the near band's cells are six — and `emit_cell` drops a cell only when all four
+of its corners are covered, so the tiles between the last full cell and the
+block boundary still get ground from one tier or the other.
+
+A skirt in the riser's own wall side texture hangs `SKIRT` 1.5 below every
+stretch of outline the fine map set, which covers both the crack where two bands
+of different pitch disagree and the strata the fine map shows where its edge
+falls on a slope. Elsewhere risers hang `RISER_SKIRT` 2.0 below the cell they
+drop to.
 
 Only the quantisation is a mode switch: were the fine tier ever smoothed
 (issue #6), the boundary snap to fine column heights is unchanged and the
@@ -99,11 +161,36 @@ terracing is what would be swapped out.
 `dwarf-eye-trees` preset — and its `vegetation` sets the count:
 
 ```
-count = round(PER_TILE * clamp01((vegetation - FLOOR) / (100 - FLOOR)) * fade)
-fade  = 1 inside NEAR, falling linearly to 0 at REACH
+count    = round(wanted * fade * treeline)
+wanted   = mix(seen, PER_TILE * clamp01((vegetation - FLOOR) / (100 - FLOOR)),
+               clamp01(distance_to_fine_ground / BLEND))
+fade     = 1 inside NEAR, falling linearly to 0 at REACH
+treeline = clamp01((TREELINE - elevation) / TREELINE_TAPER)
 ```
 
-with `PER_TILE` 20, `FLOOR` 15, `NEAR` 720 tiles and `REACH` 1920. Position,
+with `PER_TILE` 20, `FLOOR` 15, `NEAR` 720 tiles, `REACH` 1920, `BLEND` 200,
+`TREELINE` 150 and `TREELINE_TAPER` 10.
+
+Four rules keep that honest against what the player can actually see:
+
+- **The fine map wins at its own edge.** `vegetation` is a 48-tile average and
+  says nothing about the clearing the character is standing in.
+  `fine::FineSurface::nearby_density` counts distinct tree origins per block
+  column while it is surveying the ground anyway, and `crown_count_near` blends
+  from that observed density at the window's edge to the survey's over `BLEND`
+  tiles. A treeless window edge gives a treeless surround; a dense one continues
+  the forest.
+- **A tile that names no species grows nothing**, whatever its vegetation says:
+  `vegetation` counts grass and shrubs too, and `tree_materials` is DF saying
+  outright what wood is there.
+- **Nothing grows at the tree line.** Elevation 150 and up is DF's mountain
+  band, and the density tapers to nothing over the ten levels below it, so the
+  line is soft rather than a ring drawn round a peak.
+- **A site stands in a clearing**: no crown falls on a building footprint
+  (`RegionTile.buildings`) or within `CLEARING` 6 tiles of one.
+
+Only the count changes in any of these, and the count is a prefix of the seeded
+list, so nothing ever moves. Position,
 species, size (0.72 to 1.35 of the preset's height) and yaw all come from
 `hash(rx, ry, k)` on the region tile's **absolute** coordinates, so a tree keeps
 its spot as the window moves and thinning a patch drops the tail of the list
@@ -117,11 +204,74 @@ spruce or a standing dead tree, so the far band is not one green. `EMERGENT` 5%
 of trees are `EMERGENT_SCALE` 1.8 times their jittered size, which breaks the
 single-storey look. All of it off the same `hash(rx, ry, k)`.
 
-Which stage of the tree chain an instance draws at is projected size:
-`dwarf_eye_trees::crown` while `height * 30` exceeds the distance to it,
-`dwarf_eye_trees::crown_box` (12 triangles) beyond that, and past 1920 tiles
-nothing — `terrace.rs:canopy_at` hands the foliage back to the ground as colour
-over the same interval, so the two never double-count.
+## The tree chain
+
+Which stage an instance draws at is decided by **the camera's distance to that
+tree**, not by its distance from the window's centre. A region-sourced tree can
+stand a few tiles from the eye — the live window is 144 tiles square and the
+camera walks to its edge — and the old rule drew those as boxes the size of
+houses.
+
+Every placed tree is one entity per stage, each carrying its own
+`VisibilityRange` (`main.rs:horizon_ranges`), and Bevy does the swapping the way
+it does for the canopy bands:
+
+| stage | mesh | ends at | shadow |
+|---|---|---|---|
+| grown | `horizon::grown`, a grown tree at one voxel to a tile | `1.5 N` | casts |
+| crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(3 N, 150)` | casts |
+| box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | a blob |
+
+`N` is the canopy's own near band (`canopy::near_band`, 109 tiles into a
+720-tall window), so a longer lens or a taller window pushes the whole chain
+out. The projected-size rule would put the grown stage at `4 N` — a one-tile
+leaf voxel is two pixels four times further out than a quarter-tile one — and
+the triangle budget will not carry it: a grown far tree is about eight hundred
+triangles and the count goes with the square of the reach. `1.5 N`
+(`main.rs:GROWN_REACH`) is where a box crown starts reading as a box, which is
+what the stage exists to push back. Hand-offs dither across
+`HORIZON_CROSSFADE` 0.35 of the edge, wider than the canopy's 0.15, because the
+shapes either side differ more and there is no cutout to pay for.
+
+Past 1920 tiles nothing is placed at all — `terrace.rs:canopy_at` hands the
+foliage back to the ground as colour over the same interval, so the two never
+double-count.
+
+Growth is the expensive half and there is no per-tree data out here to preserve,
+so `grown.rs` grows `VARIANTS` 6 canonical shapes per species at
+`GROWN_HEIGHT` 7 tiles, caches them for the process, and lets the instance
+transform give each tree its height and its yaw. A batch is one species, one
+variant and one stage; a batch's mesh has a height of its own and an instance is
+scaled by its own height over that, so a tree is the same size whichever stage
+draws it.
+
+Every stage wears the canopy's leaf surface on an opaque copy of the canopy
+material with the horizon's block mask over it
+(`main.rs:HorizonCanopyMaterial`). An instanced crown cannot carry world-space
+UVs in its vertex buffer the way a chunk's mesh does — the instance's scale
+would take them with it and every tree would wear a different texel size — so
+`cloud_shadow.wgsl:horizon_leaf` derives them from the world position instead,
+which puts the near canopy's own density on a grown tree and a box crown alike.
+The texture is a mipped, linearly minified copy of the leaf cutout
+(`texture.rs:tiled_image`): the near band's nearest sampling with no mip chain
+is pure sparkle at this range.
+
+## Shadows
+
+Everything inside the sun's cascades casts one. Bevy's default
+`CascadeShadowConfig` reaches 150 tiles (`main.rs:SHADOW_DISTANCE`), the grown
+and crown stages are wholly inside that, and the box stage's near edge is held
+at or beyond it, so nothing inside cascade range is shadowless.
+
+Past the cascades a shadow map has nothing left to resolve a tree with, and a
+far band with no shadows at all reads as flat, so the box stage casts a **blob**
+instead: one dark translucent quad per instance lying on the ground, two
+triangles, turned to the sun's azimuth and stretched along it by the tree's
+height over the tangent of the sun's elevation, capped at
+`BLOB_MAX_STRETCH` 4 crown widths. `main.rs:aim_blob_shadows` re-aims them when
+the sun has moved more than two degrees and fades them out as it sets. They
+carry the box stage's own `VisibilityRange`, so they appear exactly where the
+box stage does.
 
 The canonical crown is **axis-aligned boxes**, not a faceted ellipsoid: at this
 range a rounded solid is only ever a dozen flat facets, and their angled edges
@@ -164,13 +314,23 @@ tiles of region details):
 
 | | triangles |
 |---|---|
-| ground: terraces, world grid, rivers, sites | 130k |
-| 8.7k crown instances (1.3k crowns, 7.4k boxes) | 129k |
-| **total** | **259k** |
+| ground: terraces, stitch fans, world grid, rivers, sites | 136k |
+| 8.3k trees, if every one drew grown | 6.5M |
+| 8.3k trees, if every one drew its canonical crown | 247k |
+| 8.3k trees, if every one drew its box | 99k |
+| blob shadows, two triangles a tree | 17k |
 
-Built in 0.08 s. The band it replaces was 359k triangles of smooth 48-pitch
-grid running twelve world tiles out, most of it interpolated from the world map
-and carrying no more information than the 768-pitch grid does.
+The three tree rows are alternatives, not a sum: a tree draws at one stage, and
+which one is its own distance to the camera. What actually reaches the GPU in a
+frame is far less than the grown row — about 320 trees are inside `1.5 N` at
+720p from a camera at eye level — and the viewer's own counter is the number to
+read. Measured drawn totals, scene-wide: **434k triangles at 60 fps at eye
+level, 994k at 54 fps from 320 tiles up**, against 810k at 95 fps and 383k at 61
+fps for the band this replaces (the two are not the same scene: the earlier one
+drew far fewer horizon trees near the eye, which is the fault this pass fixed).
+
+Entities are three per tree plus one blob on the box stage, so 8.3k trees is
+about 33k entities; only the stage in range draws.
 
 ## Invariants and gotchas
 
@@ -184,11 +344,21 @@ and carrying no more information than the 768-pitch grid does.
 - The render origin is `block_pos * 48`, so the render-local 48- and 16-tile
   grids align with region tiles and blocks. Seeds nevertheless use absolute
   coordinates (render plus origin), because the origin moves with the window.
-- The coarse material is the terrain material with `horizon` set to 1, which
+- The coarse material is the terrain material with `horizon` set non-zero, which
   turns on the block-mask discard in both `cloud_shadow.wgsl` and
   `cloud_shadow_prepass.wgsl`. It has to discard in the prepass too, or its
-  depth hides the fine ground behind it; the same shader serves the shadow pass,
-  so the horizon casts no shadow.
+  depth hides the fine ground behind it. The value says which horizon surface it
+  is: **1** the coarse ground, whose UV names an atlas cell rather than a point,
+  and **2** the far crowns, whose UVs the shader derives from the world
+  position. The prepass reads the same struct and only tests `> 0.5`, so it
+  needs no change when a kind is added — but the layout is shared and duplicated
+  in `cloud_shadow_prepass.wgsl`, so a new **field** means editing three files.
+- The prepass samples the base colour texture at the vertex's own UV, which for
+  the coarse ground is a cell's centre and always opaque, so the alpha mask
+  never discards the band. Wrapping in the prepass too would be wasted work.
+- The horizon ground still casts no shadow — the same prepass shader serves the
+  shadow pass and discards there. The far **trees** do cast, on their own
+  material, which does not take that path.
 - The smooth world grid runs a world tile under the outermost terrace and four
   units lower there, so the join is a step hidden under the terrace's own outer
   skirt. There is still no true skirt geometry across that seam, and a low

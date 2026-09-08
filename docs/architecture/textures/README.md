@@ -58,7 +58,15 @@ every run).
   maps DFHack's four floor variants onto `_5`, `_5B`, `_5C`, `_5D`.
 - A sprite below `library.rs:PATTERN_SATURATION` 0.22 is a pattern to tint with
   the tile's material colour; above it, the sprite carries its own colour
-  (`dwarf-eye-art:Sprite::saturation`).
+  (`dwarf-eye-art:Sprite::saturation`). That two-branch rule is the fine
+  mesher's and holds only where the sheet's own mean is near the middle: the
+  coarse horizon divides by the mean it measures off the atlas instead
+  (`horizon/skin.rs:cell_mean`), because DF's rough ice floor is near-white and
+  multiplying it by a snowy colour bleaches the ground.
+- The horizon's coarse ground and risers wear these same sheets, reached through
+  the read-only `library.rs:ground_cell` and `wall_side_cell`; it packs nothing
+  of its own, so a coarse slab and the fine floor beside it come out of one
+  atlas cell ([lod/horizon.md](../lod/horizon.md)).
 - Ground sprites are flattened by cutting alpha at half opacity; wall sprites
   are blended, because DF's wall art is a four-level dither and the alpha
   channel carries as much of the rock as the colour does ([walls.md](walls.md)).
