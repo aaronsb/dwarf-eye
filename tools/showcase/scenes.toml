@@ -1,0 +1,181 @@
+# The showcase scene list. Adding a scene is one entry here and nothing else:
+# the runner shoots what it finds and the gallery page is generated from it.
+#
+#   id        file name (docs/gallery/<id>.png) and anchor
+#   title     heading over the image
+#   group     which section it lands in; the [[group]] list below sets the
+#             order and the section titles, and an unknown group still gets a
+#             section of its own at the end
+#   caption   the prose under the image
+#   baseline  true puts the scene in `make showcase-check`, the visual
+#             regression layer
+#   secs      shot delay in seconds (default 25); the first window pass is ~3 s
+#             on a warm cache, longer on an empty one
+#   [scene.env]  every DWARF_EYE_* knob the shot needs, verbatim
+#
+# The runner adds DWARF_EYE_SHOT, DWARF_EYE_HUD=off and a private
+# XDG_CACHE_HOME. Nothing here may touch the game: pin lighting with
+# DWARF_EYE_HOUR and the sky with DWARF_EYE_CLOUDS or DWARF_EYE_WEATHER, never
+# the game's own clock or weather.
+
+[[group]]
+id = "lighting"
+title = "Light through the day"
+blurb = "The sun follows Dwarf Fortress's own clock. `DWARF_EYE_HOUR` pins the hour the view is lit at and leaves the game's clock where the player left it."
+
+[[group]]
+id = "weather"
+title = "Weather"
+blurb = "DF reports a cloud kind per world tile. The same field is drawn as geometry and marched for shadows, so the sky and the shade on the ground describe one sky."
+
+[[group]]
+id = "vegetation"
+title = "Vegetation"
+blurb = "Trees and plants are grown from DF's bounds, not modelled: seeds come from absolute coordinates plus species."
+
+[[group]]
+id = "terrain"
+title = "Terrain"
+blurb = "Floors are textured from DF's own sprite sheets and drawn as quads; walls, ramps and water come out of the voxel mesher. What stands in frame is whatever the character is standing next to — the map is live."
+
+[[group]]
+id = "horizon"
+title = "Horizon"
+blurb = "Past the 144-tile live window there is no fine detail to be had, so region and world maps become a coarse heightfield out to the skyline."
+
+[[group]]
+id = "walk"
+title = "Walk mode"
+blurb = "Tab hands the camera to the adventurer and stands it in the character's tile at eye height. These shots start in walk mode and never step the character."
+
+[[scene]]
+id = "morning-clear"
+title = "Morning, clear"
+group = "lighting"
+caption = "Half past seven, no cloud. The low sun rakes across the canopy and every crown throws its own shadow west."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "07:30"
+DWARF_EYE_WEATHER = "clear"
+DWARF_EYE_VIEW = "0,-22"
+DWARF_EYE_CAM = "2"
+
+[[scene]]
+id = "noon-cumulus"
+title = "Noon under cumulus"
+group = "weather"
+caption = "Midday with the sun overhead and a half-covered sky. The cloud shadows on the land are marched from the same density volume the puffs are drawn from."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "12:00"
+DWARF_EYE_CLOUDS = "cumulus=0.55"
+DWARF_EYE_VIEW = "0,-16"
+DWARF_EYE_CAM = "3"
+
+[[scene]]
+id = "godrays-fog"
+title = "Low sun, fog, light shafts"
+group = "lighting"
+caption = "Seven in the morning with fog on the ground and cumulus above it. The shafts are a fullscreen pass lit by the shadow cascades and the baked cloud shadow, thickened by the fog."
+[scene.env]
+DWARF_EYE_HOUR = "07:00"
+DWARF_EYE_CLOUDS = "cumulus=0.5,fog=0.4"
+DWARF_EYE_GODRAYS = "density=0.02,strength=0.9"
+DWARF_EYE_VIEW = "-65,-12"
+DWARF_EYE_CAM = "1.2"
+
+[[scene]]
+id = "dawn-crossing"
+title = "Dawn"
+group = "lighting"
+caption = "Ten to six, the sun still under the horizon due east. The atmosphere is raymarched Rayleigh and Mie scattering, so the dawn colour is the sky's own, not a gradient."
+[scene.env]
+DWARF_EYE_HOUR = "05:50"
+DWARF_EYE_VIEW = "-90,-8"
+DWARF_EYE_CAM = "1.2"
+
+[[scene]]
+id = "night-moon"
+title = "Night, by the moon"
+group = "lighting"
+caption = "Midnight. A second directional light lags the sun by the moon's phase, over a starlight ambient floor, with the exposure metered off whichever light is up."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "00:00"
+DWARF_EYE_VIEW = "0,-14"
+DWARF_EYE_CAM = "2.5"
+
+[[scene]]
+id = "rain"
+title = "The rain sky"
+group = "weather"
+caption = "What the `2` key asks the game for, held viewer-side instead: near-total stratus with cumulus under it and a little fog. No drops fall — dwarf-eye draws no precipitation yet, so weather reaches the picture as cloud, light and shade."
+[scene.env]
+DWARF_EYE_WEATHER = "rain"
+DWARF_EYE_HOUR = "15:00"
+DWARF_EYE_VIEW = "0,-20"
+DWARF_EYE_CAM = "2"
+
+[[scene]]
+id = "snow"
+title = "The snow sky"
+group = "weather"
+caption = "The `3` key's sky, also viewer-side: a thinner sheet with fog sitting on the ground under it. The ground stays as the game reports it — the sky is the viewer's, the snow would be the game's."
+[scene.env]
+DWARF_EYE_WEATHER = "snow"
+DWARF_EYE_HOUR = "13:00"
+DWARF_EYE_VIEW = "0,-20"
+DWARF_EYE_CAM = "2"
+
+[[scene]]
+id = "canopy-closeup"
+title = "The wood at crown height"
+group = "vegetation"
+caption = "Crowns from just above them. Leaves are cutout geometry lit with the sky's fill weighted toward the faces that look up, which is what leaves a crown with a lit side and a shaded one; every tree is grown from its own coordinates, so no two repeat."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "09:00"
+DWARF_EYE_VIEW = "0,-20"
+DWARF_EYE_CAM = "1"
+
+[[scene]]
+id = "shrub-meadow"
+title = "Trees, shrubs and stone"
+group = "vegetation"
+caption = "The vegetation layer close to. Crowns are grown rather than modelled — DF gives only the bounds, and the seed is the tree's own coordinates plus its species, so no two repeat — shrubs stand as voxels instead of crossed billboards, and trunks are extruded from their sprites, which are cross-sections and so come out round. `DWARF_EYE_PLANTS=billboard` puts standing plants back on sprites."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "10:00"
+DWARF_EYE_VIEW = "300,-15"
+DWARF_EYE_CAM = "0.5"
+
+[[scene]]
+id = "ramps-pool"
+title = "Ground level"
+group = "terrain"
+caption = "The ground beside the character at eye height. A floor is one textured quad a tile — the atlas, at full resolution, not a voxel grid — with the canopy's shadow falling across it; boulders and shrubs standing on it are voxels grown from the same sprite sheets."
+baseline = true
+[scene.env]
+DWARF_EYE_HOUR = "11:00"
+DWARF_EYE_VIEW = "120,-20"
+DWARF_EYE_CAM = "0.4"
+
+[[scene]]
+id = "horizon-height"
+title = "The horizon from height"
+group = "horizon"
+caption = "From well above the map: the fine window in the middle, the coarse region heightfield around it, and the world map beyond that."
+[scene.env]
+DWARF_EYE_HOUR = "10:00"
+DWARF_EYE_VIEW = "0,-20"
+DWARF_EYE_CAM = "12"
+
+[[scene]]
+id = "walk-eye"
+title = "Eye level, walk mode"
+group = "walk"
+caption = "Started in walk sync and left standing: the camera is in the adventurer's tile at eye height, and the character has not moved a step."
+[scene.env]
+DWARF_EYE_WALK = "1"
+DWARF_EYE_HOUR = "09:30"
+DWARF_EYE_VIEW = "0,-6"

@@ -3,7 +3,7 @@
 A Minecraft-style voxel view of a **live** Dwarf Fortress map, fed by DFHack's
 RemoteFortressReader plugin.
 
-[Architecture](docs/architecture/README.md)
+[Architecture](docs/architecture/README.md) · [Gallery](docs/gallery/README.md)
 
 ![grassland](docs/surface.png)
 
@@ -25,6 +25,7 @@ make run                      # or: cargo run --release -p dwarf-eye
 make run CLOUDS=cumulus=0.6   # with a forced sky
 make lab                      # the tree generator bench, no game needed
 make shot                     # screenshot of the viewer into shots/
+make showcase                 # shoot the scene list into docs/gallery/
 make budget                   # where the triangles go
 make test                     # unit tests
 ```
