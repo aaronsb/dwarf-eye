@@ -37,7 +37,11 @@ cargo run --release -p dwarf-eye
 `DWARF_EYE_Z_OFFSET` moves the starting cut plane relative to the player
 (default +16, high enough to clear a tree canopy); `-8` starts it below ground,
 for looking straight into the rock. `DWARF_EYE_CAM` scales how far back the
-camera starts.
+camera starts and `DWARF_EYE_VIEW=yaw,pitch` (degrees) aims it.
+
+`F12` saves a screenshot in the working directory.
+`DWARF_EYE_SHOT=path[:seconds]` saves one after the delay and exits, for
+checking a build without sitting at the window.
 
 ![cutaway](docs/cutaway.png)
 
@@ -219,6 +223,36 @@ The deck holds a fixed altitude above the terrain. Following the camera
 vertically puts the viewer inside it, and everything greys out.
 
 `DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4` forces a sky for testing.
+`DWARF_EYE_WIND=x,z` sets the wind in tiles per second, and
+`DWARF_EYE_CLOUD_TUNE=sigma=0.10,detail=0.32,gain=3,ambient=1,haze=0.0006,cirrus=0.5,shadow=0.85,steps=72`
+overrides the shading knobs. `DWARF_EYE_EV100` overrides the exposure.
+
+### Beyond the live window
+
+Dwarf Fortress holds a 144-tile window that follows the character, and DFHack
+reports blocks relative to it. The session pins a render origin on connect and
+converts every request and reply, so chunks keep their places as the character
+walks. Every pass fetches the whole window, unforced, so only blocks whose hash
+changed come back, in slabs of 500 blocks because DFHack refuses any reply over
+64 MiB.
+
+Chunks are cached on disk under `~/.cache/dwarf-eye/<world>-<save>/`
+(`DWARF_EYE_CACHE` overrides the root), keyed by absolute position, and restored
+on the next connect. A chunk the game sends again replaces the cached one.
+Columns whose lowest cached chunk is sparse hold canopy with no ground under it
+and are dropped on restore.
+
+Past the window, DFHack's region maps (one sample per 48 tiles for the world
+tiles around the player) and the world map (one per 768, interpolated) become a
+coarse heightfield out to the horizon. A block mask marks every block whose fine
+chunks reach the ground, and the horizon material discards over marked blocks in
+the main pass and the depth prepass, so the coarse ground never cuts through the
+fine. `DWARF_EYE_HORIZON_TRANSPOSE` flips the region sample order for testing;
+the default (y-major) is the verified one.
+
+Full detail outside the window is not obtainable: DF discards the local map on
+offload and regenerates it from region details, and no DFHack call reaches
+tiles beyond `world.map.block_index`.
 
 ### Driving the world for testing
 
@@ -251,11 +285,12 @@ The pink is rock salt. That one is DF's own colour, and it is correct.
 
 - Walls still draw as flat-coloured blocks; only floors are textured.
 - Units, buildings and items are fetched but not drawn.
-- Ramps are half-height blocks rather than wedges; the tile's facing direction
-  is available in `Tiletype::direction` and unused.
 - Fortifications draw as plain cubes.
 - Water and magma get vertex alpha, but the material is opaque, so they render
   solid.
-- No greedy meshing — every visible face is its own quad.
-- Every fetch that returns anything remeshes the whole loaded set.
-- No LOD, so the load radius is what keeps the triangle count down.
+- Sprite-derived models are 98.8% of triangles (`cargo run --release -p
+  dwarf-eye-world --example budget`); canopies as merged volumes are in
+  progress.
+- Cached chunks far from the camera stay at full detail; a mid LOD is planned.
+- The coarse horizon has no rivers or sites yet, and meets the fine map with a
+  bare step.
