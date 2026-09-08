@@ -1,11 +1,39 @@
 # dwarf-eye
 
+[![CI](https://img.shields.io/github/actions/workflow/status/aaronsb/dwarf-eye/ci.yml?branch=main&label=CI)](https://github.com/aaronsb/dwarf-eye/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/aaronsb/dwarf-eye)](https://github.com/aaronsb/dwarf-eye/commits/main)
+[![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange)](Cargo.toml)
+[![Bevy 0.19](https://img.shields.io/badge/bevy-0.19-232326)](https://bevyengine.org)
+
 A Minecraft-style voxel view of a **live** Dwarf Fortress map, fed by DFHack's
 RemoteFortressReader plugin.
 
+## Quick start
+
+```sh
+git clone https://github.com/aaronsb/dwarf-eye
+cd dwarf-eye
+make            # prints the targets
+make test       # unit tests
+make lab        # the tree generator bench
+make run        # the viewer, against the running game
+```
+
+Building needs a Rust stable toolchain and nothing else; the lab and the tests
+run without a game. `make run` needs Dwarf Fortress with DFHack running and an
+adventurer on the map. The first build is long, most of it Bevy, and every
+target is release, because Bevy in debug is unusable.
+
+`make clean-cache` drops the on-disk chunk cache for every world, which the game
+rebuilds as you play.
+
 [Architecture](docs/architecture/README.md) · [Gallery](docs/gallery/README.md)
 
-![grassland](docs/surface.png)
+![crowns and the far band](docs/horizon.png)
+
+Grown crowns over the live window, then the region maps carrying the land to the
+horizon.
 
 ## Requirements
 
@@ -30,6 +58,11 @@ make budget                   # where the triangles go
 make test                     # unit tests
 ```
 
+![the tree lab](docs/tree-lab.png)
+
+`make lab` grows every preset side by side with no game attached, which is where
+the vegetation and lighting work is done.
+
 | Key | |
 |---|---|
 | `Tab` | free flight or walk sync |
@@ -40,6 +73,7 @@ make test                     # unit tests
 | wheel | move speed |
 | `[` `]` | lower / raise the cut plane |
 | `H` | show or hide undiscovered tiles |
+| `G` | light shafts on or off |
 | `,` `.` | step the game clock an hour (six with shift) |
 | `1` `2` `3` | weather: clear / rain / snow |
 
@@ -47,6 +81,9 @@ make test                     # unit tests
 (default +16, high enough to clear a tree canopy); `-8` starts it below ground,
 for looking straight into the rock. `DWARF_EYE_CAM` scales how far back the
 camera starts and `DWARF_EYE_VIEW=yaw,pitch` (degrees) aims it.
+`DWARF_EYE_HUD=off` leaves the overlay out of a shot, and
+`DWARF_EYE_WEATHER=clear|rain|snow` paints the same three skies the `1` `2` `3`
+keys ask the game for, without touching the player's weather.
 
 ### Walk sync
 
@@ -74,7 +111,10 @@ mode with no hand on the keyboard.
 `DWARF_EYE_SHOT=path[:seconds]` saves one after the delay and exits, for
 checking a build without sitting at the window.
 
-![cutaway](docs/cutaway.png)
+![a cut into the soil](docs/walls.png)
+
+The cut plane dropped below the surface: soil walls and floors carry DF's own
+environment sheets, tinted by the tile's material.
 
 ## Layout
 
@@ -107,8 +147,6 @@ Both headers are raw C structs, so byte layout matters:
 tag `53.16-r1.1`.
 
 ### Sprites as voxels
-
-![sprite-derived trees](docs/sprites.png)
 
 A DF tile sprite is drawn looking straight down, so its opaque region is a
 horizontal cross-section of whatever fills the tile. `TREE_TRUNK_PILLAR` is a
@@ -156,7 +194,9 @@ in view get a sprite and which fall back to plain blocks.
 
 ### Ground
 
-![textured ground](docs/ground.png)
+![shrubs and crowns close](docs/meadow.png)
+
+Textured floors, grown shrubs and tufts, and a trunk carrying its own crown.
 
 Floors take a different path from trees. A floor sprite is a picture, not a
 cross-section, and voxelising it destroys the detail that made it worth using —
@@ -198,6 +238,14 @@ raymarched rather than sampled from lookup textures. The sun is a real
 which is what makes shade under a tree read as sky-blue rather than black.
 Light shafts are a fullscreen pass of our own (`god_rays.rs`), lit by the shadow
 cascades and the baked cloud shadow map, with density driven by the weather.
+`G` toggles them and
+`DWARF_EYE_GODRAYS=density=0.01,g=0.7,strength=0.5,dim=0.4,steps=48,off`
+overrides the knobs.
+
+![light shafts](docs/godrays.png)
+
+A low sun through fog: the shafts come from the same shadow cascades the trees
+cast with.
 
 Stars are one mesh of unlit quads on a sphere, spun by the clock and faded by
 the sun's elevation. They sit at 20000 units, beyond the horizon mesh and inside
@@ -213,6 +261,11 @@ sets. Under it sits a starlight ambient floor, and over both an exposure metered
 off whichever light is up: the daylit scene keeps its stop exactly, and night
 opens about five. The sun's own light fades out three degrees either side of the
 horizon rather than switching off, so nothing is lit sideways by a set sun.
+
+![night](docs/night.png)
+
+Ten at night: the moon lights the scene, the stars turn with the clock, and the
+exposure opens about five stops.
 
 `DWARF_EYE_HOUR=22` (also `21:30` or `21.5`) pins the hour the view is lit at
 and leaves the game's clock where the player left it, the way to look at night
@@ -289,18 +342,21 @@ on the next connect. A chunk the game sends again replaces the cached one.
 Columns whose lowest cached chunk is sparse hold canopy with no ground under it
 and are dropped on restore.
 
-Crowns are drawn at two resolutions. Near the camera a tree is cut into four
-voxels per tile with alpha-masked leaves, its plants and its hanging strands;
-beyond that it is the same tree at one voxel per tile, on one opaque material,
-with the undergrowth dropped. The swap happens where a near leaf voxel stops
-covering two pixels, which depends on the window's height and the lens: about 7
-blocks into a 720-tall window, 11 into a 1190-tall one. `DWARF_EYE_LOD_NEAR`
-sets that distance in blocks, and `DWARF_EYE_OCCLUSION=0` turns off the GPU
-occlusion culling the camera otherwise asks for.
+Crowns are drawn in three bands off the same growth. Near the camera a tree is
+cut into four voxels per tile with alpha-masked leaves, its plants and its
+hanging strands; the middle band halves that and keeps the cutout, so sun and
+sky still come through; the far band is one voxel per tile on one opaque
+material, one mesh for a chunk's whole crown. Each edge sits where that band's
+leaf voxel stops covering two pixels, which depends on the window's height and
+the lens: about 109 tiles for the near band in a 720-tall window.
+`DWARF_EYE_LOD_NEAR` sets that first distance in blocks, and
+`DWARF_EYE_OCCLUSION=0` turns off the GPU occlusion culling the camera otherwise
+asks for.
 
 Past the window, DFHack's region maps (one sample per 48 tiles for the world
 tiles around the player) and the world map (one per 768, interpolated) become a
-coarse heightfield out to the horizon. A block mask marks every block whose fine
+terraced heightfield out to the horizon, carrying forests, rivers and sites at
+three interpolated spacings. A block mask marks every block whose fine
 chunks reach the ground, and the horizon material discards over marked blocks in
 the main pass and the depth prepass, so the coarse ground never cuts through the
 fine. `DWARF_EYE_HORIZON_TRANSPOSE` flips the region sample order for testing;
@@ -324,10 +380,16 @@ In the viewer, `,` and `.` step the game clock by an hour (six with shift), and
 `1` `2` `3` set the weather.
 
 `GetWorldMap` returns a `Cloud` per world tile — 16641 of them on a 129x129
-world — each carrying front, cumulus, cirrus, stratus and fog. Nothing reads
-them yet.
+world — each carrying front, cumulus, cirrus, stratus and fog.
+`worker.rs:read_weather` averages the tiles around the player into the sky the
+viewer draws.
 
 ### Colour
+
+![a pool](docs/water.png)
+
+Water is a mesh of its own on a translucent material, so the floor of a pool
+reads through it.
 
 DF's `state_color` describes a material as a substance, not as terrain: loam is
 grey, grass plants are brown, willow is orange. `palette.rs` therefore takes
@@ -339,12 +401,25 @@ The pink is rock salt. That one is DF's own colour, and it is correct.
 
 ## Not done yet
 
-- Walls still draw as flat-coloured blocks; only floors are textured.
-- Units, buildings and items are fetched but not drawn.
-- Fortifications draw as plain cubes.
-- Water and magma get vertex alpha, but the material is opaque, so they render
-  solid.
-- Shrubs, saplings and dead trees are still crossed billboards; the tree crate
-  will grow them (issue #1).
-- Cached chunks far from the camera stay at full detail; a mid LOD is planned.
+- Units, buildings and items are fetched but not drawn (issues #5 and #15).
+- Magma is still a solid cuboid on the terrain pass; only water gets a surface
+  of its own.
+- Ground cover is a texture rather than grown plants (issue #7).
+- Crowns have their three LOD bands, but the ground between the live window and
+  the far band is drawn at full detail or not at all; a mid heightfield is
+  planned (issue #10).
 - The coarse horizon meets the fine map with a bare step (issue #9).
+
+## Lineage
+
+dwarf-eye is a spiritual successor to
+[Armok Vision](https://github.com/RosaryMala/armok-vision), the Unity viewer
+over this same RemoteFortressReader protocol, whose handling of terrain past the
+live window informed the horizon here. Tile geometry rules, ramp corner heights
+above all, come from [vox-uristi](https://github.com/plule/vox-uristi), which
+reads the same API and exports MagicaVoxel; `docs/vox-uristi-notes.md` records
+what was taken and what had to be translated.
+
+The project is in early development. Feature requests are welcome through the
+issue form; bug reports and pull requests are by arrangement for now, as
+[CONTRIBUTING.md](CONTRIBUTING.md) says.
