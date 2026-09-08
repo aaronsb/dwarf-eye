@@ -396,8 +396,17 @@ impl TileLibrary {
                 tint,
             })
         } else {
-            let name = ramp::sprite_name(info.ramp?, mask);
-            self.ramp_uv.get(&name).copied().map(|(rect, tint)| Model {
+            let family = info.ramp?;
+            // DF bakes a deep shadow into its grass and soil ramp sprites, so
+            // on a sunlit hillside those slopes read as pits. Ground slopes
+            // wear the flat ground texture beside them instead; stone keeps
+            // DF's sprite, greyed to a pattern at pack time.
+            let uv = if family == "STONE_RAMP" {
+                self.ramp_uv.get(&ramp::sprite_name(family, mask)).copied()
+            } else {
+                info.beneath.and_then(|ground| self.under_uv.get(ground).copied())
+            };
+            uv.map(|(rect, tint)| Model {
                 mesh: Arc::new(ramp::build_ramp(rect, mask, FLOOR_HEIGHT)),
                 tint,
             })
