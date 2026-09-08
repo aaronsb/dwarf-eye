@@ -692,6 +692,7 @@ fn update_hud(
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
+    rays: Res<god_rays::GodRays>,
     camera: Query<(&Transform, &FlyCamera)>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
@@ -708,10 +709,10 @@ fn update_hud(
         "{}\n{}\n{}  {}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          chunks  {}   triangles {}   {:.0} fps\n\
-         z-ceiling {ceiling}   hidden tiles {}   sky {}\n\
+         z-ceiling {ceiling}   hidden tiles {}   sky {}   light shafts {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
-         [ ]  cut plane    H  undiscovered tiles\n\
+         [ ]  cut plane    H  undiscovered tiles    G  light shafts\n\
          , .  step the game clock (shift: six hours)    1 2 3  clear / rain / snow",
         status.world,
         status.detail,
@@ -729,5 +730,6 @@ fn update_hud(
             .unwrap_or(0.0),
         if settings.show_hidden { "shown" } else { "hidden" },
         weather.describe(),
+        if rays.enabled { "on" } else { "off" },
     );
 }
