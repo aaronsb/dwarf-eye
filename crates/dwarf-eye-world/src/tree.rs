@@ -368,8 +368,14 @@ pub fn params(
     habit: Habit,
     library: &mut TileLibrary,
 ) -> trees::TreeParams {
+    // A weeping species is not something the growth tokens say; the raws only
+    // name it. Its crown is an ordinary one, so all this changes is whether
+    // strands hang off it.
+    let weeping = library.plant_id(env.species).contains("WILLOW");
     let mut params = if env.cap {
         trees::mushroom_tree()
+    } else if weeping {
+        trees::willow()
     } else {
         match habit {
             Habit::Conifer => trees::spruce(),

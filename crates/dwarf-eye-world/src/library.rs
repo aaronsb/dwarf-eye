@@ -739,7 +739,9 @@ impl TileLibrary {
             .unwrap_or_default()
     }
 
-    fn plant_id(&self, mat_index: i32) -> String {
+    /// The plant's raw id, so a species can be recognised by name where its
+    /// growth tokens do not say enough.
+    pub fn plant_id(&self, mat_index: i32) -> String {
         self.plants.get(mat_index.max(0) as usize).cloned().unwrap_or_default()
     }
 
