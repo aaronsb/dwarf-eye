@@ -102,6 +102,10 @@ tiles beyond `world.map.block_index`
 - The mid band drops plants, tufts and strands, and its leaves are opaque: a
   cutout costs a masked pass, a discard in the depth prepass and the overdraw
   behind every hole, for holes that are under a pixel there.
+- A crossfading range is not free: Bevy compiles every mesh that carries one
+  with `VISIBILITY_RANGE_DITHER`, which discards, whenever it draws and not
+  only inside the margin. An abrupt range would keep the mid band's opaque
+  shader opaque, at the cost of popping.
 - `cargo run --release -p dwarf-eye-world --example budget` reports where the
   triangles go, and `--example horizon` reports what DFHack knows beyond the
   window.
