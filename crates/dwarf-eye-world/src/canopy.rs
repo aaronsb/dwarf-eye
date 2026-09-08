@@ -80,6 +80,13 @@ pub enum Band {
     Mid,
 }
 
+/// The bands a chunk is built in, nearest first.
+///
+/// The list is the whole of the ordering: a coarser stage — a canonical crown
+/// per species, a green box — is one more entry here, one more mesh per chunk
+/// and one more handover distance, with nothing else to restructure.
+pub const BANDS: [Band; 2] = [Band::Near, Band::Mid];
+
 impl Band {
     pub fn detail(self) -> i32 {
         match self {

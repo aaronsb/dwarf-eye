@@ -41,7 +41,7 @@ use dwarf_eye_trees as trees;
 use bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport;
 use bevy::render::occlusion_culling::OcclusionCulling;
 use bevy::render::{RenderApp, RenderStartup};
-use dwarf_eye_world::canopy::{Band, CanopyMeshes, Coat, Surface};
+use dwarf_eye_world::canopy::{BANDS, Band, CanopyMeshes, Coat, Surface};
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
@@ -171,26 +171,39 @@ const CROSSFADE: f32 = 0.15;
 /// retention ever reaches.
 const BAND_FAR: f32 = 40000.0;
 
-/// The two ranges, near then mid. The near band's end margin is the mid band's
-/// start margin, which is what Bevy crossfades across.
-fn band_ranges(near: f32) -> [VisibilityRange; 2] {
-    let fade = near..near * (1.0 + CROSSFADE);
-    [
-        // Chunk meshes hold world-space vertices at an identity transform, so
-        // the range has to measure from the mesh's own bounds, not its origin.
-        VisibilityRange { start_margin: 0.0..0.0, end_margin: fade.clone(), use_aabb: true },
-        VisibilityRange {
-            start_margin: fade,
-            end_margin: BAND_FAR..BAND_FAR,
-            use_aabb: true,
-        },
-    ]
+/// Where one band hands over to the next, in tiles, nearest first.
+///
+/// One edge per handover, so `canopy::BANDS` and this list grow together: a
+/// coarser stage is one more edge and one more mesh, never a new shape.
+fn band_edges(near: f32) -> Vec<f32> {
+    vec![near]
 }
 
-/// Which band a canopy entity belongs to, so a resized window can rewrite its
-/// range.
+/// One range per band, nearest first. Each band's end margin is the next one's
+/// start margin, which is what Bevy crossfades across; the last runs to the far
+/// plane.
+fn band_ranges(near: f32) -> Vec<VisibilityRange> {
+    let edges = band_edges(near);
+    let fade = |at: f32| at..at * (1.0 + CROSSFADE);
+    (0..=edges.len())
+        .map(|stage| VisibilityRange {
+            start_margin: if stage == 0 { 0.0..0.0 } else { fade(edges[stage - 1]) },
+            end_margin: match edges.get(stage) {
+                Some(&at) => fade(at),
+                None => BAND_FAR..BAND_FAR,
+            },
+            // Chunk meshes hold world-space vertices at an identity transform,
+            // so the range has to measure from the mesh's own bounds, not its
+            // origin.
+            use_aabb: true,
+        })
+        .collect()
+}
+
+/// Which band a canopy entity belongs to, by its place in `canopy::BANDS`, so a
+/// resized window can rewrite its range.
 #[derive(Component, Clone, Copy, PartialEq)]
-struct CanopyBand(Band);
+struct CanopyBand(usize);
 
 fn occlusion_culling() -> bool {
     std::env::var("DWARF_EYE_OCCLUSION").map(|v| v != "0").unwrap_or(true)
@@ -207,25 +220,37 @@ struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 struct Spawned {
     terrain: Option<Entity>,
     water: Option<Entity>,
-    canopy: [Option<Entity>; 4],
-    mid: [Option<Entity>; 4],
+    /// One entry per canopy band, nearest first.
+    bands: Vec<Stage>,
     /// Terrain and water, which every band draws.
     base: usize,
-    near: usize,
-    mid_triangles: usize,
     /// Middle of the chunk, for saying which band is drawing.
     centre: Vec3,
 }
 
+/// One chunk's crown at one detail band: its entities and what they cost.
+struct Stage {
+    entities: [Option<Entity>; 4],
+    triangles: usize,
+}
+
 impl Spawned {
-    fn held(&self) -> usize {
-        self.base + self.near + self.mid_triangles
+    fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        [self.terrain, self.water]
+            .into_iter()
+            .chain(self.bands.iter().flat_map(|s| s.entities))
+            .flatten()
     }
 
-    /// What this chunk draws with the camera here: one band, never both.
-    fn drawn(&self, eye: Vec3, near: f32) -> usize {
-        self.base
-            + if self.centre.distance(eye) < near { self.near } else { self.mid_triangles }
+    fn held(&self) -> usize {
+        self.base + self.bands.iter().map(|s| s.triangles).sum::<usize>()
+    }
+
+    /// What this chunk draws with the camera here: one band, never two.
+    fn drawn(&self, eye: Vec3, edges: &[f32]) -> usize {
+        let away = self.centre.distance(eye);
+        let stage = edges.iter().position(|&edge| away < edge).unwrap_or(edges.len());
+        self.base + self.bands.get(stage).map(|s| s.triangles).unwrap_or(0)
     }
 }
 
@@ -234,7 +259,8 @@ impl Spawned {
 /// The band each chunk is in is read off its middle, which is what Bevy's own
 /// range check does with the mesh's bounds.
 fn drawn_triangles(entities: &ChunkEntities, near: f32, eye: Vec3) -> usize {
-    entities.0.values().map(|s| s.drawn(eye, near)).sum()
+    let edges = band_edges(near);
+    entities.0.values().map(|s| s.drawn(eye, &edges)).sum()
 }
 
 /// Meshes that have arrived from the worker and not yet reached the GPU.
@@ -242,7 +268,7 @@ fn drawn_triangles(entities: &ChunkEntities, near: f32, eye: Vec3) -> usize {
 /// chunks never stalls a frame. A later mesh for the same chunk replaces an
 /// earlier one still waiting.
 #[derive(Resource, Default)]
-struct PendingChunks(HashMap<ChunkKey, (MeshData, CanopyMeshes, CanopyMeshes)>);
+struct PendingChunks(HashMap<ChunkKey, (MeshData, Vec<CanopyMeshes>)>);
 
 /// Chunk meshes uploaded per frame.
 const UPLOAD_BUDGET: usize = 24;
@@ -590,8 +616,8 @@ fn drain_worker(
                 mask.dirty = true;
             }
             Event::Chunks(batch) => {
-                for (key, terrain, crown, mid) in batch {
-                    pending.0.insert(key, (terrain, crown, mid));
+                for (key, terrain, crowns) in batch {
+                    pending.0.insert(key, (terrain, crowns));
                 }
             }
             Event::Status(text) => status.detail = text,
@@ -628,10 +654,9 @@ fn size_bands(
     bands.near = near;
     let ranges = band_ranges(near);
     for (band, mut range) in &mut ranged {
-        *range = match band.0 {
-            Band::Near => ranges[0].clone(),
-            Band::Mid => ranges[1].clone(),
-        };
+        if let Some(wanted) = ranges.get(band.0) {
+            *range = wanted.clone();
+        }
     }
     info!(
         "canopy bands: near out to {near:.0} tiles ({:.1} blocks), mid beyond",
@@ -669,26 +694,20 @@ fn upload_chunks(
 
     let ranges = band_ranges(bands.near);
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
-        let Some((mut data, crown, mid)) = pending.0.remove(&key) else { continue };
+        let Some((mut data, crowns)) = pending.0.remove(&key) else { continue };
         // Water rides in with the terrain and splits off here: its own entity,
         // its own translucent material.
         let pool = data.take_water();
         if let Some(old) = entities.0.remove(&key) {
-            for entity in [old.terrain, old.water]
-                .into_iter()
-                .chain(old.canopy)
-                .chain(old.mid)
-                .flatten()
-            {
+            for entity in old.entities() {
                 commands.entity(entity).despawn();
             }
         }
-        if data.is_empty() && pool.is_empty() && crown.is_empty() && mid.is_empty() {
+        if data.is_empty() && pool.is_empty() && crowns.iter().all(CanopyMeshes::is_empty) {
             continue;
         }
         let base = data.triangle_count() + pool.triangle_count();
-        let (near, mid_triangles) = (crown.triangle_count(), mid.triangle_count());
-        let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>, band: Option<Band>| {
+        let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>, stage: Option<usize>| {
             (!mesh.is_empty()).then(|| {
                 let mut entity = commands.spawn((
                     Mesh3d(meshes.add(to_bevy_mesh(mesh))),
@@ -699,41 +718,33 @@ fn upload_chunks(
                 // Terrain and water carry no range at all: they are drawn
                 // wherever they are retained, and the bands beyond this one are
                 // the heightfield's job, not theirs.
-                if let Some(band) = band {
-                    let range = match band {
-                        Band::Near => ranges[0].clone(),
-                        Band::Mid => ranges[1].clone(),
-                    };
-                    entity.insert((range, CanopyBand(band)));
+                if let Some(stage) = stage {
+                    entity.insert((ranges[stage].clone(), CanopyBand(stage)));
                 }
                 entity.id()
             })
         };
         let terrain = spawn(data, material.0.clone(), None);
         let water = spawn(pool, water_material.0.clone(), None);
-        let mut canopy = [None; 4];
-        let crowns = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
-        for (slot, (mesh, material)) in
-            crowns.into_iter().zip(canopy_materials.each(Band::Near)).enumerate()
-        {
-            canopy[slot] = spawn(mesh, material, Some(Band::Near));
-        }
-        let mut coarse = [None; 4];
-        let coarse_meshes = [mid.bark, mid.broadleaf, mid.needle, mid.streamers];
-        for (slot, (mesh, material)) in
-            coarse_meshes.into_iter().zip(canopy_materials.each(Band::Mid)).enumerate()
-        {
-            coarse[slot] = spawn(mesh, material, Some(Band::Mid));
+        let mut spawned_bands = Vec::with_capacity(crowns.len());
+        for (stage, crown) in crowns.into_iter().enumerate() {
+            let Some(&band) = BANDS.get(stage) else { continue };
+            let triangles = crown.triangle_count();
+            let meshes_of = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
+            let mut entities = [None; 4];
+            for (slot, (mesh, material)) in
+                meshes_of.into_iter().zip(canopy_materials.each(band)).enumerate()
+            {
+                entities[slot] = spawn(mesh, material, Some(stage));
+            }
+            spawned_bands.push(Stage { entities, triangles });
         }
         let centre = Vec3::new(
             (key.0 * BLOCK + BLOCK / 2) as f32,
             key.2 as f32 * Z_SCALE,
             (key.1 * BLOCK + BLOCK / 2) as f32,
         );
-        entities.0.insert(
-            key,
-            Spawned { terrain, water, canopy, mid: coarse, base, near, mid_triangles, centre },
-        );
+        entities.0.insert(key, Spawned { terrain, water, bands: spawned_bands, base, centre });
     }
     status.triangles = entities.0.values().map(Spawned::held).sum();
 }
