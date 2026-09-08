@@ -284,6 +284,20 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
     mesh
 }
 
+/// The 3x3 corner field as fractions of a level: 0 at the foot of the slope,
+/// 1 at its top.
+///
+/// What those fractions are stretched between is the caller's business. The
+/// mesh runs them from the floor slab to the level above; anything walking the
+/// slope wants its own rule, and this keeps the corner arithmetic in one
+/// place either way.
+pub fn slopes(mask: u8) -> [[f32; 3]; 3] {
+    let levels = levels(mask);
+    let fraction =
+        |level: u32| level.min(HEIGHT).saturating_sub(1) as f32 / (HEIGHT - 1) as f32;
+    std::array::from_fn(|row| std::array::from_fn(|col| fraction(levels[row][col])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

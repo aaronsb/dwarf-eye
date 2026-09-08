@@ -36,7 +36,7 @@ use anyhow::Result;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use dwarf_eye_world::mesh::{FLOOR_HEIGHT, Z_SCALE};
-use dwarf_eye_world::{BLOCK, BlockBounds, Session, Solid, World};
+use dwarf_eye_world::{BLOCK, BlockBounds, Session, Solid, World, ramp};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -53,16 +53,13 @@ const SPEED: f32 = 3.2;
 /// cell they are standing in.
 const EYE: f32 = 0.85 * Z_SCALE;
 
-/// How high a ramp carries its footing inside its own cell, matching the wedge
-/// the mesh draws there.
-const RAMP_FOOTING: f32 = 0.55 * Z_SCALE;
-
-/// The same for the lower step of a staircase.
+/// How high the lower step of a staircase carries its footing inside its cell,
+/// matching what the mesh draws there. A ramp has no single height: its
+/// surface is a slope, read corner by corner out of [`ramp::surface`].
 const STAIR_FOOTING: f32 = 0.5 * Z_SCALE;
 
-/// How close the drawn camera may come to the ground beneath it. The glide
-/// that smooths a change of level would otherwise dip the eye through a floor
-/// it is still easing up onto.
+/// How close the drawn eye may ever come to the ground beneath it, whatever
+/// else is going on.
 const CLEARANCE: f32 = 0.25 * Z_SCALE;
 
 /// How close to a shut edge the camera may press.
@@ -277,6 +274,25 @@ impl Ground {
     }
 }
 
+/// Reads a ramp's 3x3 corner field as a bilinear patch: corners sit at the
+/// tile's edges and the middles half way, so a position inside the tile falls
+/// in one quadrant of the four.
+fn patch(field: [[f32; 3]; 3], u: f32, v: f32) -> f32 {
+    let pair = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        if t < 0.5 { (0, 1, t * 2.0) } else { (1, 2, (t - 0.5) * 2.0) }
+    };
+    // Row 0 is north and column 0 is west, as `ramp::levels` lays them out.
+    let (north, south, down) = pair(v);
+    let (west, east, across) = pair(u);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    lerp(
+        lerp(field[north][west], field[north][east], across),
+        lerp(field[south][west], field[south][east], across),
+        down,
+    )
+}
+
 /// Whether a tile offers footing. Shrubs and saplings do: Dwarf Fortress lets
 /// the character walk through them, and refusing would fence the player in.
 fn stands_on(solid: Solid) -> bool {
@@ -316,9 +332,11 @@ pub struct WalkMode {
     blocked: [f32; 9],
     /// Steps in a row the game has not taken. Reset by any real movement.
     strikes: u32,
-    /// The gap between where the camera is drawn and where it stands, decayed
-    /// away so every jump reads as a glide.
-    glide: Vec3,
+    /// The gap between where the camera is drawn and where it stands on the
+    /// ground plan, decayed away so every jump reads as a glide. Height is
+    /// never part of it: the eye rides the surface, so it slides down a slope
+    /// rather than through it.
+    glide: Vec2,
     ground: Option<Ground>,
     /// A position report waiting to be reconciled.
     fix: Option<(IVec3, Ground)>,
@@ -335,14 +353,35 @@ impl WalkMode {
         self.ground.as_ref().and_then(|g| g.get(tile))
     }
 
-    /// How high the footing in a cell stands above the cell's own base: the
-    /// surface the character's feet are on, as the mesh draws it. Dwarf
-    /// Fortress puts a unit on the level whose floor it stands on, and that
-    /// floor is a thin slab resting in the bottom of the cell, not the cell's
-    /// base itself.
-    fn footing(&self, cell: IVec3) -> f32 {
-        match self.solid(cell) {
-            Some(Solid::Ramp) => RAMP_FOOTING,
+    /// Which of a ramp's eight neighbours are walls, the same set the mesh
+    /// builds its slope from, so the ground underfoot is the ground on screen.
+    fn ramp_mask(&self, tile: IVec3) -> u8 {
+        let mut mask = 0;
+        for (bit, dx, dy) in ramp::NEIGHBOURS {
+            if self
+                .solid(IVec3::new(tile.x + dx, tile.y + dy, tile.z))
+                .is_some_and(obstructs)
+            {
+                mask |= bit;
+            }
+        }
+        mask
+    }
+
+    /// How high the footing in a tile stands above the tile's own base, `u`
+    /// east and `v` south inside it: the surface the feet are on, as the mesh
+    /// draws it. Dwarf Fortress puts a unit on the level whose floor it stands
+    /// on, and that floor is a thin slab resting in the bottom of the cell,
+    /// not the cell's base itself.
+    fn footing(&self, tile: IVec3, solid: Option<Solid>, u: f32, v: f32) -> f32 {
+        match solid {
+            // A ramp is a slope, not a step, so the height comes from where on
+            // the tile the eye actually is. Its low edge meets the floor slabs
+            // beside it and its high edge meets the slab on the level above,
+            // which is what carries the eye across both without a step.
+            Some(Solid::Ramp) => {
+                FLOOR_HEIGHT + patch(ramp::slopes(self.ramp_mask(tile)), u, v) * Z_SCALE
+            }
             Some(Solid::Stair) => STAIR_FOOTING,
             // Ground we have not seen yet is taken for ordinary floor, which
             // is what almost all of it is.
@@ -350,20 +389,36 @@ impl WalkMode {
         }
     }
 
-    /// The height of the ground in a cell, in render space.
-    fn surface(&self, cell: IVec3) -> f32 {
-        let z = cell.z - self.origin.unwrap_or(IVec3::ZERO).z;
-        z as f32 * Z_SCALE + self.footing(cell)
+    /// The height of the ground directly under a render-space position.
+    ///
+    /// This is what the eye rides, rather than the level of the cell we think
+    /// we are in. Walking off a ramp onto the floor beside it changes the tile
+    /// and the level underfoot at the same moment, and because a ramp's edge
+    /// corners meet the slabs next to them the height does not jump — the eye
+    /// tracks the slope down and off it.
+    fn surface(&self, x: f32, y: f32) -> f32 {
+        let origin = self.origin.unwrap_or(IVec3::ZERO);
+        let (tx, ty) = (x.floor(), y.floor());
+        let (u, v) = (x - tx, y - ty);
+        let (tx, ty) = (tx as i32 + origin.x, ty as i32 + origin.y);
+        // The level we believe we are on first, then the one below — where a
+        // ramp we have walked off the top of lives — then the one above.
+        for z in [self.cell.z, self.cell.z - 1, self.cell.z + 1] {
+            let tile = IVec3::new(tx, ty, z);
+            let solid = self.solid(tile);
+            if solid.is_some_and(stands_on) {
+                return (z - origin.z) as f32 * Z_SCALE + self.footing(tile, solid, u, v);
+            }
+        }
+        (self.cell.z - origin.z) as f32 * Z_SCALE + FLOOR_HEIGHT
     }
 
-    /// Where the camera logically stands, in render space, before the glide.
-    fn anchor(&self) -> Vec3 {
+    /// Where the camera logically stands on the ground plan, before the glide.
+    /// Height is not part of it: the eye takes that from whatever it is
+    /// standing over.
+    fn anchor(&self) -> Vec2 {
         let cell = self.cell - self.origin.unwrap_or(IVec3::ZERO);
-        Vec3::new(
-            cell.x as f32 + self.offset.x,
-            self.surface(self.cell) + EYE,
-            cell.y as f32 + self.offset.y,
-        )
+        Vec2::new(cell.x as f32 + self.offset.x, cell.y as f32 + self.offset.y)
     }
 
     /// Applies a change that moves the camera without the player walking, and
@@ -373,7 +428,7 @@ impl WalkMode {
         change(self);
         self.glide += before - self.anchor();
         if self.glide.length() > SNAP {
-            self.glide = Vec3::ZERO;
+            self.glide = Vec2::ZERO;
         }
     }
 
@@ -503,7 +558,7 @@ pub fn toggle(keys: Res<ButtonInput<KeyCode>>, bridge: NonSend<Bridge>, mut walk
     walk.pending = None;
     walk.blocked = [0.0; 9];
     walk.strikes = 0;
-    walk.glide = Vec3::ZERO;
+    walk.glide = Vec2::ZERO;
     walk.line = if wanted { "walk    finding the character…".into() } else { String::new() };
 }
 
@@ -668,12 +723,13 @@ pub fn walk(
     // Every jump the camera did not walk decays away over a few frames.
     walk.glide *= (-dt / GLIDE).exp();
     if walk.glide.length() < 0.001 {
-        walk.glide = Vec3::ZERO;
+        walk.glide = Vec2::ZERO;
     }
-    // The glide may not carry the eye into the ground it is easing onto.
-    let mut drawn = walk.anchor() + walk.glide;
-    drawn.y = drawn.y.max(walk.surface(walk.cell) + CLEARANCE);
-    transform.translation = drawn;
+    let ground = walk.anchor() + walk.glide;
+    let surface = walk.surface(ground.x, ground.y);
+    // Whatever else happens, the eye stays above what it is standing on.
+    let eye = (surface + EYE).max(surface + CLEARANCE);
+    transform.translation = Vec3::new(ground.x, eye, ground.y);
 
     let shut = walk.blocked.iter().filter(|&&b| b > 0.0).count();
     let state = match (walk.strikes, walk.pending.is_some(), shut) {
@@ -695,7 +751,7 @@ fn reconcile(walk: &mut WalkMode) {
         walk.ground = Some(ground);
         walk.cell = tile;
         walk.offset = Vec2::splat(0.5);
-        walk.glide = Vec3::ZERO;
+        walk.glide = Vec2::ZERO;
         walk.moved(tile);
         return;
     }
@@ -767,6 +823,27 @@ mod tests {
             let step = IVec2::new(forward.x.round() as i32, forward.z.round() as i32);
             assert_eq!(step, expect, "bearing {bearing} walks the wrong way");
             assert_eq!(move_key(step), key);
+        }
+    }
+
+    /// A ramp has to hand the eye off to the floors on either side of it
+    /// without a step, or walking a slope clips through the ground.
+    #[test]
+    fn a_ramp_joins_the_floors_at_both_of_its_edges() {
+        // A wall to the east lifts that side, so the slope runs up eastward.
+        let slopes = ramp::slopes(ramp::E);
+        let footing = |u: f32| FLOOR_HEIGHT + patch(slopes, u, 0.5) * Z_SCALE;
+        assert_eq!(footing(0.0), FLOOR_HEIGHT, "the low edge left the floor beside it");
+        assert_eq!(
+            footing(1.0),
+            Z_SCALE + FLOOR_HEIGHT,
+            "the high edge fell short of the floor a level above"
+        );
+        let mut last = f32::NEG_INFINITY;
+        for step in 0..=20 {
+            let height = footing(step as f32 / 20.0);
+            assert!(height >= last, "the slope stepped back down on the way up");
+            last = height;
         }
     }
 
