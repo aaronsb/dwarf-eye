@@ -469,9 +469,27 @@ impl Envelope {
     }
 
     pub fn contains(&self, p: Vec3) -> bool {
+        self.contains_within(p, 0.0)
+    }
+
+    /// Whether `p` is inside, or within `slack` tiles of it.
+    ///
+    /// The envelope is a hull, not a mould: a footprint says which tiles a tree
+    /// occupies, and a tile is tree all the way to its edge, not only at its
+    /// middle. Without slack a limb stepping half a tile at a time cannot cross
+    /// from one tile's centre to the next and dies at the first jog.
+    pub fn contains_within(&self, p: Vec3, slack: f32) -> bool {
         let Some(footprint) = self.level_at(p.y) else { return false };
-        let (ix, iz) = Self::cell(footprint, p);
-        footprint.get(ix, iz)
+        if slack <= 0.0 {
+            let (ix, iz) = Self::cell(footprint, p);
+            return footprint.get(ix, iz);
+        }
+        [-slack, slack].iter().any(|&dx| {
+            [-slack, slack].iter().any(|&dz| {
+                let (ix, iz) = Self::cell(footprint, vec3(p.x + dx, p.y, p.z + dz));
+                footprint.get(ix, iz)
+            })
+        })
     }
 
     /// World-space centre of the open cells on the level `p` sits in.

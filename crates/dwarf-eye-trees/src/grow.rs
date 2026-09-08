@@ -53,12 +53,18 @@ pub struct Skeleton {
     /// Centre of the foliage, for the shell and underside bias.
     pub crown_center: Vec3,
     pub crown_radius: f32,
+    /// Highest point any foliage reaches, for the dome the crown ends in.
+    pub crown_top: f32,
     /// Height actually reached, in tiles.
     pub height: f32,
 }
 
 /// Distance grown between skeleton segments, in tiles.
 const STEP: f32 = 0.5;
+
+/// How far past an envelope's footprint a limb may reach before it gives up,
+/// in tiles. Half a tile is the edge of the tile the footprint names.
+const SLACK: f32 = 0.5;
 
 struct Grower<'a> {
     params: &'a TreeParams,
@@ -103,6 +109,7 @@ pub fn grow(params: &TreeParams, seed: u64, envelope: Option<&Envelope>) -> Skel
         params: params.clone(),
         crown_center: Vec3::ZERO,
         crown_radius: 1.0,
+        crown_top: 0.0,
         height: 0.0,
     };
     if envelope.is_none() {
@@ -301,13 +308,33 @@ impl Grower<'_> {
         }
     }
 
+    /// A clear bole, then a trunk that carries on up through the crown throwing
+    /// limbs as it rises.
+    ///
+    /// Forking only at the trunk's top makes the whole crown depend on one
+    /// node: inside a tight envelope, if those first limbs cannot spread the
+    /// tree ends as a stub. Tiers give it several chances, and match what a
+    /// real trunk does anyway.
     fn deciduous(&mut self, base_radius: f32, rng: &mut Rng) {
         let p = self.params;
-        let trunk_len = p.height * p.clear_frac;
-        let dir = jitter_up(rng, 0.06);
-        let top = self.limb(Vec3::ZERO, dir, trunk_len, base_radius, 0, rng);
+        let mut node =
+            self.limb(Vec3::ZERO, jitter_up(rng, 0.06), p.height * p.clear_frac, base_radius, 0, rng);
+
+        const TIERS: u8 = 3;
+        // The trunk dies out around two thirds of the way up; above that it is
+        // just another limb.
+        let rise = p.height * (0.66 - p.clear_frac).max(0.12) / TIERS as f32;
         let limb_len = p.height * p.limb_frac;
-        self.fork(top.pos, top.dir, limb_len, top.radius, 1, rng);
+        for tier in 0..TIERS {
+            let t = tier as f32 / TIERS as f32;
+            let mut sub = rng.fork();
+            self.fork(node.pos, node.dir, limb_len * (1.0 - 0.22 * t), node.radius, 1, &mut sub);
+            if tier + 1 == TIERS {
+                break;
+            }
+            node = self.limb(node.pos, node.dir, rise, node.radius, 0, rng);
+        }
+        self.hang_leaves(node.pos, node.dir, rng, 1.0);
     }
 
     fn broad(&mut self, base_radius: f32, rng: &mut Rng) {
@@ -445,10 +472,13 @@ impl Grower<'_> {
             let child_radius = radius * p.thickness_ratio;
             let mut sub = rng.fork();
             let end = self.limb(pos, child_dir, child_len, child_radius, level, &mut sub);
-            if end.grown < child_len * 0.4 {
-                // The envelope cut it short; finish it with a tuft.
-                self.hang_leaves(end.pos, end.dir, &mut sub, 0.8);
+            if end.grown <= 0.0 {
                 continue;
+            }
+            if end.grown < child_len * 0.4 {
+                // The envelope cut it short. Tuft it, but keep branching: a
+                // child heading elsewhere may still have room.
+                self.hang_leaves(end.pos, end.dir, &mut sub, 0.8);
             }
             grown += 1;
             // The outermost two levels carry foliage along the limb as well as
@@ -507,7 +537,7 @@ impl Grower<'_> {
 
             let mut next = pos + next_dir * STEP;
             if let Some(envelope) = self.envelope
-                && !envelope.contains(next)
+                && !envelope.contains_within(next, SLACK)
             {
                 // Bend back toward the open middle of this level.
                 if let Some(centroid) = envelope.centroid_at(pos) {
@@ -515,7 +545,7 @@ impl Grower<'_> {
                     next_dir = (next_dir + inward * 0.8).normalize();
                     next = pos + next_dir * STEP;
                 }
-                if !envelope.contains(next) {
+                if !envelope.contains_within(next, SLACK) {
                     break;
                 }
             }
@@ -606,6 +636,10 @@ fn measure(skeleton: &mut Skeleton) {
     }
     skeleton.crown_center = center;
     skeleton.crown_radius = radius;
+    skeleton.crown_top = skeleton
+        .leaves
+        .iter()
+        .fold(f32::MIN, |top, l| top.max(l.center.y + l.radius));
     for l in &mut skeleton.leaves {
         l.shell = (shell_distance(l.center, center, stretch) / radius).clamp(0.0, 1.0);
     }

@@ -8,6 +8,10 @@ use crate::math::{IVec3, Vec3, ivec3};
 use crate::params::Rgb;
 use crate::rng::{hash3, hash_unit};
 
+/// Voxels per patch of one shade. Bigger than one, so a crown reads as blocks
+/// of colour and coplanar faces can merge.
+const SHADE_PATCH: i32 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Bark,
@@ -91,7 +95,15 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
             r = if segment.depth == 0 { r.max(0.55) } else { r.clamp(0.5, 1.05) };
             fill_ball(&mut voxels, p, r, |v| Voxel {
                 kind: Kind::Bark,
-                color: pick(&palette.bark, v, 0x8A17),
+                color: pick(
+                    &palette.bark,
+                    ivec3(
+                        v.x.div_euclid(SHADE_PATCH),
+                        v.y.div_euclid(SHADE_PATCH),
+                        v.z.div_euclid(SHADE_PATCH),
+                    ),
+                    0x8A17,
+                ),
             });
         }
     }
@@ -101,6 +113,10 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
     let stretch = skeleton.params.crown_stretch;
     let hollow = skeleton.params.crown_hollow.clamp(0.0, 1.0);
     let density = skeleton.params.leaf_density;
+    // The crown ends in a dome: over the top fifth of it the leaves thin to
+    // tufts, so no tree finishes in a flat slab of foliage.
+    let apex = skeleton.crown_top * scale;
+    let dome = ((skeleton.crown_top - skeleton.crown_center.y) * scale * 0.55).max(1.0);
 
     for cluster in &skeleton.leaves {
         let center = cluster.center * scale;
@@ -128,6 +144,8 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
                     // Dense at the crown's surface, open in its core, as far as
                     // the species is hollow at all.
                     let mut keep = density * (1.0 - hollow + hollow * (0.28 + shell));
+                    let into_dome = ((p.y - (apex - dome)) / dome).clamp(0.0, 1.0);
+                    keep *= 1.0 - 0.88 * into_dome * into_dome;
                     // The underside is thinner than the top, as light dictates.
                     if p.y < crown.y {
                         keep *= 1.0 - hollow * 0.38;
@@ -137,10 +155,15 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
                     if hash_unit(x, y, z, cluster.seed) > keep.clamp(0.02, 0.98) {
                         continue;
                     }
-                    let mut color = pick(&palette.leaf, key, 0x2C71);
+                    // Shade is chosen per cluster of voxels, not per voxel: it
+                    // reads as foliage in patches rather than static, and it
+                    // lets the mesher merge runs of one colour instead of
+                    // breaking every face apart.
+                    let patch = ivec3(x.div_euclid(SHADE_PATCH), y.div_euclid(SHADE_PATCH), z.div_euclid(SHADE_PATCH));
+                    let mut color = pick(&palette.leaf, patch, 0x2C71);
                     // The outermost leaves catch the light.
                     let lit = cluster.shell * 0.6 + shell * 0.4;
-                    if lit > 0.6 && hash_unit(x, y, z, 0x77A3) < (lit - 0.6) * 2.2 {
+                    if lit > 0.6 && hash_unit(patch.x, patch.y, patch.z, 0x77A3) < (lit - 0.6) * 2.2 {
                         color = color.lerp(palette.tip, 0.85);
                     }
                     voxels.insert(key, Voxel { kind: Kind::Leaf, color });

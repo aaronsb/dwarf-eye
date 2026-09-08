@@ -388,7 +388,24 @@ impl Forest {
         let built = Envelope::read(world, library, origin, species).map(|env| {
             let growth = library.growth(species);
             let habit = env.habit(growth);
-            Arc::new(voxelise(&env, library, growth, habit, world_origin))
+            let grown = voxelise(&env, library, growth, habit, world_origin);
+            if std::env::var("DWARF_EYE_TREE_LOG").is_ok() {
+                let (bx, by) = (env.base.0.div_euclid(BLOCK), env.base.1.div_euclid(BLOCK));
+                let mut loaded = env.z1;
+                while world.chunk(bx, by, loaded + 1).is_some() {
+                    loaded += 1;
+                }
+                eprintln!(
+                    "tree {:?} species {species} envelope z {}..{} truncated {} loaded top {loaded} voxels y {}..{}",
+                    env.origin,
+                    env.z0,
+                    env.z1,
+                    env.truncated,
+                    grown.gy as f32 / DETAIL as f32,
+                    (grown.gy + grown.ny) as f32 / DETAIL as f32,
+                );
+            }
+            Arc::new(grown)
         });
         self.trees.insert(origin, built.clone());
         built

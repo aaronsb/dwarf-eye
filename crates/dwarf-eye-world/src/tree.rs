@@ -287,29 +287,67 @@ pub fn seed(env: &Envelope, world_origin: (i32, i32, i32)) -> u64 {
     rng::hash3(ox + world_origin.0, oy + world_origin.1, oz + world_origin.2, env.species as u64)
 }
 
-/// The DF envelope as the growth crate's, centred on the trunk.
+/// How far the tree's tiles reach from its trunk, in tiles.
 ///
-/// The crate grows from the origin outward and asks the envelope where it may
-/// go, so the grid has to be centred on the tile the trunk stands on rather
-/// than on the footprint's corner.
-pub fn envelope(env: &Envelope) -> trees::Envelope {
-    let reach = [
-        env.base.0 - env.x0,
-        env.x0 + env.w - 1 - env.base.0,
-        env.base.1 - env.y0,
-        env.y0 + env.d - 1 - env.base.1,
-    ];
-    let r = reach.into_iter().max().unwrap_or(1).max(1);
-    let side = (2 * r + 1) as u32;
+/// This and the height are the whole of what the game tells us about a tree's
+/// size. Every level's own footprint is DF's bookkeeping, not a silhouette.
+pub fn extent(env: &Envelope) -> f32 {
+    let base = [env.base.0 as f32 + 0.5, env.base.1 as f32 + 0.5];
+    let mut reach: f32 = 1.0;
+    for (level, centre) in env.centre.iter().enumerate() {
+        let lean = ((centre[0] - base[0]).powi(2) + (centre[1] - base[1]).powi(2)).sqrt();
+        reach = reach.max(lean + env.radius[level]);
+    }
+    reach
+}
 
-    let levels = (0..env.height())
+/// The crown's typical radius in tiles, which is what the species is grown to.
+///
+/// [`extent`] is a worst case and makes a fat blob of every leaning tree; the
+/// mean of the levels the game calls crown is the size it actually reports.
+pub fn spread(env: &Envelope) -> f32 {
+    let from = (env.crown_z0 - env.z0).max(0) as usize;
+    let levels = &env.radius[from.min(env.radius.len().saturating_sub(1))..];
+    let wide: f32 = levels.iter().sum();
+    (wide / levels.len().max(1) as f32).max(1.0)
+}
+
+/// Extra levels a crown may rise into, a quarter of its own depth.
+///
+/// DF's footprint stops in a flat plane. A crown grown to fill it ends in a
+/// slab, so the tree is allowed to dome or spike above what the tiles say.
+pub fn headroom(env: &Envelope) -> i32 {
+    let crown = (env.z1 - env.crown_z0 + 1).max(1);
+    ((crown as f32 * 0.25).round() as i32).clamp(1, 3)
+}
+
+/// The bounds the tree may grow inside, as the growth crate wants them.
+///
+/// A box, not a mould. DF's tiles say how tall a tree is, how far it reaches
+/// and where it stands; the shape inside that is the species' own, grown the
+/// same way the tree lab grows it. Only a limb leaving the whole extent is
+/// stopped, never one leaving a particular level's exact footprint — moulding a
+/// tree to those gives a flat-topped, straight-sided slab.
+pub fn envelope(env: &Envelope) -> trees::Envelope {
+    let reach = extent(env);
+    let r = reach.ceil() as i32 + 1;
+    let side = (2 * r + 1) as u32;
+    let over = headroom(env);
+
+    let levels = (0..env.height() + over)
         .map(|i| {
-            let mut foot = trees::Footprint { width: side, depth: side, cells: vec![false; (side * side) as usize] };
+            // The headroom narrows, so what rises into it is an apex.
+            let above = (i - env.height() + 1).max(0) as f32;
+            let radius = (reach * (1.0 - 0.3 * above)).max(0.9);
+            let mut foot = trees::Footprint {
+                width: side,
+                depth: side,
+                cells: vec![false; (side * side) as usize],
+            };
             for iz in 0..side as i32 {
                 for ix in 0..side as i32 {
-                    let x = env.base.0 + ix - r;
-                    let y = env.base.1 + iz - r;
-                    if env.occupied(x, y, env.z0 + i) {
+                    let (dx, dz) = ((ix - r) as f32, (iz - r) as f32);
+                    if (dx * dx + dz * dz).sqrt() <= radius {
                         foot.cells[(iz * side as i32 + ix) as usize] = true;
                     }
                 }
@@ -339,7 +377,7 @@ pub fn params(
         }
     };
 
-    params.height = env.height() as f32;
+    params.height = (env.height() + headroom(env)) as f32;
     // A tall tree carries a thicker trunk, kept under a tile across either way.
     let tall = ((env.height() - 2) as f32 / 12.0).clamp(0.0, 1.0);
     params.trunk_width = 0.32 + 0.38 * tall;
@@ -347,6 +385,10 @@ pub fn params(
     // Where the crown starts is the game's own answer, not the preset's.
     let clear = (env.crown_z0 - env.z0) as f32 / params.height.max(1.0);
     params.clear_frac = clear.clamp(0.08, 0.7);
+
+    // Limbs reach for the extent the game gives, so the preset grows to this
+    // tree's size rather than pressing against the bounds.
+    params.limb_frac = (spread(env) * 0.75 / params.height.max(1.0)).clamp(0.12, 0.4);
 
     // DF's branch density is a percentage; it decides how full the crown is and
     // how much light comes through a leaf face.
@@ -371,7 +413,9 @@ pub fn params(
     if !bark.is_empty() {
         params.palette.bark = bark;
     }
-    params.palette.tip = tip.lerp(trees::Rgb(255, 255, 255), 0.22);
+    // The species' own lightest shade, unwhitened: DF's leaf sprites are
+    // already pale, and lifting them further washes the crown out.
+    params.palette.tip = tip;
     params
 }
 
