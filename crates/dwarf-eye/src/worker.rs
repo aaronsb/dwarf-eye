@@ -9,7 +9,7 @@ use crate::walk::Pilot;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
-use dwarf_eye_world::canopy::{CanopyMeshes, Forest};
+use dwarf_eye_world::canopy::{Band, CanopyMeshes, Forest};
 use dwarf_eye_world::clock;
 use dwarf_eye_world::{BLOCK, BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -44,10 +44,10 @@ pub enum Event {
     /// The packed ground texture, sent once before any geometry.
     Atlas { width: u32, height: u32, pixels: Vec<u8> },
     Connected { world_name: String, save: String, center: (i32, i32, i32), size: (i32, i32, i32) },
-    /// Geometry for chunks that changed, terrain then crown. Crowns ride their
-    /// own material, so they arrive as their own mesh. Two empty meshes mean
-    /// "despawn this one".
-    Chunks(Vec<(ChunkKey, MeshData, CanopyMeshes)>),
+    /// Geometry for chunks that changed: terrain, then the crown at each
+    /// detail band. Crowns ride their own materials, so they arrive as their
+    /// own meshes. All-empty meshes mean "despawn this one".
+    Chunks(Vec<(ChunkKey, MeshData, CanopyMeshes, CanopyMeshes)>),
     /// Coarse terrain beyond the loaded map, sent once the map's surface is known.
     Horizon(MeshData),
     /// Blocks whose fine chunks reach the ground, where the horizon must yield.
@@ -402,7 +402,9 @@ fn collect(
         events.send(Event::Chunks(
             stale
                 .iter()
-                .map(|&k| (k, MeshData::default(), CanopyMeshes::default()))
+                .map(|&k| {
+                    (k, MeshData::default(), CanopyMeshes::default(), CanopyMeshes::default())
+                })
                 .collect(),
         ))?;
     }
@@ -427,7 +429,9 @@ fn collect(
         events.send(Event::Chunks(
             dropped
                 .iter()
-                .map(|&k| (k, MeshData::default(), CanopyMeshes::default()))
+                .map(|&k| {
+                    (k, MeshData::default(), CanopyMeshes::default(), CanopyMeshes::default())
+                })
                 .collect(),
         ))?;
     }
@@ -592,12 +596,15 @@ fn remesh_touched(
     for key in keys {
         let Some(chunk) = df.world.chunk(key.0, key.1, key.2) else { continue };
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
-        let crown = match library.as_deref_mut() {
-            Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib, df.origin()),
-            None => CanopyMeshes::default(),
-        };
+        // Both bands are built here: they share the growth the forest caches,
+        // and a chunk that arrives has to arrive whole.
+        let (mut crown, mut mid) = (CanopyMeshes::default(), CanopyMeshes::default());
+        if let Some(lib) = library.as_deref_mut() {
+            crown = forest.build_chunk(&df.world, chunk, opts, lib, df.origin(), Band::Near);
+            mid = forest.build_chunk(&df.world, chunk, opts, lib, df.origin(), Band::Mid);
+        }
         cost.insert(key, mesh.triangle_count() + crown.triangle_count());
-        batch.push((key, mesh, crown));
+        batch.push((key, mesh, crown, mid));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
             batch.reserve(BATCH);
@@ -624,12 +631,15 @@ fn remesh_all(
     for chunk in df.world.chunks() {
         let key = (chunk.block_x, chunk.block_y, chunk.z);
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
-        let crown = match library.as_deref_mut() {
-            Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib, df.origin()),
-            None => CanopyMeshes::default(),
-        };
+        // Both bands are built here: they share the growth the forest caches,
+        // and a chunk that arrives has to arrive whole.
+        let (mut crown, mut mid) = (CanopyMeshes::default(), CanopyMeshes::default());
+        if let Some(lib) = library.as_deref_mut() {
+            crown = forest.build_chunk(&df.world, chunk, opts, lib, df.origin(), Band::Near);
+            mid = forest.build_chunk(&df.world, chunk, opts, lib, df.origin(), Band::Mid);
+        }
         cost.insert(key, mesh.triangle_count() + crown.triangle_count());
-        batch.push((key, mesh, crown));
+        batch.push((key, mesh, crown, mid));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
             batch.reserve(BATCH);

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
-use dwarf_eye_world::canopy::{CanopyBudget, Forest};
+use dwarf_eye_world::canopy::{Band, CanopyBudget, Forest, MID_DETAIL};
 use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::mesh::{Budget, build_chunk_budgeted};
 use dwarf_eye_world::{MeshOptions, Session};
@@ -21,6 +21,7 @@ fn main() -> Result<()> {
     let opts = MeshOptions { z_ceiling: view.2 + 16, show_hidden: true };
     let mut total = Budget::default();
     let mut canopy = CanopyBudget::default();
+    let mut mid = CanopyBudget::default();
     let mut forest = Forest::default();
     let mut chunks = 0;
     for chunk in df.world.chunks() {
@@ -35,7 +36,8 @@ fn main() -> Result<()> {
         total.liquids += budget.liquids;
         total.other += budget.other;
         if let Some(lib) = library.as_mut() {
-            let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, &mut canopy);
+            let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, Band::Near, &mut canopy);
+            let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, Band::Mid, &mut mid);
         }
         chunks += 1;
     }
@@ -54,6 +56,11 @@ fn main() -> Result<()> {
     ] {
         println!("  {:>10}  {:>5.1}%  {name}", n, n as f32 * 100.0 / sum.max(1) as f32);
     }
+    println!(
+        "mid band at {MID_DETAIL} sub-voxels per tile: {} triangles, {:.2}x fewer than near",
+        mid.triangles,
+        canopy.triangles as f32 / mid.triangles.max(1) as f32,
+    );
     println!(
         "trees at {} sub-voxels per tile: {} triangles merged, {} unmerged ({:.2}x)",
         dwarf_eye_world::tree::DETAIL,
