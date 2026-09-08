@@ -17,7 +17,7 @@ fn main() -> Result<()> {
                 (
                     t.name().to_string(),
                     format!("{:?}", t.shape()),
-                    format!("{:?}", t.material()),
+                    format!("{:?} dir={}", t.material(), t.direction()),
                 ),
             )
         })

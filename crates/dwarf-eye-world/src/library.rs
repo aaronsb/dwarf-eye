@@ -1,7 +1,7 @@
 //! Resolves a tile to a cached voxel model built from DF's own sprite.
 
 use crate::mesh::MeshData;
-use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
+use crate::model::{Caps, RenderMode, build_flat_tile, build_model, build_ramp};
 use anyhow::Result;
 use dfhack_remote::rfr::{PlantRawList, TiletypeList, TiletypeMaterial, TiletypeShape};
 use dwarf_eye_art::atlas::{Atlas, Rect};
@@ -27,6 +27,8 @@ struct ModelKey {
     tile: i32,
     plant: i32,
     caps: Caps,
+    /// Orientation, for geometry the mesher works out from neighbours.
+    dirs: u8,
 }
 
 struct TileInfo {
@@ -55,6 +57,7 @@ fn mode_for(shape: TiletypeShape, name: &str) -> Option<RenderMode> {
         S::Sapling | S::Shrub | S::Boulder => Some(RenderMode::Billboard),
         // Ground cover, including the walkable surface of a treetop.
         S::Floor | S::Pebbles => Some(RenderMode::FlatTile),
+        S::Ramp => Some(RenderMode::Ramp),
         _ => None,
     }
 }
@@ -214,7 +217,9 @@ impl TileLibrary {
             } else {
                 Vec::new()
             };
-            let beneath = (mode == RenderMode::Billboard).then(|| ground_under(t.material()));
+            // Billboards need ground under them; ramps need it on their slope.
+            let beneath = matches!(mode, RenderMode::Billboard | RenderMode::Ramp)
+                .then(|| ground_under(t.material()));
             tiles.insert(
                 t.id,
                 TileInfo {
@@ -318,10 +323,37 @@ impl TileLibrary {
         }
     }
 
+    /// A wedge for a ramp tile, rising toward `high`.
+    ///
+    /// Falls back to a flat slab when no neighbouring wall says which way it
+    /// should climb.
+    pub fn ramp(&mut self, tile: i32, high: u8) -> Option<Model> {
+        let family = self.tiles.get(&tile)?.beneath?;
+        let key = ModelKey { tile, plant: -1, caps: Caps::BOTH, dirs: high };
+        if let Some(found) = self.cache.get(&key) {
+            return found.clone();
+        }
+
+        let built = self.under_uv.get(family).copied().map(|(rect, tint)| Model {
+            mesh: Arc::new(if high == 0 {
+                build_flat_tile(rect, FLOOR_HEIGHT)
+            } else {
+                build_ramp(rect, high, FLOOR_HEIGHT)
+            }),
+            tint,
+        });
+        self.cache.insert(key, built.clone());
+        built
+    }
+
     /// A ground slab for a tile that holds a free-standing object, or `None`
     /// when the tile needs no floor of its own.
     pub fn ground_beneath(&mut self, tile: i32) -> Option<Model> {
-        let family = self.tiles.get(&tile)?.beneath?;
+        let info = self.tiles.get(&tile)?;
+        if info.mode != RenderMode::Billboard {
+            return None;
+        }
+        let family = info.beneath?;
         if let Some(found) = self.under_model.get(family) {
             return found.clone();
         }
@@ -393,7 +425,7 @@ impl TileLibrary {
     pub fn model(&mut self, tile: i32, mat_index: i32, caps: Caps) -> Option<Model> {
         let info = self.tiles.get(&tile)?;
         let plant = if info.generic { -1 } else { mat_index };
-        let key = ModelKey { tile, plant, caps };
+        let key = ModelKey { tile, plant, caps, dirs: 0 };
         if let Some(found) = self.cache.get(&key) {
             return found.clone();
         }

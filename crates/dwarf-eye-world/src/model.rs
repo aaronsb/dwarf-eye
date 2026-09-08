@@ -20,6 +20,8 @@ pub enum RenderMode {
     Billboard,
     /// A textured slab on the floor: pebbles, floors, grass.
     FlatTile,
+    /// A wedge rising toward the wall it leans on.
+    Ramp,
 }
 
 impl RenderMode {
@@ -28,7 +30,7 @@ impl RenderMode {
             RenderMode::Extrude => (0.0, 1.0),
             RenderMode::ThinExtrude => (0.34, 0.66),
             RenderMode::FlatTile => (0.0, 0.12),
-            RenderMode::Billboard => (0.0, 1.0),
+            RenderMode::Billboard | RenderMode::Ramp => (0.0, 1.0),
         }
     }
 }
@@ -87,6 +89,73 @@ pub fn build_flat_tile(uv: Rect, height: f32) -> MeshData {
     mesh.push_quad([[1.0, 0.0, 1.0], [1.0, y, 1.0], [0.0, y, 1.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 1.0], side);
     mesh.push_quad([[0.0, 0.0, 1.0], [0.0, y, 1.0], [0.0, y, 0.0], [0.0, 0.0, 0.0]], [-1.0, 0.0, 0.0], side);
     mesh.push_quad([[1.0, 0.0, 0.0], [1.0, y, 0.0], [1.0, y, 1.0], [1.0, 0.0, 1.0]], [1.0, 0.0, 0.0], side);
+
+    mesh
+}
+
+/// A wedge rising toward `high`, textured on the slope.
+///
+/// Terrain ramps carry no direction of their own — DFHack reports
+/// `dir=--------` for them — so the caller works out which side is high from
+/// whichever neighbour is a wall.
+///
+/// `high` uses the direction bits from the raws: N=1, S=2, W=4, E=8. In world
+/// terms north is -z and west is -x.
+pub fn build_ramp(uv: Rect, high: u8, floor: f32) -> MeshData {
+    const NORTH: u8 = 1;
+    const SOUTH: u8 = 2;
+    const WEST: u8 = 4;
+    const EAST: u8 = 8;
+
+    let (lo, hi) = (floor * Z_SCALE, Z_SCALE);
+    // Corner height, given the corner's position on the tile.
+    let height = |x: f32, z: f32| -> f32 {
+        let raised = (high & NORTH != 0 && z < 0.5)
+            || (high & SOUTH != 0 && z > 0.5)
+            || (high & WEST != 0 && x < 0.5)
+            || (high & EAST != 0 && x > 0.5);
+        if raised { hi } else { lo }
+    };
+
+    let mut mesh = MeshData::default();
+    let white = [1.0, 1.0, 1.0, 1.0];
+
+    // The slope itself, carrying the ground texture.
+    let corners = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    let top: [[f32; 3]; 4] = corners.map(|(x, z)| [x, height(x, z), z]);
+    mesh.push_textured_quad(
+        top,
+        [0.0, 1.0, 0.0],
+        white,
+        [
+            [uv.u0, uv.v0],
+            [uv.u0, uv.v1],
+            [uv.u1, uv.v1],
+            [uv.u1, uv.v0],
+        ],
+    );
+
+    // Walls under the slope, each spanning one edge of the tile.
+    let side = shade(white, 0.72);
+    let edges: [([f32; 2], [f32; 2], [f32; 3]); 4] = [
+        ([0.0, 0.0], [1.0, 0.0], [0.0, 0.0, -1.0]),
+        ([1.0, 1.0], [0.0, 1.0], [0.0, 0.0, 1.0]),
+        ([0.0, 1.0], [0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ([1.0, 0.0], [1.0, 1.0], [1.0, 0.0, 0.0]),
+    ];
+    for (a, b, normal) in edges {
+        let (ya, yb) = (height(a[0], a[1]), height(b[0], b[1]));
+        mesh.push_quad(
+            [
+                [a[0], 0.0, a[1]],
+                [a[0], ya, a[1]],
+                [b[0], yb, b[1]],
+                [b[0], 0.0, b[1]],
+            ],
+            normal,
+            shade(side, if normal[1] == 0.0 { 1.0 } else { 1.0 }),
+        );
+    }
 
     mesh
 }

@@ -258,6 +258,31 @@ pub fn build_chunk(
                     };
                     let caps = Caps { top: !continues(1), bottom: !continues(-1) };
 
+                    // Terrain ramps carry no direction, so the slope comes from
+                    // whichever neighbour is a wall.
+                    if lib.mode(voxel.tile_id) == Some(RenderMode::Ramp) {
+                        let mut high = 0u8;
+                        for (bit, dx, dy) in [(1u8, 0, -1), (2, 0, 1), (4, -1, 0), (8, 1, 0)] {
+                            if world
+                                .voxel(x + dx, y + dy, z)
+                                .is_some_and(|n| n.solid.occludes())
+                            {
+                                high |= bit;
+                            }
+                        }
+                        if let Some(model) = lib.ramp(voxel.tile_id, high) {
+                            let wobble = jitter(x, y, z);
+                            let tint = if model.tint {
+                                let base = damp([color[0], color[1], color[2]], 0.35);
+                                [base[0] * wobble, base[1] * wobble, base[2] * wobble]
+                            } else {
+                                [wobble, wobble, wobble]
+                            };
+                            mesh.stamp(&model.mesh, [fx, fy, fz], tint);
+                            continue;
+                        }
+                    }
+
                     // A shrub or boulder fills its tile outright, with no floor
                     // tile of its own, so give it ground to stand on.
                     if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
