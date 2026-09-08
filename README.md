@@ -3,6 +3,8 @@
 A Minecraft-style voxel view of a **live** Dwarf Fortress map, fed by DFHack's
 RemoteFortressReader plugin.
 
+[Architecture](docs/architecture/README.md)
+
 ![grassland](docs/surface.png)
 
 ## Requirements
