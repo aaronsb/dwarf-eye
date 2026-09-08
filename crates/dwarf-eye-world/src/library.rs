@@ -1,7 +1,8 @@
 //! Resolves a tile to a cached voxel model built from DF's own sprite.
 
 use crate::mesh::MeshData;
-use crate::model::{Caps, RenderMode, build_flat_tile, build_model, build_ramp};
+use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
+use crate::ramp;
 use anyhow::Result;
 use dfhack_remote::rfr::{PlantRawList, TiletypeList, TiletypeMaterial, TiletypeShape};
 use dwarf_eye_art::atlas::{Atlas, Rect};
@@ -37,6 +38,8 @@ struct TileInfo {
     candidates: Vec<String>,
     /// Ground to draw beneath a free-standing object.
     beneath: Option<&'static str>,
+    /// Which of DF's ramp sheets a ramp tile draws from.
+    ramp: Option<&'static str>,
     dirs: u8,
     mode: RenderMode,
     /// Species-independent tiles look straight at the generic sheet.
@@ -187,6 +190,10 @@ pub struct TileLibrary {
     /// Ground families packed for use beneath free-standing objects.
     under_uv: HashMap<&'static str, (Rect, bool)>,
     under_model: HashMap<&'static str, Option<Model>>,
+    /// DF's ramp sprites, by full sprite name.
+    ramp_uv: HashMap<String, (Rect, bool)>,
+    /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
+    ramp_model: HashMap<(i32, u8), Option<Model>>,
 }
 
 impl TileLibrary {
@@ -226,6 +233,7 @@ impl TileLibrary {
                     family,
                     candidates,
                     beneath,
+                    ramp: (mode == RenderMode::Ramp).then(|| ramp::family_for(t.material())),
                     dirs: raws::direction_mask(t.direction()),
                     mode,
                     generic,
@@ -254,9 +262,12 @@ impl TileLibrary {
             flat_tint: HashMap::new(),
             under_uv: HashMap::new(),
             under_model: HashMap::new(),
+            ramp_uv: HashMap::new(),
+            ramp_model: HashMap::new(),
         };
         library.pack_ground();
         library.pack_under();
+        library.pack_ramps();
         Ok(library)
     }
 
@@ -323,26 +334,34 @@ impl TileLibrary {
         }
     }
 
-    /// A wedge for a ramp tile, rising toward `high`.
+    /// A ramp's sloped surface for one eight-neighbour wall mask.
     ///
-    /// Falls back to a flat slab when no neighbouring wall says which way it
-    /// should climb.
-    pub fn ramp(&mut self, tile: i32, high: u8) -> Option<Model> {
-        let family = self.tiles.get(&tile)?.beneath?;
-        let key = ModelKey { tile, plant: -1, caps: Caps::BOTH, dirs: high };
-        if let Some(found) = self.cache.get(&key) {
+    /// The mask keys the cache, so all 256 neighbour sets resolve — and because
+    /// DF names its ramp sprites by the same set, the picture on the slope
+    /// always agrees with the shape underneath it.
+    ///
+    /// Falls back to a flat slab of ground when no neighbour is a wall and
+    /// there is nothing for the tile to climb toward.
+    pub fn ramp(&mut self, tile: i32, mask: u8) -> Option<Model> {
+        if let Some(found) = self.ramp_model.get(&(tile, mask)) {
             return found.clone();
         }
 
-        let built = self.under_uv.get(family).copied().map(|(rect, tint)| Model {
-            mesh: Arc::new(if high == 0 {
-                build_flat_tile(rect, FLOOR_HEIGHT)
-            } else {
-                build_ramp(rect, high, FLOOR_HEIGHT)
-            }),
-            tint,
-        });
-        self.cache.insert(key, built.clone());
+        let info = self.tiles.get(&tile)?;
+        let built = if ramp::is_flat(mask) {
+            let family = info.beneath?;
+            self.under_uv.get(family).copied().map(|(rect, tint)| Model {
+                mesh: Arc::new(build_flat_tile(rect, FLOOR_HEIGHT)),
+                tint,
+            })
+        } else {
+            let name = ramp::sprite_name(info.ramp?, mask);
+            self.ramp_uv.get(&name).copied().map(|(rect, tint)| Model {
+                mesh: Arc::new(ramp::build_ramp(rect, mask, FLOOR_HEIGHT)),
+                tint,
+            })
+        };
+        self.ramp_model.insert((tile, mask), built.clone());
         built
     }
 
@@ -403,6 +422,36 @@ impl TileLibrary {
         }
     }
 
+    /// Packs DF's own ramp sheets, whole.
+    ///
+    /// Each family holds 47 sprites — one per distinct wall set — and the set
+    /// is small and knowable, so it can be finished before the first frame like
+    /// the ground is. The raws parser eats a trailing direction group off every
+    /// part name, so a lookup has to be spelled the same way the index was
+    /// filled.
+    fn pack_ramps(&mut self) {
+        let wanted: Vec<&'static str> = {
+            let mut v: Vec<_> = self.tiles.values().filter_map(|t| t.ramp).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for family in wanted {
+            for name in ramp::sprite_names(family) {
+                let key = raws::parse_part(&name);
+                let Some(sprite) = self.art.tree_sprite("", &key.family, key.dirs).cloned() else {
+                    self.misses.insert(name);
+                    continue;
+                };
+                let pattern = sprite.saturation() < PATTERN_SATURATION;
+                let backdrop = sprite_mean(&sprite);
+                if let Some(rect) = self.atlas.insert(atlas_key(&name, 0, ""), &sprite, backdrop) {
+                    self.ramp_uv.insert(name, (rect, pattern));
+                }
+            }
+        }
+    }
+
     /// The packed ground texture, for the renderer to upload.
     pub fn atlas(&self) -> &Atlas {
         &self.atlas
@@ -414,6 +463,7 @@ impl TileLibrary {
 
     pub fn model_count(&self) -> usize {
         self.cache.values().filter(|m| m.is_some()).count()
+            + self.ramp_model.values().filter(|m| m.is_some()).count()
     }
 
     pub fn missing(&self) -> usize {
