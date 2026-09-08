@@ -38,7 +38,9 @@ use shadow::{
 };
 use sky::Clock;
 use dwarf_eye_trees as trees;
+use bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport;
 use bevy::render::occlusion_culling::OcclusionCulling;
+use bevy::render::{RenderApp, RenderStartup};
 use dwarf_eye_world::canopy::{Band, CanopyMeshes, Coat, Surface};
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
@@ -101,7 +103,31 @@ fn main() {
                 (walk::receive, walk::walk).chain().run_if(walk::walking),
             ),
         )
+        .add_plugins(report_culling)
         .run();
+}
+
+/// Says in the log whether this device can actually do the occlusion culling
+/// the camera asks for: the two-phase pass needs GPU preprocessing with
+/// culling, and Bevy quietly ignores `OcclusionCulling` where that is missing.
+fn report_culling(app: &mut App) {
+    let Some(render) = app.get_sub_app_mut(RenderApp) else { return };
+    render.add_systems(
+        RenderStartup,
+        |support: Res<GpuPreprocessingSupport>| {
+            info!(
+                "GPU preprocessing {}; occlusion culling {}",
+                if support.is_available() { "available" } else { "unavailable" },
+                if !support.is_culling_supported() {
+                    "unsupported on this device"
+                } else if occlusion_culling() {
+                    "on"
+                } else {
+                    "off (DWARF_EYE_OCCLUSION=0)"
+                }
+            );
+        },
+    );
 }
 
 #[derive(Resource)]
@@ -345,7 +371,6 @@ fn setup(
     if occlusion_culling() {
         commands.entity(camera).insert(OcclusionCulling);
     }
-    info!("occlusion culling {}", if occlusion_culling() { "on" } else { "off" });
 
     commands.spawn((
         DirectionalLight {
