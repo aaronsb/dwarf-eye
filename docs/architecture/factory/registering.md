@@ -1,35 +1,26 @@
 # Registering an override
 
-Status: planned (issue #5). The path a tree takes today is the pattern the
-registry generalises.
+Status: landed for vegetation (`factory.rs`); prefabs and items still to come
+(issues #5, #15).
 
-## The path today
+## The path a plant takes
 
-A tree becomes geometry through four steps, none of them registered:
-
-1. `library.rs:mode_for` and `library.rs:canopy_part` classify the tiletype at
-   load, from its `TiletypeShape` and its name.
-2. `mesh.rs:build_chunk_budgeted` early-outs on `TileLibrary::is_trunk` and
-   `TileLibrary::canopy_part`, so no tile of a tree is drawn from its sprite.
-3. `canopy.rs:Forest::nearby` finds the origins whose tiles reach the chunk, and
-   `Forest::tree` grows and caches one volume per origin.
+1. `library.rs:TileLibrary::load` calls `factory::plan` once per tiletype and
+   keeps the `Class` and `Extent` on the tiletype's entry.
+2. `mesh.rs:build_chunk_budgeted` asks `Plan::grown`, and skips the sprite path
+   for what the factory grows; a one-tile plant still gets its ground slab.
+3. `canopy.rs:Forest::nearby` collects the tree origins reaching the chunk
+   (`TileLibrary::of_tree`) and `Forest::tree` grows and caches one volume per
+   origin; `Forest::sow` grows and caches one plant per tile of the chunk.
 4. `canopy.rs:emit` sorts merged faces into the four canopy meshes, which
-   `main.rs:upload_chunks` pairs with the four canopy materials.
+   `main.rs:upload_chunks` pairs with the four canopy materials; plants are
+   stamped into the same meshes.
 
-## The intended shape
+`Treatment::Sprite` is the sprite-derived geometry of `library.rs:model`, which
+is what every unregistered class still gets. Still to come: boulders as
+something other than a billboard, and buildings as `.vox` prefabs.
 
-Issue #5 puts a registry in `dwarf-eye-world`:
-
-```
-classify(tile shape, material, species, item or building id, neighbourhood) -> Class
-resolve(Class) -> Treatment
-```
-
-`Treatment::Default` is the sprite-derived geometry of `library.rs:model`.
-Overrides are registered per class: trees first, then shrubs and one-tile plants
-such as rhubarb, boulders, dead trees, and buildings as `.vox` prefabs.
-
-## What registering one will involve
+## What registering one involves
 
 - A `Class` the classifier can produce from what a tile already carries. Adding
   a class must not need a second pass over the map.
@@ -41,7 +32,8 @@ such as rhubarb, boulders, dead trees, and buildings as `.vox` prefabs.
 - The corresponding skip in the default path, which is what the registry lookup
   replaces.
 - A unit test for any new pure logic, and a screenshot pair for the look
-  ([../testing/README.md](../testing/README.md)).
+  ([../testing/README.md](../testing/README.md)). `factory.rs` is pure, so
+  classification and the seed rule are unit-tested on synthetic tiles.
 
 ## Invariants
 

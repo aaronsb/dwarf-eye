@@ -1,6 +1,7 @@
 //! Turns chunks into triangle soup. Engine-agnostic: the renderer only has to
 //! copy the four output arrays into its own mesh type.
 
+use crate::factory::{Extent, Style};
 use crate::library::TileLibrary;
 use crate::model::{Caps, RenderMode};
 use crate::palette::{Rgb, Solid};
@@ -245,6 +246,7 @@ pub fn build_chunk_budgeted(
     if chunk.z > opts.z_ceiling {
         return mesh;
     }
+    let style = Style::current();
     let (ox, oy, oz) = chunk.origin();
 
     for ly in 0..BLOCK {
@@ -300,10 +302,38 @@ pub fn build_chunk_budgeted(
 
             // A sprite-derived model, when this tiletype has one.
             if let Some(lib) = library.as_deref_mut() {
-                // Trees are grown and voxelised separately, onto their own
-                // material, so no tile of one is drawn from its sprite here.
-                if lib.canopy_part(voxel.tile_id).is_some() || lib.is_trunk(voxel.tile_id) {
-                    continue;
+                // The factory decides who draws a tile. What it grows — a
+                // tree's wood and crown, a plant standing in its own tile —
+                // comes back as canopy geometry on its own materials, so
+                // nothing of it is drawn from a sprite here.
+                if let Some(plan) = lib.plan(voxel.tile_id) {
+                    if plan.grown(style) {
+                        // A standing plant occupies its tile outright: DF
+                        // reports no floor under it, so it keeps the ground the
+                        // billboard used to stand on.
+                        if plan.extent == Extent::Tile {
+                            if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
+                                let before = mesh.indices.len();
+                                let wobble = jitter(x, y, z);
+                                let tint = if ground.tint {
+                                    let base = damp([color[0], color[1], color[2]], 0.35);
+                                    [base[0] * wobble, base[1] * wobble, base[2] * wobble]
+                                } else {
+                                    [wobble, wobble, wobble]
+                                };
+                                mesh.stamp(&ground.mesh, [fx, fy, fz], tint);
+                                let rims = rim_faces();
+                                mesh.cuboid(
+                                    [fx, fy, fz],
+                                    [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0],
+                                    color,
+                                    Faces { top: true, ..rims },
+                                );
+                                tally(&mesh, before, &mut budget.ground_under);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if lib.handles(voxel.tile_id) {
                     // A trunk with more trunk above it has no visible top. This

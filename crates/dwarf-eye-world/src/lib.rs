@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod clock;
+pub mod factory;
 pub mod canopy;
 pub mod horizon;
 pub mod library;

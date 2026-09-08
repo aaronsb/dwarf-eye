@@ -1,6 +1,7 @@
 //! Resolves a tile to a cached voxel model built from DF's own sprite.
 
 use crate::canopy::CanopyPart;
+use crate::factory::{self, Plan};
 use crate::mesh::MeshData;
 use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
 use crate::ramp;
@@ -51,6 +52,10 @@ struct TileInfo {
     canopy: Option<CanopyPart>,
     /// Trunk or root: the woody column a crown hangs on.
     trunk: bool,
+    /// What the entity factory makes of this tiletype: what it is, and how much
+    /// room it has. Decided once here, so a mesher asking per tile pays one
+    /// lookup rather than a chain of special cases.
+    plan: Plan,
 }
 
 /// Decides how a tiletype's mask becomes geometry.
@@ -252,6 +257,11 @@ pub struct TileLibrary {
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
     ramp_model: HashMap<(i32, u8), Option<Model>>,
+    /// Tiletypes the factory calls built work. Kept apart from `tiles`, which
+    /// holds only what has a sprite treatment: a constructed wall is drawn as a
+    /// plain block and would not be in there, and a tree still has to know not
+    /// to grow into one.
+    built: HashSet<i32>,
 }
 
 impl TileLibrary {
@@ -264,8 +274,19 @@ impl TileLibrary {
             .clamp(4, 32);
 
         let mut tiles = HashMap::new();
+        let mut built = HashSet::new();
         for t in &tiletypes.tiletype_list {
             let name = t.name();
+            let entity = factory::Tile {
+                shape: t.shape(),
+                material: t.material(),
+                special: t.special(),
+                name,
+                plant: "",
+            };
+            if factory::built(factory::classify(entity, factory::Near::default())) {
+                built.insert(t.id);
+            }
             let Some(mode) = mode_for(t.shape(), name) else { continue };
             let generic = matches!(mode, RenderMode::Billboard);
             let family = if generic {
@@ -300,6 +321,12 @@ impl TileLibrary {
                     generic,
                     canopy: canopy_part(t.shape(), name),
                     trunk: mode == RenderMode::Extrude && canopy_part(t.shape(), name).is_none(),
+                    // A cap tile wears an ordinary floor or wall shape, and
+                    // DF's own name for it is the link to the tree.
+                    plan: factory::plan(
+                        entity,
+                        factory::Near { in_tree: canopy_part(t.shape(), name).is_some() },
+                    ),
                 },
             );
         }
@@ -332,6 +359,7 @@ impl TileLibrary {
             bark_tones: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
+            built,
         };
         library.pack_leaves();
         library.pack_ground();
@@ -746,6 +774,23 @@ impl TileLibrary {
     /// growth tokens do not say enough.
     pub fn plant_id(&self, mat_index: i32) -> String {
         self.plants.get(mat_index.max(0) as usize).cloned().unwrap_or_default()
+    }
+
+    /// What the factory makes of a tiletype, or `None` when DF has never
+    /// mentioned it.
+    pub fn plan(&self, tile: i32) -> Option<Plan> {
+        self.tiles.get(&tile).map(|t| t.plan)
+    }
+
+    /// Whether a tiletype is built work: a wall, floor or building someone
+    /// raised, which no plant may grow into.
+    pub fn is_built(&self, tile: i32) -> bool {
+        self.built.contains(&tile)
+    }
+
+    /// Whether a tiletype is part of a multi-tile tree, living or dead.
+    pub fn of_tree(&self, tile: i32) -> bool {
+        self.plan(tile).is_some_and(|p| p.of_tree())
     }
 
     /// Whether this tiletype is a tree's woody column.

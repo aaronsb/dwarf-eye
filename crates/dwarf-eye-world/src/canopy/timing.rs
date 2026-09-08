@@ -65,6 +65,8 @@ pub struct Phases {
     pub absorb: Phase,
     /// Meshing a chunk's slice.
     pub emit: Phase,
+    /// Growing and meshing one standing plant.
+    pub plants: Phase,
     /// Chunks built.
     pub chunks: Phase,
 }
@@ -77,6 +79,7 @@ pub static PHASES: Phases = Phases {
     voxelise: Phase::new(),
     absorb: Phase::new(),
     emit: Phase::new(),
+    plants: Phase::new(),
     chunks: Phase::new(),
 };
 
@@ -89,7 +92,8 @@ pub fn report() -> String {
     let p = &PHASES;
     let line = format!(
         "canopy: {} chunks, {} trees grown | nearby {:.1}s envelope {:.1}s skeleton {:.1}s \
-         rasterise {:.1}s voxelise {:.1}s absorb {:.1}s ({} slices) emit {:.1}s",
+         rasterise {:.1}s voxelise {:.1}s absorb {:.1}s ({} slices) emit {:.1}s | \
+         {} plants grown in {:.1}s",
         p.chunks.count(),
         p.skeleton.count(),
         p.nearby.seconds(),
@@ -100,10 +104,12 @@ pub fn report() -> String {
         p.absorb.seconds(),
         p.absorb.count(),
         p.emit.seconds(),
+        p.plants.count(),
+        p.plants.seconds(),
     );
     for phase in [
         &p.nearby, &p.envelope, &p.skeleton, &p.rasterise, &p.voxelise, &p.absorb, &p.emit,
-        &p.chunks,
+        &p.plants, &p.chunks,
     ] {
         phase.clear();
     }
