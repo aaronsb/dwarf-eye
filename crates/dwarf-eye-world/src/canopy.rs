@@ -94,12 +94,25 @@ impl Band {
         self == Band::Near
     }
 
+    /// Which of [`CanopyMeshes`]'s four meshes a surface goes into.
+    ///
+    /// The near band splits by material, since each wants its own cutout. The
+    /// mid band puts everything in the first, because one mesh on one material
+    /// is one entity and one draw call per chunk, and a chunk that far off has
+    /// no bark grain or leaf holes left to tell apart.
+    fn slot(self, surface: Surface) -> usize {
+        match self {
+            Band::Near => surface.slot(),
+            Band::Mid => 0,
+        }
+    }
+
     /// What each of [`CanopyMeshes`]'s four meshes is drawn with.
     ///
     /// The mid band's leaves are opaque: a cutout costs a masked pass, a
     /// discard in the depth prepass and the overdraw behind every hole, and at
-    /// that distance the holes are under a pixel. Its fourth slot is never
-    /// filled, since strands are a near-band thing.
+    /// that distance the holes are under a pixel. Only its first slot is ever
+    /// filled.
     pub fn coats(self) -> [Coat; 4] {
         match self {
             Band::Near => [
@@ -108,7 +121,7 @@ impl Band {
                 Coat::Cutout(Surface::Needle),
                 Coat::Strip,
             ],
-            Band::Mid => [Coat::Bark, Coat::Leaf, Coat::Leaf, Coat::Leaf],
+            Band::Mid => [Coat::Leaf; 4],
         }
     }
 }
@@ -534,11 +547,12 @@ impl CanopyMeshes {
         [&self.bark, &self.broadleaf, &self.needle, &self.streamers].into_iter()
     }
 
-    fn slot(&mut self, surface: Surface) -> &mut MeshData {
-        match surface {
-            Surface::Bark => &mut self.bark,
-            Surface::Broadleaf => &mut self.broadleaf,
-            Surface::Needle => &mut self.needle,
+    fn at(&mut self, slot: usize) -> &mut MeshData {
+        match slot {
+            0 => &mut self.bark,
+            1 => &mut self.broadleaf,
+            2 => &mut self.needle,
+            _ => &mut self.streamers,
         }
     }
 }
@@ -646,7 +660,7 @@ impl Forest {
             return meshes;
         }
 
-        let mut volume = Volume::new(chunk, above, band.detail());
+        let mut volume = Volume::new(chunk, above, band);
         for (origin, species) in origins {
             let grown = self.tree(world, library, origin, species, world_origin, band);
             let Some(grown) = grown else { continue };
@@ -906,6 +920,7 @@ fn hang(
 /// One chunk's slice of whatever trees reach it, with a voxel of halo so faces
 /// at its edge can be culled against what the neighbour holds.
 struct Volume {
+    band: Band,
     /// Sub-voxels per tile, the band's own detail.
     detail: i32,
     nx: i32,
@@ -921,9 +936,11 @@ impl Volume {
     /// nothing is loaded over it. A crown reaching past the top of its column
     /// would otherwise have no chunk to be drawn in and would end flat at the
     /// loaded ceiling.
-    fn new(chunk: &Chunk, above: i32, detail: i32) -> Self {
+    fn new(chunk: &Chunk, above: i32, band: Band) -> Self {
+        let detail = band.detail();
         let (nx, ny) = (BLOCK * detail, detail * (1 + above.max(0)));
         Self {
+            band,
             detail,
             nx,
             ny,
@@ -1072,7 +1089,7 @@ fn emit(volume: &Volume, out: &mut CanopyMeshes, budget: &mut CanopyBudget) {
                     let rgba =
                         [tone.color[0] * lit, tone.color[1] * lit, tone.color[2] * lit, 1.0];
                     push_face(
-                        out.slot(tone.surface),
+                        out.at(volume.band.slot(tone.surface)),
                         face,
                         ox,
                         oy,
@@ -1216,6 +1233,10 @@ mod tests {
             !Band::Mid.coats().iter().any(|c| c.masked()),
             "a mid mesh asked for a masked material"
         );
+        // One mesh, so one entity and one draw call for a chunk's whole crown.
+        for surface in [Surface::Bark, Surface::Broadleaf, Surface::Needle] {
+            assert_eq!(Band::Mid.slot(surface), 0);
+        }
         assert_eq!(Band::Near.coats().iter().filter(|c| c.masked()).count(), 3);
     }
 
@@ -1244,7 +1265,7 @@ mod tests {
 
     #[test]
     fn a_shade_is_interned_once_per_surface() {
-        let mut volume = Volume::new(&test_chunk(0, 0, 0), 0, DETAIL);
+        let mut volume = Volume::new(&test_chunk(0, 0, 0), 0, Band::Near);
         let bark = Tone { color: [0.4, 0.3, 0.2], surface: Surface::Bark };
         let leaf = Tone { surface: Surface::Broadleaf, ..bark };
         assert_eq!(volume.intern(bark), volume.intern(bark));

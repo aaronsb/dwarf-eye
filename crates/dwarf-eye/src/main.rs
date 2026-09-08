@@ -270,8 +270,9 @@ pub struct CanopyMaterials {
     pub broadleaf: Handle<TerrainMat>,
     pub needle: Handle<TerrainMat>,
     pub streamers: Handle<TerrainMat>,
-    /// The mid band's foliage: the same leaf shading with no cutout at all, so
-    /// it draws opaque, writes depth in the prepass and never discards.
+    /// The mid band's whole crown, bark and all: the leaf shading with no
+    /// cutout, so it draws opaque, writes depth in the prepass and never
+    /// discards.
     pub leaf: Handle<TerrainMat>,
 }
 
