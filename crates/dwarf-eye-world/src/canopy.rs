@@ -512,13 +512,16 @@ fn face_shade(normal: [f32; 3]) -> f32 {
     }
 }
 
+/// A tree's origin tile and the detail its copy was cut at.
+type TreeKey = ((i32, i32, i32), i32);
+
 /// Trees that have been grown, kept so a chunk never regrows one.
 ///
 /// Keyed by origin and by the detail the copy was cut at: the two bands are the
 /// same tree sampled twice, and both are wanted for as long as the chunk is.
 #[derive(Default)]
 pub struct Forest {
-    trees: HashMap<((i32, i32, i32), i32), Option<Arc<TreeVoxels>>>,
+    trees: HashMap<TreeKey, Option<Arc<TreeVoxels>>>,
     /// Standing plants, by the absolute tile each one stands on.
     plants: HashMap<(i32, i32, i32), Option<Arc<Plant>>>,
 }
