@@ -100,6 +100,20 @@ const DEFAULT_FOLIAGE: [u8; 3] = [82, 138, 58];
 /// Wood colour for a species whose sheets carry no trunk.
 const DEFAULT_BARK: [u8; 3] = [96, 72, 48];
 
+/// `n` shades of one colour, dark to light, for when a sprite offers none.
+fn spread(base: [u8; 3], n: usize) -> Vec<[u8; 3]> {
+    (0..n)
+        .map(|i| {
+            let f = 0.72 + 0.56 * (i as f32 + 0.5) / n.max(1) as f32;
+            [
+                (base[0] as f32 * f).min(255.0) as u8,
+                (base[1] as f32 * f).min(255.0) as u8,
+                (base[2] as f32 * f).min(255.0) as u8,
+            ]
+        })
+        .collect()
+}
+
 /// Height of a ground slab, as a fraction of a z-level.
 const FLOOR_HEIGHT: f32 = 0.12;
 
@@ -226,6 +240,9 @@ pub struct TileLibrary {
     canopy_color: HashMap<i32, [u8; 3]>,
     /// Species index -> the colour of its wood.
     bark: HashMap<i32, [u8; 3]>,
+    /// Species index -> the tones its leaves and its wood are painted in.
+    leaf_tones: HashMap<i32, Vec<[u8; 3]>>,
+    bark_tones: HashMap<i32, Vec<[u8; 3]>>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
@@ -303,6 +320,8 @@ impl TileLibrary {
             under_model: HashMap::new(),
             canopy_color: HashMap::new(),
             bark: HashMap::new(),
+            leaf_tones: HashMap::new(),
+            bark_tones: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
         };
@@ -613,6 +632,52 @@ impl TileLibrary {
             .unwrap_or(DEFAULT_BARK);
         self.bark.insert(mat_index, color);
         color
+    }
+
+    /// The tones a species' leaves are drawn in, darkest first.
+    ///
+    /// DF's own twig sprite already holds the greens the species is drawn with,
+    /// so taking its dominant tones keeps a pine dark and an apricot pale
+    /// without a table.
+    pub fn leaf_tones(&mut self, mat_index: i32, n: usize) -> Vec<[u8; 3]> {
+        if let Some(found) = self.leaf_tones.get(&mat_index) {
+            return found.clone();
+        }
+        let plant_id = self.plant_id(mat_index);
+        let tones = ["TREE_TWIGS", "TREE_BRANCH"]
+            .into_iter()
+            .find_map(|family| {
+                let found = self.art.tree_sprite(&plant_id, family, 0)?.tones(n);
+                (!found.is_empty()).then_some(found)
+            })
+            .unwrap_or_else(|| spread(DEFAULT_FOLIAGE, n));
+        self.leaf_tones.insert(mat_index, tones.clone());
+        tones
+    }
+
+    /// The tones a species' wood is drawn in, darkest first.
+    ///
+    /// Most trunk sprites are near-grey patterns DF tints with the tile's
+    /// material, and reading those gives grey wood, so a pattern falls back to
+    /// shades of plain bark.
+    pub fn bark_tones(&mut self, mat_index: i32, n: usize) -> Vec<[u8; 3]> {
+        if let Some(found) = self.bark_tones.get(&mat_index) {
+            return found.clone();
+        }
+        let plant_id = self.plant_id(mat_index);
+        let tones = ["TREE_TRUNK_PILLAR", "TREE_TRUNK", "TREE_BRANCH"]
+            .into_iter()
+            .find_map(|family| {
+                let sprite = self.art.tree_sprite(&plant_id, family, 0)?;
+                if sprite.saturation() < PATTERN_SATURATION {
+                    return None;
+                }
+                let found = sprite.tones(n);
+                (!found.is_empty()).then_some(found)
+            })
+            .unwrap_or_else(|| spread(DEFAULT_BARK, n));
+        self.bark_tones.insert(mat_index, tones.clone());
+        tones
     }
 
     /// How a species grows, from the plant object raws. All zero when the

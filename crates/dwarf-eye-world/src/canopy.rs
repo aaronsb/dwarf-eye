@@ -9,6 +9,12 @@
 //! empty. Sky comes through the gaps, and the cost follows the leaf surface
 //! rather than the tile count.
 //!
+//! Leaves are scattered as small clusters rather than solid blobs, so a third
+//! or more of the crown's shell is air and the limbs show through it. Habit
+//! comes from the plant raws: a species with no heavy branches is a conifer and
+//! carries its foliage in tiers with the trunk showing between them, and
+//! anything else spreads.
+//!
 //! Everything is rasterised into a sub-tile voxel grid and meshed with the same
 //! face emitter the rest of the renderer uses, with coplanar faces of one
 //! colour merged greedily. `DETAIL` sub-voxels per tile edge is the one knob:
@@ -27,10 +33,14 @@ use std::collections::HashMap;
 
 /// Sub-voxels per tile edge, and where the override lives.
 ///
-/// Four is what the live window affords: six costs 2.0M triangles across it and
-/// four costs 977k, and four reads blockier, which is the look. Three is the
-/// intended far level of detail. `DWARF_EYE_CANOPY_DETAIL` overrides it.
-pub const DEFAULT_DETAIL: i32 = 4;
+/// Six is the scale the reference art works at. Three is the intended far level
+/// of detail. `DWARF_EYE_CANOPY_DETAIL` overrides it.
+pub const DEFAULT_DETAIL: i32 = 6;
+
+/// Voxels per leaf cluster edge. Two gives clusters of one to eight voxels,
+/// which is the scattered look; the grid is world-aligned so clusters carry
+/// across tile and chunk boundaries unbroken.
+const CLUSTER: i32 = 2;
 
 pub fn detail() -> i32 {
     std::env::var("DWARF_EYE_CANOPY_DETAIL")
@@ -59,36 +69,58 @@ pub enum CanopyPart {
 }
 
 impl CanopyPart {
-    /// Radius of a leaf clump, in tiles.
-    fn clump_radius(self) -> f32 {
+    /// The share of a tile's volume this part fills with leaves when the tile
+    /// is fully exposed. Everything else scales this down.
+    fn leaf_fill(self) -> f32 {
         match self {
-            CanopyPart::Branch => 0.38,
-            CanopyPart::Twig => 0.31,
-            CanopyPart::Cap => 0.44,
+            CanopyPart::Branch => 0.42,
+            CanopyPart::Twig => 0.55,
+            CanopyPart::Cap => 0.70,
         }
     }
 
-    /// Most clumps a tile of this part ever scatters.
-    fn clump_limit(self) -> f32 {
-        match self {
-            CanopyPart::Branch => 3.0,
-            CanopyPart::Twig => 4.0,
-            CanopyPart::Cap => 4.0,
-        }
-    }
-
-    /// Radius of the rod along a limb, in tiles.
+    /// Whether this part carries a woody rod at all.
     ///
-    /// DF's own BRANCH_RADIUS is how far a branch reaches, not how thick it is,
-    /// so thickness is set here. TODO: take it from MAX_TRUNK_DIAMETER once the
-    /// L-system grows real tapered limbs.
-    fn rod_radius(self) -> f32 {
-        match self {
-            CanopyPart::Branch => 0.13,
-            CanopyPart::Twig => 0.07,
-            CanopyPart::Cap => 0.0,
-        }
+    /// Limbs must stay far slimmer than the leaves around them, so a rod is one
+    /// voxel wide wherever it runs and only a limb meeting the trunk widens.
+    /// DF's own BRANCH_RADIUS is how far a branch reaches rather than how thick
+    /// it is, so thickness is set here. TODO: taper from MAX_TRUNK_DIAMETER once
+    /// the L-system grows real limbs.
+    fn woody(self) -> bool {
+        matches!(self, CanopyPart::Branch | CanopyPart::Twig)
     }
+}
+
+/// How a species carries its crown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Habit {
+    /// Limbs fork and rise, leaves everywhere the crown opens onto air.
+    Spreading,
+    /// Foliage in tiers around the trunk, with air and bare trunk between them,
+    /// narrowing to a spike.
+    Conifer,
+}
+
+/// Reads a species' habit out of its growth tokens.
+///
+/// DF gives pine, cedar and larch no heavy branches at all and the broadleaves
+/// a quarter density of them, which separates the two habits exactly.
+pub fn habit(growth: raws::TreeGrowth) -> Habit {
+    if growth.heavy_branch_density == 0 && growth.branch_density > 0 {
+        Habit::Conifer
+    } else {
+        Habit::Spreading
+    }
+}
+
+/// Everything about how one species is drawn, resolved once per chunk.
+struct Look {
+    /// Leaf tones darkest first, with the last reserved for new growth at the
+    /// tips.
+    leaf: Vec<u8>,
+    bark: Vec<u8>,
+    habit: Habit,
+    growth: raws::TreeGrowth,
 }
 
 /// A deterministic value in 0..1 from four integers.
@@ -120,6 +152,8 @@ struct Volume {
     ny: i32,
     /// Zero is empty; anything else is a palette entry plus one.
     cells: Vec<u8>,
+    /// Voxels set so far, so the budget can weigh bark against leaves.
+    filled: usize,
     palette: Vec<[f32; 3]>,
     keys: HashMap<u64, u8>,
     origin: (i32, i32, i32),
@@ -134,6 +168,7 @@ impl Volume {
             nx,
             ny,
             cells,
+            filled: 0,
             palette: Vec::new(),
             keys: HashMap::new(),
             origin: chunk.origin(),
@@ -142,6 +177,17 @@ impl Volume {
 
     fn index(&self, i: i32, j: i32, k: i32) -> usize {
         (((i + 1) * (self.ny + 2) + (j + 1)) * (self.nx + 2) + (k + 1)) as usize
+    }
+
+    fn set(&mut self, i: i32, j: i32, k: i32, shade: u8) {
+        if i < -1 || j < -1 || k < -1 || i > self.nx || j > self.ny || k > self.nx {
+            return;
+        }
+        let at = self.index(i, j, k);
+        if self.cells[at] == 0 {
+            self.filled += 1;
+        }
+        self.cells[at] = shade;
     }
 
     fn get(&self, i: i32, j: i32, k: i32) -> u8 {
@@ -192,34 +238,27 @@ impl Volume {
         ]
     }
 
-    /// Fills the voxels inside an ellipsoid.
-    fn ellipsoid(&mut self, centre: [f32; 3], radius: [f32; 3], shade: u8) {
-        let lo = [centre[0] - radius[0], centre[1] - radius[1], centre[2] - radius[2]];
-        let hi = [centre[0] + radius[0], centre[1] + radius[1], centre[2] + radius[2]];
-        let [(i0, i1), (j0, j1), (k0, k1)] = self.span(lo, hi);
-        for i in i0..=i1 {
-            for j in j0..=j1 {
-                for k in k0..=k1 {
-                    let p = self.centre(i, j, k);
-                    let mut d = 0.0;
-                    for a in 0..3 {
-                        let t = (p[a] - centre[a]) / radius[a];
-                        d += t * t;
-                    }
-                    if d <= 1.0 {
-                        let at = self.index(i, j, k);
-                        self.cells[at] = shade;
-                    }
-                }
-            }
-        }
+    /// The voxel centre nearest a point, so a rod runs down a line of voxels
+    /// instead of falling between two.
+    fn snap(&self, p: [f32; 3]) -> [f32; 3] {
+        let d = self.detail as f32;
+        let axis = |v: f32, origin: f32| -> f32 {
+            origin + ((v - origin) * d - 0.5).round() / d + 0.5 / d
+        };
+        [
+            axis(p[0], self.origin.0 as f32),
+            axis(p[1] / Z_SCALE, self.origin.2 as f32) * Z_SCALE,
+            axis(p[2], self.origin.1 as f32),
+        ]
     }
 
     /// Fills the voxels within `radius` of the segment `a`..`b`.
+    ///
+    /// Endpoints snap to voxel centres, so a radius under one voxel draws a
+    /// single line of voxels rather than a two-wide smear or nothing at all.
     fn rod(&mut self, a: [f32; 3], b: [f32; 3], radius: f32, shade: u8) {
-        // Below about three quarters of a voxel a rod falls between the voxel
-        // centres and vanishes, so thin growth still draws a hairline.
-        let r = radius.max(0.75 / self.detail as f32);
+        let (a, b) = (self.snap(a), self.snap(b));
+        let r = radius.max(0.28 / self.detail as f32);
         let lo = [a[0].min(b[0]) - r, a[1].min(b[1]) - r, a[2].min(b[2]) - r];
         let hi = [a[0].max(b[0]) + r, a[1].max(b[1]) + r, a[2].max(b[2]) + r];
         let [(i0, i1), (j0, j1), (k0, k1)] = self.span(lo, hi);
@@ -242,8 +281,7 @@ impl Volume {
                         d2 += e * e;
                     }
                     if d2 <= r * r {
-                        let at = self.index(i, j, k);
-                        self.cells[at] = shade;
+                        self.set(i, j, k, shade);
                     }
                 }
             }
@@ -254,12 +292,14 @@ impl Volume {
 /// How the six faces are lit, so a voxel crown reads as a lit solid.
 const FACE_SHADE: [f32; 6] = [0.70, 0.70, 0.50, 1.0, 0.82, 0.82];
 
-/// Triangles a chunk's crown cost, with and without merging.
+/// What a chunk's crowns cost.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct CanopyBudget {
     pub triangles: usize,
     /// What the same faces would have cost one quad each.
     pub unmerged: usize,
+    pub leaf_voxels: usize,
+    pub bark_voxels: usize,
 }
 
 /// Builds one chunk's crown geometry.
@@ -289,16 +329,44 @@ pub fn build_budgeted(
         return mesh;
     }
 
+    // Palettes and habit are per species, so they are resolved once and the
+    // geometry then runs without touching the sprite sheets again.
     let mut volume = Volume::new(chunk, detail());
+    let mut looks: HashMap<i32, Look> = HashMap::new();
     for part in &skeleton.parts {
-        limbs(&mut volume, &skeleton, part, library);
-        leaves(&mut volume, &skeleton, part, library);
+        if looks.contains_key(&part.species) {
+            continue;
+        }
+        let leaf: Vec<u8> = library
+            .leaf_tones(part.species, 3)
+            .into_iter()
+            .map(|c| volume.shade(key(part.species, 0, &c), to_linear(c)))
+            .collect();
+        let bark: Vec<u8> = library
+            .bark_tones(part.species, 2)
+            .into_iter()
+            .map(|c| volume.shade(key(part.species, 1, &c), to_linear(c)))
+            .collect();
+        let growth = library.growth(part.species);
+        looks.insert(part.species, Look { leaf, bark, habit: habit(growth), growth });
+    }
+
+    for part in &skeleton.parts {
+        let Some(look) = looks.get(&part.species) else { continue };
+        limbs(&mut volume, world, library, part, look, budget);
+        leaves(&mut volume, world, library, &skeleton, part, look, budget);
     }
     // A trunk standing among the crown gets leaves over it too, so its sawn-off
-    // top does not show through the gaps.
+    // top does not show through the gaps, and a trunk meeting the ground gets a
+    // flare of roots.
     for (pos, tree, species) in skeleton.crowned_trunks() {
+        let Some(look) = looks.get(&species) else { continue };
         let part = Part { pos, kind: CanopyPart::Branch, links: 0, tree, species };
-        leaves(&mut volume, &skeleton, &part, library);
+        leaves(&mut volume, world, library, &skeleton, &part, look, budget);
+    }
+    for (pos, tree, species) in skeleton.trunk_feet(world, library) {
+        let Some(look) = looks.get(&species) else { continue };
+        root_flare(&mut volume, pos, tree, look, budget);
     }
     emit(&volume, &mut mesh, budget);
     mesh
@@ -309,86 +377,195 @@ fn tile_centre(pos: (i32, i32, i32)) -> [f32; 3] {
     [pos.0 as f32 + 0.5, (pos.2 as f32 + 0.5) * Z_SCALE, pos.1 as f32 + 0.5]
 }
 
+/// A palette key that keeps one species' leaves and wood apart.
+fn key(species: i32, slot: u64, color: &[u8; 3]) -> u64 {
+    ((species as u32 as u64) << 32)
+        | (slot << 24)
+        | ((color[0] as u64) << 16)
+        | ((color[1] as u64) << 8)
+        | color[2] as u64
+}
+
+/// How many crown tiles stand directly above one, up to four.
+///
+/// Read from the world rather than from the chunk's own gather, so the answer
+/// does not depend on which chunk is asking.
+fn cover(world: &World, library: &TileLibrary, pos: (i32, i32, i32)) -> i32 {
+    let (x, y, z) = pos;
+    (1..=4)
+        .take_while(|n| {
+            world
+                .voxel(x, y, z + n)
+                .is_some_and(|v| library.canopy_part(v.tile_id).is_some())
+        })
+        .count() as i32
+}
+
 /// Lays one tile's limbs into the volume.
 ///
 /// Each tile draws its own half of every joint, out to the tile boundary, so
 /// two joined tiles meet in the middle whichever chunk each of them lands in.
-fn limbs(volume: &mut Volume, skeleton: &Skeleton, part: &Part, library: &mut TileLibrary) {
+/// A limb runs one voxel wide everywhere except where it meets the trunk.
+fn limbs(
+    volume: &mut Volume,
+    world: &World,
+    library: &TileLibrary,
+    part: &Part,
+    look: &Look,
+    budget: &mut CanopyBudget,
+) {
+    if !part.kind.woody() || look.bark.is_empty() {
+        return;
+    }
     let (x, y, z) = part.pos;
     let centre = tile_centre(part.pos);
-    let bark = to_linear(library.bark_color(part.species));
-    let rod_radius = part.kind.rod_radius();
-    if rod_radius > 0.0 {
-        let shade = volume.shade(u64::MAX ^ (part.species as u32 as u64), bark);
-        let mut drawn = false;
-        for bit in [raws::NORTH, raws::SOUTH, raws::WEST, raws::EAST] {
-            if part.links & bit == 0 {
-                continue;
-            }
-            let (dx, dy) = step(bit);
-            let end = [
-                centre[0] + dx as f32 * 0.5,
-                centre[1],
-                centre[2] + dy as f32 * 0.5,
-            ];
-            volume.rod(centre, end, rod_radius, shade);
-            drawn = true;
+    let before = volume.filled;
+
+    // Two bark tones along the limb, so it does not read as one painted stick.
+    let tone = |n: i32| -> u8 {
+        let pick = hash01(part.tree.0 ^ x, part.tree.1 ^ y, z, 40 + n);
+        look.bark[(pick * look.bark.len() as f32) as usize % look.bark.len()]
+    };
+
+    let d = volume.detail as f32;
+    // One voxel along a limb, a little more where it lands on the trunk.
+    let hairline = 0.3 / d;
+    let thick = 0.95 / d;
+    let mut drawn = false;
+    for (n, bit) in [raws::NORTH, raws::SOUTH, raws::WEST, raws::EAST].into_iter().enumerate() {
+        if part.links & bit == 0 {
+            continue;
         }
-        // A limb that joins nothing, and the stub that meets the trunk below,
-        // still need a body.
-        if !drawn || skeleton.is_trunk((x, y, z - 1)) {
-            let below = [centre[0], centre[1] - 0.5 * Z_SCALE, centre[2]];
-            volume.rod(centre, below, rod_radius, shade);
-        }
+        let (dx, dy) = step(bit);
+        let end = [centre[0] + dx as f32 * 0.5, centre[1], centre[2] + dy as f32 * 0.5];
+        volume.rod(centre, end, hairline, tone(n as i32));
+        drawn = true;
     }
+
+    // A limb standing on the trunk widens where it meets it; one that joins
+    // nothing still needs a body.
+    let on_trunk = world
+        .voxel(x, y, z - 1)
+        .is_some_and(|v| library.is_trunk(v.tile_id));
+    if on_trunk || !drawn {
+        let below = [centre[0], centre[1] - 0.5 * Z_SCALE, centre[2]];
+        let width = if on_trunk { thick } else { hairline };
+        volume.rod(centre, below, width, tone(9));
+    }
+    budget.bark_voxels += volume.filled - before;
 }
 
-/// Scatters one tile's leaf clumps.
+/// Scatters one tile's leaves.
 ///
-/// Only where the tile opens onto air: a tile boxed in by more crown is never
-/// seen, so it stays an empty frame of limbs and the sky reaches the ground
-/// through the gaps.
-fn leaves(volume: &mut Volume, skeleton: &Skeleton, part: &Part, library: &mut TileLibrary) {
+/// Clusters sit on a world-aligned grid, so they carry across tiles unbroken,
+/// and the share of a tile they fill falls with how enclosed the tile is and
+/// how much crown stands over it. That is what leaves the inside of a crown an
+/// open frame of limbs, opens the underside, and keeps the leaf mass at the top
+/// and the outside where it belongs.
+#[allow(clippy::too_many_arguments)]
+fn leaves(
+    volume: &mut Volume,
+    world: &World,
+    library: &TileLibrary,
+    skeleton: &Skeleton,
+    part: &Part,
+    look: &Look,
+    budget: &mut CanopyBudget,
+) {
+    if look.leaf.is_empty() {
+        return;
+    }
     let (x, y, z) = part.pos;
-    let centre = tile_centre(part.pos);
-    let (tx, ty, tz) = part.tree;
-    let growth = library.growth(part.species);
     let openness = skeleton.openness(part.pos);
     if openness <= 0.0 {
         return;
     }
-    // A species that grows few branches carries fewer leaves.
-    let density = if growth.branch_density == 0 {
+
+    // A conifer carries its foliage in tiers. Every other level of the tree is
+    // left bare so the trunk shows between them.
+    let tier = (z - part.tree.2).rem_euclid(2) == 0;
+    if look.habit == Habit::Conifer && !tier {
+        return;
+    }
+
+    let under = cover(world, library, part.pos);
+    let depth = 1.0 - under as f32 / 4.0;
+    // Each tree varies a little, so a stand does not repeat one silhouette.
+    let vary = 0.85 + 0.3 * hash01(part.tree.0, part.tree.1, part.tree.2, 7);
+    let density = if look.growth.branch_density == 0 {
         1.0
     } else {
-        0.6 + 0.8 * (growth.branch_density as f32 / 100.0)
+        0.65 + 0.7 * (look.growth.branch_density as f32 / 100.0)
     };
-    let spread = 0.85 + 0.1 * growth.branch_radius.clamp(1, 4) as f32;
-    let count = (part.kind.clump_limit() * (0.25 + 0.75 * openness) * density).round() as i32;
+    let fill = part.kind.leaf_fill() * (0.35 + 0.65 * openness) * (0.55 + 0.45 * depth)
+        * density
+        * vary;
 
-    let above = (x, y, z + 1);
-    let crown = !skeleton.holds(above) && !skeleton.is_trunk(above);
-    let leaf = to_linear(library.canopy_color(part.species));
-    for n in 0..count.max(1) {
-        let jitter = |slot: i32| hash01(tx ^ x, ty ^ y, tz ^ z, n * 8 + slot);
-        let offset = [
-            (jitter(0) - 0.5) * 0.62,
-            (jitter(1) - 0.5) * 0.62 * Z_SCALE,
-            (jitter(2) - 0.5) * 0.62,
-        ];
-        let scale = part.kind.clump_radius() * spread * (0.8 + 0.45 * jitter(3));
-        // Four shades, quantised so a clump's faces still merge with itself.
-        // Leaves at the top of the crown catch more sky, so they run lighter.
-        let level = (jitter(4) * 3.0) as i32 + crown as i32;
-        let lift = 0.84 + 0.08 * level as f32;
-        let key = ((part.species as u32 as u64) << 8) | level as u64;
-        let shade = volume.shade(key, [leaf[0] * lift, leaf[1] * lift, leaf[2] * lift]);
-        volume.ellipsoid(
-            [centre[0] + offset[0], centre[1] + offset[1], centre[2] + offset[2]],
-            [scale, scale * 0.82 * Z_SCALE, scale],
-            shade,
-        );
+    // New growth at the outer tips runs lighter than the leaves behind it.
+    let tips = openness > 0.45 && under == 0;
+    let d = volume.detail;
+    let before = volume.filled;
+    for a in 0..d {
+        for b in 0..d {
+            for c in 0..d {
+                let (i, j, k) = ((x - volume.origin.0) * d + a,
+                                 (z - volume.origin.2) * d + b,
+                                 (y - volume.origin.1) * d + c);
+                if i < -1 || j < -1 || k < -1 || i > volume.nx || j > volume.ny || k > volume.nx {
+                    continue;
+                }
+                // Cluster on a world-aligned grid so the pattern is continuous.
+                let (gi, gj, gk) = (x * d + a, z * d + b, y * d + c);
+                let cluster = (
+                    gi.div_euclid(CLUSTER),
+                    gj.div_euclid(CLUSTER),
+                    gk.div_euclid(CLUSTER),
+                );
+                // Ease off toward the tile's corners, so a crown does not read
+                // as a stack of cubes.
+                let off = |v: i32| (v as f32 + 0.5) / d as f32 - 0.5;
+                let reach = (off(a) * off(a) + off(b) * off(b) + off(c) * off(c)).sqrt() / 0.87;
+                let here = fill * (1.15 - 0.5 * reach);
+                if hash01(cluster.0, cluster.1, cluster.2, 3) >= here {
+                    continue;
+                }
+                let pick = hash01(cluster.0, cluster.1, cluster.2, 11);
+                let last = look.leaf.len() - 1;
+                let tone = if tips && pick > 0.66 {
+                    look.leaf[last]
+                } else {
+                    look.leaf[(pick * last as f32) as usize % look.leaf.len()]
+                };
+                volume.set(i, j, k, tone);
+            }
+        }
     }
+    budget.leaf_voxels += volume.filled - before;
+}
+
+/// A flare of roots where a trunk meets the ground.
+fn root_flare(
+    volume: &mut Volume,
+    pos: (i32, i32, i32),
+    tree: (i32, i32, i32),
+    look: &Look,
+    budget: &mut CanopyBudget,
+) {
+    if look.bark.is_empty() {
+        return;
+    }
+    let centre = tile_centre(pos);
+    let before = volume.filled;
+    let foot = [centre[0], centre[1] - 0.5 * Z_SCALE + 0.5 / volume.detail as f32, centre[2]];
+    for n in 0..5 {
+        let angle = std::f32::consts::TAU
+            * (n as f32 + hash01(tree.0, tree.1, tree.2, 20 + n)) / 5.0;
+        let reach = 0.32 + 0.22 * hash01(tree.0, tree.1, pos.2, 30 + n);
+        let end = [foot[0] + angle.cos() * reach, foot[1], foot[2] + angle.sin() * reach];
+        let tone = look.bark[n as usize % look.bark.len()];
+        volume.rod(foot, end, 0.6 / volume.detail as f32, tone);
+    }
+    budget.bark_voxels += volume.filled - before;
 }
 
 /// Turns the volume's surface into quads, merging coplanar runs of one shade.
@@ -551,26 +728,34 @@ mod tests {
         Chunk { block_x: 0, block_y: 0, z: 0, voxels: Vec::new() }
     }
 
+    /// A limb has to be one voxel wide and unbroken: thinner and it vanishes
+    /// between the voxel centres, thicker and the bark outweighs the leaves.
     #[test]
-    fn a_clump_fills_voxels_around_its_centre() {
+    fn a_limb_is_one_voxel_wide_and_unbroken() {
         let mut volume = Volume::new(&chunk(), 6);
-        let shade = volume.shade(1, [0.2, 0.5, 0.2]);
-        volume.ellipsoid([8.0, 0.5, 8.0], [0.3, 0.3, 0.3], shade);
-        let filled = volume.cells.iter().filter(|&&c| c != 0).count();
-        assert!(filled > 4, "a third-of-a-tile clump should hold several voxels, got {filled}");
-        assert_eq!(volume.get(48, 3, 48), shade);
+        let shade = volume.shade(1, [0.4, 0.3, 0.2]);
+        volume.rod([8.0, 0.5, 8.0], [9.0, 0.5, 8.0], 0.3 / 6.0, shade);
+        for i in 48..54 {
+            let across: usize = (0..8)
+                .map(|j| (0..8).filter(|k| volume.get(i, j, 44 + k) != 0).count())
+                .sum();
+            assert_eq!(across, 1, "voxel column {i} should hold exactly one limb voxel");
+        }
     }
 
     #[test]
-    fn a_rod_stays_connected_along_its_length() {
+    fn a_root_flare_reaches_out_from_the_foot() {
         let mut volume = Volume::new(&chunk(), 6);
         let shade = volume.shade(1, [0.4, 0.3, 0.2]);
-        volume.rod([8.0, 0.5, 8.0], [9.0, 0.5, 8.0], 0.05, shade);
-        // Every voxel column the rod passes through must hold something.
-        for i in 48..54 {
-            let any = (0..6).any(|j| (0..6).any(|k| volume.get(i, j, 45 + k) != 0));
-            assert!(any, "the rod broke at voxel column {i}");
-        }
+        let look = Look {
+            leaf: Vec::new(),
+            bark: vec![shade],
+            habit: Habit::Spreading,
+            growth: raws::TreeGrowth::default(),
+        };
+        let mut budget = CanopyBudget::default();
+        root_flare(&mut volume, (8, 8, 0), (8, 8, 0), &look, &mut budget);
+        assert!(budget.bark_voxels > 6, "five roots should cost several voxels");
     }
 
     #[test]

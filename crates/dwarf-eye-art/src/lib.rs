@@ -51,6 +51,38 @@ impl Sprite {
         if count == 0 { 0.0 } else { total / count as f32 }
     }
 
+    /// The `n` dominant tones of the opaque pixels, darkest first.
+    ///
+    /// Taken as percentiles of brightness rather than by clustering: a leaf
+    /// sprite is one hue in a few values, and the percentiles land on those
+    /// values while staying stable against a stray highlight. The band stops
+    /// short of both ends, because DF outlines its sprites in something close to
+    /// black and those pixels are drawing, not colour.
+    pub fn tones(&self, n: usize) -> Vec<[u8; 3]> {
+        let mut opaque: Vec<[u8; 3]> = self
+            .pixels
+            .iter()
+            .filter(|p| p[3] >= 128)
+            .map(|p| [p[0], p[1], p[2]])
+            .collect();
+        if opaque.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let luma = |c: &[u8; 3]| {
+            0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32
+        };
+        opaque.sort_by(|a, b| luma(a).total_cmp(&luma(b)));
+        const LOW: f32 = 0.26;
+        const HIGH: f32 = 0.86;
+        (0..n)
+            .map(|i| {
+                let t = if n == 1 { 0.5 } else { i as f32 / (n - 1) as f32 };
+                let at = ((LOW + (HIGH - LOW) * t) * opaque.len() as f32) as usize;
+                opaque[at.min(opaque.len() - 1)]
+            })
+            .collect()
+    }
+
     /// Reduces the sprite to an `n` x `n` occupancy-and-colour grid.
     ///
     /// Each cell takes the alpha-weighted mean colour of the block it covers and

@@ -166,6 +166,30 @@ impl Skeleton {
         found
     }
 
+    /// Trunk tiles standing on something that is not more trunk: the foot of
+    /// the tree, where the roots flare.
+    ///
+    /// The tile below is read from the world rather than from this chunk's
+    /// gather, so the answer does not depend on which chunk is asking.
+    pub fn trunk_feet(
+        &self,
+        world: &World,
+        library: &TileLibrary,
+    ) -> Vec<((i32, i32, i32), (i32, i32, i32), i32)> {
+        let mut found: Vec<_> = self
+            .trunk
+            .iter()
+            .filter(|((x, y, z), _)| {
+                !world
+                    .voxel(*x, *y, z - 1)
+                    .is_some_and(|v| library.is_trunk(v.tile_id))
+            })
+            .map(|(&pos, &(tree, species))| (pos, tree, species))
+            .collect();
+        found.sort_unstable_by_key(|(pos, ..)| *pos);
+        found
+    }
+
     /// How much of a tile's six faces open onto nothing.
     ///
     /// Zero deep inside the crown, where leaves would never be seen, and it

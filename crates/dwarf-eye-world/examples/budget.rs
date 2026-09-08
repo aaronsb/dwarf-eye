@@ -59,5 +59,11 @@ fn main() -> Result<()> {
         canopy.unmerged,
         canopy.unmerged as f32 / canopy.triangles.max(1) as f32,
     );
+    println!(
+        "  {} leaf voxels, {} bark voxels, bark is {:.1}% of leaves",
+        canopy.leaf_voxels,
+        canopy.bark_voxels,
+        canopy.bark_voxels as f32 * 100.0 / canopy.leaf_voxels.max(1) as f32,
+    );
     Ok(())
 }
