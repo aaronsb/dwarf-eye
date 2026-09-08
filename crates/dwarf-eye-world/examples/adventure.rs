@@ -67,6 +67,38 @@ fn main() -> Result<()> {
         units.creature_list.len()
     );
 
+    // `--trail <seconds>` just watches, printing every tile the character
+    // moves to. Run it beside the viewer to see walk mode drive the game.
+    if let Some(i) = std::env::args().position(|a| a == "--trail") {
+        let seconds: f32 = std::env::args()
+            .nth(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30.0);
+        let started = std::time::Instant::now();
+        let mut last = None;
+        let mut steps = 0;
+        println!("\n== watching for {seconds:.0} s ==");
+        while started.elapsed().as_secs_f32() < seconds {
+            let now = unit_pos(&mut df);
+            if now != last {
+                if let (Some(a), Some(b)) = (last, now) {
+                    steps += 1;
+                    println!(
+                        "  {:>5.1}s  {a:?} -> {b:?}   {}",
+                        started.elapsed().as_secs_f32(),
+                        if a.2 != b.2 { "slope" } else { "" }
+                    );
+                } else if let Some(b) = now {
+                    println!("  {:>5.1}s  at {b:?}", started.elapsed().as_secs_f32());
+                }
+                last = now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        println!("  {steps} tiles walked, ending at {last:?}");
+        return Ok(());
+    }
+
     let dir = std::env::args().nth(1).unwrap_or_else(|| "E".into()).to_uppercase();
     let steps: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6);
 

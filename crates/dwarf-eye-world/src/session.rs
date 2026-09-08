@@ -26,11 +26,6 @@ pub struct Session {
     origin: (i32, i32, i32),
     /// Chunks from earlier sessions, and where new ones are written.
     cache: Option<Cache>,
-    /// Set whenever [`Session::refresh_window`] sees the window move, and left
-    /// standing until someone takes it. Walk mode refreshes the window several
-    /// times a second so the character's tile converts correctly, which would
-    /// otherwise consume the move before the collection pass noticed it.
-    window_moved: bool,
 }
 
 /// Absolute position of a window's corner: tiles in x/y, z-level in z.
@@ -49,7 +44,7 @@ impl Session {
         let world = World::new(Palette::new(tiletypes, materials));
         let origin = window_origin(&map_info);
         let cache = Cache::open(map_info.world_name_english(), map_info.save_name()).ok();
-        Ok(Self { client, world, map_info, version, origin, cache, window_moved: false })
+        Ok(Self { client, world, map_info, version, origin, cache })
     }
 
     /// Absolute key of a render-space chunk key.
@@ -117,13 +112,7 @@ impl Session {
         let info: rfr::MapInfo = self.client.call_empty(methods::GET_MAP_INFO)?;
         let moved = window_origin(&info) != window_origin(&self.map_info);
         self.map_info = info;
-        self.window_moved |= moved;
         Ok(moved)
-    }
-
-    /// Whether the window has moved since this was last asked, clearing the flag.
-    pub fn take_window_moved(&mut self) -> bool {
-        std::mem::replace(&mut self.window_moved, false)
     }
 
     /// The render origin, in absolute tiles and z-level.

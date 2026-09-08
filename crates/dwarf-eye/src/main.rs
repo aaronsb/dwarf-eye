@@ -89,7 +89,7 @@ fn main() {
             Update,
             (
                 walk::toggle,
-                (walk::receive, walk::poll, walk::walk).chain().run_if(walk::walking),
+                (walk::receive, walk::walk).chain().run_if(walk::walking),
             ),
         )
         .run();

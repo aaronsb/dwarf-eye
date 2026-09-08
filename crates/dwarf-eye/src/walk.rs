@@ -7,23 +7,41 @@
 //!
 //! Movement is optimistic. The camera does not wait at the edge; it walks on
 //! into the next cell while the request is in flight, and the position poll
-//! settles up afterwards. A confirmed step needs no correction. A refused one
-//! springs the camera back and shuts that edge for a moment. The camera is
-//! never allowed more than one cell ahead of what the game has confirmed, so a
-//! second edge waits for the first step to land.
+//! settles up afterwards. A confirmed step needs no correction. A step the
+//! game never takes springs the camera back and shuts that edge for a couple
+//! of seconds. The camera is never allowed more than one cell ahead of what
+//! the game has confirmed, so a second edge waits for the first step to land.
 //!
 //! The sync runs both ways. When the character moves without being asked —
 //! the player clicking a distant tile in Dwarf Fortress, a series of automatic
 //! steps, travel, being shoved — the poll sees a tile we did not ask for and
 //! the camera simply follows it, keeping where the player stood inside the
 //! cell and where they were looking.
+//!
+//! All of that rests on a step being confirmed within a fraction of a second,
+//! so walk mode holds its own Dwarf Fortress connection on its own thread.
+//! Sharing the map thread does not work: one collection pass can hold it for
+//! many seconds, every step in that time is scored as a refusal, and the
+//! backlog then replays itself into the game all at once.
+//!
+//! That failure is designed out rather than tuned away. There is no queue
+//! between here and the game: one slot holds the single step waiting to go,
+//! writing a new order overwrites the old, and an order the confirmation
+//! window has already passed is dropped rather than sent late. At most one
+//! step can be outstanding, and a late step cannot exist.
 
 use crate::camera::FlyCamera;
-use crate::worker::{Bridge, Command};
+use crate::worker::Bridge;
+use anyhow::Result;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use dwarf_eye_world::mesh::Z_SCALE;
-use dwarf_eye_world::{Solid, World};
+use dwarf_eye_world::{BLOCK, BlockBounds, Session, Solid, World};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Tiles per second inside a cell. Close to the pace the game confirms a step
 /// at, so a held key flows rather than stuttering against the cell edge.
@@ -38,11 +56,17 @@ const RAISED: f32 = 0.5 * Z_SCALE;
 /// How close to a shut edge the camera may press.
 const MARGIN: f32 = 0.12;
 
-/// How long a step may stay unconfirmed before it is treated as refused.
+/// How long a step may stay unconfirmed before it is treated as refused. The
+/// same window bounds how long an unsent order stays worth sending.
 const CONFIRM: f32 = 0.6;
 
-/// How long a refused edge stays shut, so a wall is not hammered every frame.
-const BLOCKED: f32 = 0.5;
+/// How long a refused edge stays shut. Long enough that a wall is leaned on
+/// rather than hammered, short enough that a door opening is noticed.
+const BLOCKED: f32 = 2.0;
+
+/// Consecutive unconfirmed steps that call a scripted walk off. A player can
+/// lean on a wall as long as they like; a script cannot.
+const STRIKES: u32 = 3;
 
 /// Time constant of the glide that absorbs every jump: a step onto a ramp, a
 /// spring back, the game moving the character a tile of its own accord.
@@ -53,31 +77,169 @@ const GLIDE: f32 = 0.05;
 /// teleport, where a glide would only be a long slide through the ground.
 const SNAP: f32 = 5.0;
 
-/// How far around the character walkability is shipped to the render thread.
-/// The camera is never more than one cell from the confirmed tile, so this is
-/// generous.
-pub const GROUND_RADIUS: i32 = 4;
+/// How far around the character walkability is carried. The camera is never
+/// more than one cell from the confirmed tile, so this is generous.
+const GROUND_RADIUS: i32 = 4;
+
+/// How often the walk thread reads the character's position.
+const POLL: Duration = Duration::from_millis(125);
+
+// ---------------------------------------------------------------- the pilot
+
+/// The one step waiting to reach the game.
+struct Order {
+    /// The suffix of `df.interface_key.A_MOVE_*`: `N`, `SE`, `UP` and so on.
+    key: String,
+    issued: Instant,
+}
+
+/// Where the character stands, in absolute tiles, with the shape of the ground
+/// around them.
+pub struct Report {
+    tile: (i32, i32, i32),
+    ground: Ground,
+}
+
+/// Walk mode's own connection to Dwarf Fortress, on its own thread.
+///
+/// It drives itself: while walk mode is on it reads the character's position
+/// at a steady rate, and between reads it delivers whatever single step is
+/// waiting. Nothing queues, so nothing can arrive late.
+pub struct Pilot {
+    /// The one step waiting to go. Writing replaces whatever was there.
+    order: Arc<Mutex<Option<Order>>>,
+    active: Arc<AtomicBool>,
+    pub rx: Receiver<Report>,
+}
+
+impl Pilot {
+    pub fn spawn() -> Self {
+        let order: Arc<Mutex<Option<Order>>> = Arc::default();
+        let active = Arc::new(AtomicBool::new(false));
+        let (reports, rx) = channel();
+        let (theirs, alive) = (Arc::clone(&order), Arc::clone(&active));
+        thread::Builder::new()
+            .name("dfhack-walk".into())
+            .spawn(move || {
+                if let Err(err) = pilot(&theirs, &alive, &reports) {
+                    bevy::log::warn!("walk mode lost its connection: {err:#}");
+                }
+            })
+            .expect("spawning the walk thread");
+        Self { order, active, rx }
+    }
+
+    /// Asks for one step. Any step still waiting is dropped: only the newest
+    /// intention matters, and only one can ever be in flight.
+    fn step(&self, key: &str) {
+        if let Ok(mut slot) = self.order.lock() {
+            *slot = Some(Order { key: key.to_string(), issued: Instant::now() });
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
+    }
+}
+
+fn pilot(
+    order: &Mutex<Option<Order>>,
+    active: &AtomicBool,
+    reports: &Sender<Report>,
+) -> Result<()> {
+    let mut df = Session::connect_local()?;
+    let origin = df.origin();
+    let mut next_poll = Instant::now();
+    // The block the local map was last pulled for. Walkability only needs the
+    // character's own neighbourhood, so this is refreshed on crossing a block
+    // rather than on every poll.
+    let mut mapped: Option<(i32, i32, i32)> = None;
+
+    loop {
+        if !active.load(Ordering::Relaxed) {
+            // Idle costs the game nothing.
+            thread::sleep(Duration::from_millis(50));
+            next_poll = Instant::now();
+            continue;
+        }
+
+        // Steps go first: a step delayed behind a read is a step the camera
+        // has already walked past.
+        let waiting = order.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(Order { key, issued }) = waiting {
+            if issued.elapsed().as_secs_f32() > CONFIRM {
+                // The camera has given up on this one, so the game must never
+                // see it. A late step is a step the player did not ask for.
+                bevy::log::warn!("walk: dropped a stale {key} step");
+            } else {
+                let expr = format!(
+                    "local s=dfhack.gui.getCurViewscreen(); s:feed_key(df.interface_key.A_MOVE_{key})"
+                );
+                if let Err(err) = df.client.run_command("lua", &[&expr]) {
+                    bevy::log::warn!("walk: step {key} was not delivered: {err:#}");
+                }
+            }
+        }
+
+        if Instant::now() < next_poll {
+            thread::sleep(Duration::from_millis(3));
+            continue;
+        }
+        next_poll = Instant::now() + POLL;
+
+        // The window follows the character, so where it sits has to be re-read
+        // alongside the position: a stale window would place the same tile 48
+        // tiles away.
+        if df.refresh_window().is_err() {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let Ok(here) = df.view_center() else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        let block = (here.0.div_euclid(BLOCK), here.1.div_euclid(BLOCK), here.2);
+        if mapped != Some(block) {
+            mapped = Some(block);
+            let around = |r: i32, d: i32| BlockBounds {
+                min_x: block.0 - r,
+                max_x: block.0 + r + 1,
+                min_y: block.1 - r,
+                max_y: block.1 + r + 1,
+                min_z: here.2 - d,
+                max_z: here.2 + d + 1,
+            };
+            let _ = df.fetch(around(1, 2), true);
+            df.world.retain_within(around(2, 4));
+        }
+
+        let tile = (here.0 + origin.0, here.1 + origin.1, here.2 + origin.2);
+        reports.send(Report { tile, ground: Ground::sample(&df.world, here, origin) })?;
+    }
+}
+
+// ---------------------------------------------------------------- the ground
 
 /// The shape of the ground near the character, so the camera can judge a step
 /// and find its own eye height without a round trip to the game.
-#[derive(Clone)]
 pub struct Ground {
-    /// Render tile the square is centred on.
-    center: (i32, i32, i32),
-    /// Solids for `z-1..=z+1` over a `(2r+1)` square, level-major then row-major.
-    /// `None` where that chunk is not loaded.
+    /// Absolute tile the square is centred on.
+    center: IVec3,
+    /// Solids for `z-1..=z+1` over a `2 * GROUND_RADIUS + 1` square, level-major
+    /// then row-major. `None` where that chunk is not loaded.
     solids: Vec<Option<Solid>>,
 }
 
 impl Ground {
-    /// Reads the square out of the voxel world. Cheap: a few hundred lookups.
-    pub fn sample(world: &World, center: (i32, i32, i32)) -> Self {
-        let radius = GROUND_RADIUS;
-        let span = 2 * radius + 1;
-        let mut solids = Vec::with_capacity((3 * span * span) as usize);
+    /// Reads the square out of a voxel world whose render frame is pinned at
+    /// `origin`. Cheap: a few hundred lookups.
+    fn sample(world: &World, center: (i32, i32, i32), origin: (i32, i32, i32)) -> Self {
+        let r = GROUND_RADIUS;
+        let mut solids = Vec::with_capacity((3 * (2 * r + 1) * (2 * r + 1)) as usize);
         for dz in -1..=1 {
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
+            for dy in -r..=r {
+                for dx in -r..=r {
                     solids.push(
                         world
                             .voxel(center.0 + dx, center.1 + dy, center.2 + dz)
@@ -86,22 +248,20 @@ impl Ground {
                 }
             }
         }
-        Self { center, solids }
+        Self {
+            center: IVec3::new(center.0 + origin.0, center.1 + origin.1, center.2 + origin.2),
+            solids,
+        }
     }
 
     fn get(&self, tile: IVec3) -> Option<Solid> {
-        let (dx, dy, dz) = (
-            tile.x - self.center.0,
-            tile.y - self.center.1,
-            tile.z - self.center.2,
-        );
+        let d = tile - self.center;
         let r = GROUND_RADIUS;
-        if dx.abs() > r || dy.abs() > r || dz.abs() > 1 {
+        if d.x.abs() > r || d.y.abs() > r || d.z.abs() > 1 {
             return None;
         }
         let span = 2 * r + 1;
-        let i = (dz + 1) * span * span + (dy + r) * span + (dx + r);
-        *self.solids.get(i as usize)?
+        *self.solids.get(((d.z + 1) * span * span + (d.y + r) * span + (d.x + r)) as usize)?
     }
 }
 
@@ -115,6 +275,8 @@ fn obstructs(solid: Solid) -> bool {
     matches!(solid, Solid::Cube | Solid::Fortification)
 }
 
+// ------------------------------------------------------------------ the mode
+
 /// A step asked for and not yet seen in the game.
 struct Pending {
     /// The tile it started from, which a refusal returns to.
@@ -127,26 +289,31 @@ struct Pending {
 #[derive(Resource, Default)]
 pub struct WalkMode {
     pub active: bool,
-    /// Where the game last said the character stands, in render tiles.
+    /// The render origin the map thread pinned, once it has connected.
+    /// Positions travel as absolute tiles and are placed against this.
+    origin: Option<IVec3>,
+    /// Where the game last said the character stands, in absolute tiles.
     confirmed: Option<IVec3>,
     /// The cell the camera occupies: the confirmed tile, or one step ahead.
     cell: IVec3,
     /// Where inside that cell the camera stands, east and south, 0 to 1.
     offset: Vec2,
     pending: Option<Pending>,
-    /// Directions that just refused a step, and how long they stay shut,
-    /// indexed by `(dy + 1) * 3 + (dx + 1)`.
+    /// Directions that refused a step, and how long they stay shut, indexed by
+    /// `(dy + 1) * 3 + (dx + 1)`.
     blocked: [f32; 9],
+    /// Steps in a row the game has not taken. Reset by any real movement.
+    strikes: u32,
     /// The gap between where the camera is drawn and where it stands, decayed
     /// away so every jump reads as a glide.
     glide: Vec3,
     ground: Option<Ground>,
     /// A position report waiting to be reconciled.
     fix: Option<(IVec3, Ground)>,
-    /// Set while a poll is in flight, so requests never pile up behind a slow
-    /// collection pass.
-    awaiting: bool,
-    since_poll: f32,
+    /// Scripted legs still to walk, from the environment. Current first.
+    drive: Vec<Leg>,
+    /// Set once the environment has been read.
+    started: bool,
     /// What the HUD says about the mode.
     pub line: String,
 }
@@ -164,12 +331,13 @@ impl WalkMode {
         }
     }
 
-    /// Where the camera logically stands, before the glide is added.
+    /// Where the camera logically stands, in render space, before the glide.
     fn anchor(&self) -> Vec3 {
+        let cell = self.cell - self.origin.unwrap_or(IVec3::ZERO);
         Vec3::new(
-            self.cell.x as f32 + self.offset.x,
-            self.cell.z as f32 * Z_SCALE + self.footing(self.cell) + EYE,
-            self.cell.y as f32 + self.offset.y,
+            cell.x as f32 + self.offset.x,
+            cell.z as f32 * Z_SCALE + self.footing(self.cell) + EYE,
+            cell.y as f32 + self.offset.y,
         )
     }
 
@@ -186,7 +354,8 @@ impl WalkMode {
 
     /// The level a step in `dir` would land on, or `None` where it cannot be
     /// taken. Unknown ground never refuses: terrain that has not streamed in
-    /// yet is not a wall.
+    /// yet is not a wall, and a step the game will not take is caught anyway
+    /// when the poll shows the character has not moved.
     fn step_target(&self, from: IVec3, dir: IVec2) -> Option<i32> {
         let (x, y) = (from.x + dir.x, from.y + dir.y);
         let on_ramp = self.solid(from) == Some(Solid::Ramp);
@@ -212,14 +381,21 @@ impl WalkMode {
         None
     }
 
-    fn shut(&self, dir: IVec2) -> bool {
-        self.blocked[((dir.y + 1) * 3 + (dir.x + 1)) as usize] > 0.0
+    fn slot(dir: IVec2) -> usize {
+        ((dir.y + 1) * 3 + (dir.x + 1)) as usize
     }
 
     fn may_step(&self, dir: IVec2) -> bool {
-        self.pending.is_none() && !self.shut(dir) && self.step_target(self.cell, dir).is_some()
+        self.pending.is_none()
+            && self.blocked[Self::slot(dir)] <= 0.0
+            && self.step_target(self.cell, dir).is_some()
     }
 
+    /// The character moved, wherever the move came from, so nothing is stuck.
+    fn moved(&mut self, tile: IVec3) {
+        self.confirmed = Some(tile);
+        self.strikes = 0;
+    }
 }
 
 /// The eight compass directions, as the suffix of `df.interface_key.A_MOVE_*`.
@@ -236,6 +412,40 @@ fn move_key(dir: IVec2) -> &'static str {
     }
 }
 
+/// A scripted walk, for checking the mode with no hand on the keyboard.
+///
+/// `DWARF_EYE_WALK=1` starts in walk mode as soon as the character is found.
+/// `DWARF_EYE_WALK_DRIVE=bearing,seconds;bearing,seconds;…` then holds the
+/// character walking on each compass bearing in turn — degrees, 0 north,
+/// 90 east — so a there-and-back leaves the character where it started. A leg
+/// with no bearing, `,30`, just stands still for that long, which is how a
+/// scripted walk waits for the map to paint before setting off.
+fn scripted_drive() -> Vec<Leg> {
+    let Ok(spec) = std::env::var("DWARF_EYE_WALK_DRIVE") else { return Vec::new() };
+    spec.split(';')
+        .filter_map(|leg| {
+            let (bearing, seconds) = leg.split_once(',')?;
+            let bearing = bearing.trim();
+            let bearing = if bearing.is_empty() {
+                None
+            } else {
+                // A compass bearing turns the opposite way to the camera's yaw,
+                // which has north at zero and swings west as it grows.
+                Some(-bearing.parse::<f32>().ok()?.to_radians())
+            };
+            Some(Leg { bearing, seconds: seconds.trim().parse().ok()? })
+        })
+        .collect()
+}
+
+/// One leg of a scripted walk: a heading to hold, or a pause.
+struct Leg {
+    bearing: Option<f32>,
+    seconds: f32,
+}
+
+// --------------------------------------------------------------- the systems
+
 /// Whether free flight should run this frame.
 pub fn flying(walk: Res<WalkMode>) -> bool {
     !walk.active
@@ -246,54 +456,44 @@ pub fn walking(walk: Res<WalkMode>) -> bool {
 }
 
 /// Tab swaps between free flight and walking with the character.
-pub fn toggle(keys: Res<ButtonInput<KeyCode>>, mut walk: ResMut<WalkMode>) {
-    if !keys.just_pressed(KeyCode::Tab) {
+pub fn toggle(keys: Res<ButtonInput<KeyCode>>, bridge: NonSend<Bridge>, mut walk: ResMut<WalkMode>) {
+    let wanted = if !walk.started {
+        walk.started = true;
+        walk.drive = scripted_drive();
+        std::env::var("DWARF_EYE_WALK").is_ok()
+    } else if keys.just_pressed(KeyCode::Tab) {
+        !walk.active
+    } else {
         return;
-    }
-    walk.active = !walk.active;
+    };
+
+    walk.active = wanted;
+    bridge.pilot.set_active(wanted);
+    // Anything the walk thread said before now describes a tile the character
+    // may have long since left.
+    for _ in bridge.pilot.rx.try_iter() {}
+    walk.fix = None;
     // Re-fix on every entry: the character may be anywhere by now.
     walk.confirmed = None;
     walk.pending = None;
     walk.blocked = [0.0; 9];
+    walk.strikes = 0;
     walk.glide = Vec3::ZERO;
-    walk.since_poll = 0.0;
-    walk.line = if walk.active {
-        "walk    finding the character…".into()
-    } else {
-        String::new()
-    };
+    walk.line = if wanted { "walk    finding the character…".into() } else { String::new() };
 }
 
-/// Takes whatever position reports the worker has sent. Only the newest
+/// Takes whatever position reports the walk thread has sent. Only the newest
 /// matters: an older one has already been overtaken.
 pub fn receive(bridge: NonSend<Bridge>, mut walk: ResMut<WalkMode>) {
-    for report in bridge.reports.try_iter() {
-        walk.awaiting = false;
-        walk.fix = Some((
-            IVec3::new(report.tile.0, report.tile.1, report.tile.2),
-            report.ground,
-        ));
+    if walk.origin.is_none()
+        && let Some(&(x, y, z)) = bridge.origin.get()
+    {
+        walk.origin = Some(IVec3::new(x, y, z));
     }
-}
-
-/// Asks where the character stands, eight times a second while walking, and
-/// never with a request already outstanding.
-pub fn poll(time: Res<Time>, bridge: NonSend<Bridge>, mut walk: ResMut<WalkMode>) {
-    if !walk.active {
-        walk.awaiting = false;
-        return;
+    for report in bridge.pilot.rx.try_iter() {
+        let tile = IVec3::new(report.tile.0, report.tile.1, report.tile.2);
+        walk.fix = Some((tile, report.ground));
     }
-    walk.since_poll += time.delta_secs();
-    // A dropped reply would otherwise wedge the poll for good.
-    if walk.awaiting && walk.since_poll < 1.0 {
-        return;
-    }
-    if walk.since_poll < 0.125 {
-        return;
-    }
-    walk.since_poll = 0.0;
-    walk.awaiting = true;
-    let _ = bridge.tx.send(Command::Adventurer);
 }
 
 pub fn walk(
@@ -311,7 +511,7 @@ pub fn walk(
 
     reconcile(&mut walk);
 
-    let Some(confirmed) = walk.confirmed else {
+    let (Some(confirmed), Some(origin)) = (walk.confirmed, walk.origin) else {
         walk.line = "walk    finding the character…".into();
         return;
     };
@@ -320,22 +520,44 @@ pub fn walk(
         *shut = (*shut - dt).max(0.0);
     }
 
-    // A step that never arrives is a refusal: return to the tile it left and
-    // shut that edge for a moment.
+    // A step the game never took is a refusal: return to the tile it left and
+    // shut that edge, rather than leaning on it again next frame. The order
+    // itself has expired by now, so it can no longer reach the game either.
     let expired = walk.pending.as_mut().is_some_and(|p| {
         p.age += dt;
         p.age > CONFIRM
     });
     if expired && let Some(p) = walk.pending.take() {
         let (from, dir) = (p.from, p.dir);
+        walk.strikes += 1;
         walk.jump(|w| {
             w.cell = from;
             if dir != IVec2::ZERO {
                 let back = w.offset + dir.as_vec2();
                 w.offset = back.clamp(Vec2::splat(MARGIN), Vec2::splat(1.0 - MARGIN));
             }
-            w.blocked[((dir.y + 1) * 3 + (dir.x + 1)) as usize] = BLOCKED;
+            w.blocked[WalkMode::slot(dir)] = BLOCKED;
         });
+        // A player can lean on a wall all day; a scripted walk is called off
+        // rather than left bouncing.
+        if walk.strikes >= STRIKES && !walk.drive.is_empty() {
+            warn!("walk: {} steps in a row went unconfirmed; scripted walk stopped", walk.strikes);
+            walk.drive.clear();
+        }
+    }
+
+    // A scripted walk steers instead of the mouse and holds the forward key.
+    let mut scripted = false;
+    if let Some(leg) = walk.drive.first_mut() {
+        leg.seconds -= dt;
+        let bearing = leg.bearing;
+        if leg.seconds <= 0.0 {
+            walk.drive.remove(0);
+        }
+        if let Some(bearing) = bearing {
+            fly.yaw = bearing;
+            scripted = true;
+        }
     }
 
     if buttons.pressed(MouseButton::Right) {
@@ -347,18 +569,21 @@ pub fn walk(
 
     // Render x is east and render z is south, which is how the game lays out a
     // tile, so heading and cell offset share one plane.
-    let forward = transform.forward();
-    let right = transform.right();
+    let forward = Vec2::new(transform.forward().x, transform.forward().z).normalize_or_zero();
+    let right = Vec2::new(transform.right().x, transform.right().z).normalize_or_zero();
     let mut heading = Vec2::ZERO;
     for (key, axis) in [
-        (KeyCode::KeyW, Vec2::new(forward.x, forward.z)),
-        (KeyCode::KeyS, -Vec2::new(forward.x, forward.z)),
-        (KeyCode::KeyD, Vec2::new(right.x, right.z)),
-        (KeyCode::KeyA, -Vec2::new(right.x, right.z)),
+        (KeyCode::KeyW, forward),
+        (KeyCode::KeyS, -forward),
+        (KeyCode::KeyD, right),
+        (KeyCode::KeyA, -right),
     ] {
         if keys.pressed(key) {
-            heading += axis.normalize_or_zero();
+            heading += axis;
         }
+    }
+    if scripted {
+        heading += forward;
     }
     let mut want = walk.offset + heading.normalize_or_zero() * SPEED * dt;
 
@@ -384,10 +609,10 @@ pub fn walk(
             // how much when the step lands.
             want -= dir.as_vec2();
             walk.pending = Some(Pending { from, dir, age: 0.0 });
-            let _ = bridge.tx.send(Command::Step { key: move_key(dir).into() });
+            bridge.pilot.step(move_key(dir));
         }
         // Whatever was not stepped is held inside the cell, a margin short of
-        // the edge so the camera never sits in the wall.
+        // the edge so the camera never stands in the wall.
         let held = taken.unwrap_or(IVec2::ZERO);
         if over.x != 0 && held.x == 0 {
             want.x = want.x.clamp(MARGIN, 1.0 - MARGIN);
@@ -411,7 +636,7 @@ pub fn walk(
         };
         if let Some(key) = vertical {
             walk.pending = Some(Pending { from: walk.cell, dir: IVec2::ZERO, age: 0.0 });
-            let _ = bridge.tx.send(Command::Step { key: key.into() });
+            bridge.pilot.step(key);
         }
     }
 
@@ -422,15 +647,15 @@ pub fn walk(
     }
     transform.translation = walk.anchor() + walk.glide;
 
-    let state = match (&walk.pending, walk.blocked.iter().any(|&b| b > 0.0)) {
-        (Some(_), _) => "stepping",
-        (None, true) => "blocked",
+    let shut = walk.blocked.iter().filter(|&&b| b > 0.0).count();
+    let state = match (walk.strikes, walk.pending.is_some(), shut) {
+        (s, _, _) if s >= STRIKES => "stuck",
+        (_, true, _) => "stepping",
+        (_, _, n) if n > 0 => "blocked",
         _ => "walking",
     };
-    walk.line = format!(
-        "walk    character tile ({}, {}, {})   {state}",
-        confirmed.x, confirmed.y, confirmed.z
-    );
+    let tile = confirmed - origin;
+    walk.line = format!("walk    character tile ({}, {}, {})   {state}", tile.x, tile.y, tile.z);
 }
 
 /// Settles the camera against what the game says, once a position report is in.
@@ -442,35 +667,35 @@ fn reconcile(walk: &mut WalkMode) {
         walk.ground = Some(ground);
         walk.cell = tile;
         walk.offset = Vec2::splat(0.5);
-        walk.confirmed = Some(tile);
         walk.glide = Vec3::ZERO;
+        walk.moved(tile);
         return;
     }
 
     match walk.pending.take() {
+        // Nothing has landed yet; keep waiting for it.
         Some(pending) if tile == pending.from => {
-            // Nothing has landed yet; keep waiting.
             walk.ground = Some(ground);
             walk.pending = Some(pending);
         }
+        // Our step, confirmed. The camera is already in the cell; only the
+        // level is news, and it comes from a ramp.
         Some(pending)
             if pending.dir != IVec2::ZERO
                 && tile.x == pending.from.x + pending.dir.x
                 && tile.y == pending.from.y + pending.dir.y =>
         {
-            // Our step, confirmed. The camera is already in the cell; only the
-            // level is news, and it comes from a ramp.
-            walk.confirmed = Some(tile);
+            walk.moved(tile);
             walk.jump(|w| {
                 w.ground = Some(ground);
                 w.cell = tile;
             });
         }
+        // A staircase, confirmed.
         Some(pending)
             if pending.dir == IVec2::ZERO && tile.x == pending.from.x && tile.y == pending.from.y =>
         {
-            // A staircase, confirmed.
-            walk.confirmed = Some(tile);
+            walk.moved(tile);
             walk.jump(|w| {
                 w.ground = Some(ground);
                 w.cell = tile;
@@ -485,11 +710,50 @@ fn reconcile(walk: &mut WalkMode) {
             // player's place in the cell and their heading. A long jump —
             // travel — is taken outright rather than slid through.
             walk.blocked = [0.0; 9];
-            walk.confirmed = Some(tile);
+            walk.moved(tile);
             walk.jump(|w| {
                 w.ground = Some(ground);
                 w.cell = tile;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render x runs east and render z runs south, so a compass bearing has to
+    /// come out as the tile step the game would take. The first live run walked
+    /// the wrong way, so this pins the convention down.
+    #[test]
+    fn bearings_reach_the_compass() {
+        for (bearing, expect, key) in [
+            (0.0, IVec2::new(0, -1), "N"),
+            (90.0, IVec2::new(1, 0), "E"),
+            (180.0, IVec2::new(0, 1), "S"),
+            (270.0, IVec2::new(-1, 0), "W"),
+        ] {
+            let yaw = -f32::to_radians(bearing);
+            let forward = Quat::from_euler(EulerRot::YXZ, yaw, 0.0, 0.0) * Vec3::NEG_Z;
+            let step = IVec2::new(forward.x.round() as i32, forward.z.round() as i32);
+            assert_eq!(step, expect, "bearing {bearing} walks the wrong way");
+            assert_eq!(move_key(step), key);
+        }
+    }
+
+    #[test]
+    fn the_ground_square_addresses_its_own_tiles() {
+        let solids = vec![None; (3 * (2 * GROUND_RADIUS + 1) * (2 * GROUND_RADIUS + 1)) as usize];
+        let mut ground = Ground { center: IVec3::new(100, 200, 30), solids };
+        let span = 2 * GROUND_RADIUS + 1;
+        // One tile east and one level down, by hand.
+        let index = 0 * span * span + GROUND_RADIUS * span + (GROUND_RADIUS + 1);
+        ground.solids[index as usize] = Some(Solid::Ramp);
+        assert_eq!(ground.get(IVec3::new(101, 200, 29)), Some(Solid::Ramp));
+        assert_eq!(ground.get(IVec3::new(100, 200, 30)), None);
+        // Outside the square, and outside the three levels.
+        assert_eq!(ground.get(IVec3::new(200, 200, 30)), None);
+        assert_eq!(ground.get(IVec3::new(101, 200, 27)), None);
     }
 }
