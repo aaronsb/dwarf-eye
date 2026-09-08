@@ -7,8 +7,10 @@
 //! elevation), so a later session with a different render origin places them
 //! where they belong.
 //!
-//! Layout: one file per chunk, `<bx>_<by>_<z>.chunk`, 256 voxels of 16 bytes
-//! after a 4-byte magic. The format is private to this crate.
+//! Layout: one file per chunk, `<bx>_<by>_<z>.chunk`, 256 voxels of 19 bytes
+//! after a 4-byte magic. The format is private to this crate, and the magic
+//! carries its version: a file written by an older layout fails to read and is
+//! deleted.
 
 use crate::palette::Solid;
 use crate::world::{Chunk, TILES_PER_BLOCK, Voxel};
@@ -16,8 +18,8 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"DEC1";
-const VOXEL_BYTES: usize = 16;
+const MAGIC: &[u8; 4] = b"DEC2";
+const VOXEL_BYTES: usize = 19;
 
 fn solid_to_u8(s: Solid) -> u8 {
     match s {
@@ -86,6 +88,9 @@ impl Cache {
             bytes.extend_from_slice(&v.color);
             bytes.extend_from_slice(&v.tile_id.to_le_bytes());
             bytes.extend_from_slice(&v.mat_index.to_le_bytes());
+            bytes.push(v.tree_dx as u8);
+            bytes.push(v.tree_dy as u8);
+            bytes.push(v.tree_dz as u8);
         }
         let path = self.path(key);
         let tmp = path.with_extension("tmp");
@@ -139,6 +144,9 @@ fn read_chunk(path: &Path) -> Result<Vec<Voxel>> {
             color: [v[5], v[6], v[7]],
             tile_id: i32::from_le_bytes([v[8], v[9], v[10], v[11]]),
             mat_index: i32::from_le_bytes([v[12], v[13], v[14], v[15]]),
+            tree_dx: v[16] as i8,
+            tree_dy: v[17] as i8,
+            tree_dz: v[18] as i8,
         });
     }
     Ok(voxels)

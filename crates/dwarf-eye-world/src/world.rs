@@ -24,6 +24,25 @@ pub struct Voxel {
     pub water: u8,
     /// Fill level 0-7.
     pub magma: u8,
+    /// Where this tile sits inside its tree, from `tree_x`/`tree_y`/`tree_z`.
+    /// Zero for everything that is not part of a tree.
+    pub tree_dx: i8,
+    pub tree_dy: i8,
+    pub tree_dz: i8,
+}
+
+impl Voxel {
+    /// The tile position of the tree this tile belongs to.
+    ///
+    /// DFHack reports the offset from the origin on x and y and the offset to
+    /// it on z, so the two axes are combined the opposite way round.
+    pub fn tree_origin(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+        (
+            x - self.tree_dx as i32,
+            y - self.tree_dy as i32,
+            z + self.tree_dz as i32,
+        )
+    }
 }
 
 /// A decoded 16x16x1 slab, addressed by block coordinates.
@@ -178,6 +197,10 @@ impl World {
 
         // Every parallel array is either full length or absent, so index
         // defensively rather than assuming the server filled all of them.
+        // Tree extents never approach a hundred tiles, so a byte holds an
+        // offset with room to spare.
+        let offset = |list: &[i32], i: usize| list.get(i).map(|&v| v.clamp(-127, 127) as i8).unwrap_or(0);
+
         for i in 0..TILES_PER_BLOCK {
             let Some(&tile_id) = block.tiles.get(i) else { continue };
             let shape = self.palette.shape(tile_id);
@@ -194,6 +217,9 @@ impl World {
                 outside: block.outside.get(i).copied().unwrap_or(false),
                 water: block.water.get(i).copied().unwrap_or(0).clamp(0, 7) as u8,
                 magma: block.magma.get(i).copied().unwrap_or(0).clamp(0, 7) as u8,
+                tree_dx: offset(&block.tree_x, i),
+                tree_dy: offset(&block.tree_y, i),
+                tree_dz: offset(&block.tree_z, i),
             };
         }
 
