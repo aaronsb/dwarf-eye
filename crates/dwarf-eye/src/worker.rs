@@ -335,7 +335,10 @@ fn read_weather(map: &rfr::WorldMap) -> Weather {
 
 /// Meshes every loaded chunk and ships the results in batches.
 /// Pulls the region and world maps and stitches the land beyond the loaded map.
-fn build_horizon(df: &mut Session) -> Result<dwarf_eye_world::horizon::Horizon> {
+fn build_horizon(
+    df: &mut Session,
+    skins: &dwarf_eye_world::horizon::skin::Skins,
+) -> Result<dwarf_eye_world::horizon::Horizon> {
     let regions: rfr::RegionMaps = df.client.call_empty(methods::GET_REGION_MAPS_NEW)?;
     let world_map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP)?;
     let transpose = std::env::var("DWARF_EYE_HORIZON_TRANSPOSE").is_ok();
@@ -346,6 +349,7 @@ fn build_horizon(df: &mut Session) -> Result<dwarf_eye_world::horizon::Horizon> 
         &regions,
         &world_map,
         &df.world,
+        skins,
         transpose,
     ))
 }
@@ -472,7 +476,11 @@ fn collect(
     // for the first blocks, and follows the window after.
     if df.world.chunk_count() > 0 && (!*horizon_sent || window_moved) {
         *horizon_sent = true;
-        match build_horizon(df) {
+        let skins = library
+            .as_deref()
+            .map(dwarf_eye_world::horizon::skin::Skins::from_library)
+            .unwrap_or_default();
+        match build_horizon(df, &skins) {
             Ok(mesh) => events.send(Event::Horizon(mesh))?,
             Err(e) => events.send(Event::Status(format!("no horizon: {e:#}")))?,
         }

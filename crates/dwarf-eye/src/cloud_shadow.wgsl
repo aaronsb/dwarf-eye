@@ -9,6 +9,7 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
+    pbr_bindings::{base_color_texture, base_color_sampler},
 }
 
 struct CloudShadow {
@@ -23,7 +24,9 @@ struct CloudShadow {
     // Height the map was baked at.
     ground: f32,
     enabled: f32,
-    // One on the horizon material, which yields to loaded blocks.
+    // Non-zero on a horizon material, which yields to loaded blocks: 1 on the
+    // coarse ground, whose UV names an atlas cell, 2 on the far crowns, whose
+    // UVs are world-space on a leaf texture of their own.
     horizon: f32,
     // Block coordinate of the mask's first texel.
     mask_origin: vec2<f32>,
@@ -49,6 +52,64 @@ fn masked(world: vec3<f32>) -> bool {
         return false;
     }
     return textureLoad(block_mask, block, 0).r > 0.5;
+}
+
+// The ground atlas's own layout, from `dwarf_eye_art::atlas`. A cell is 32 px
+// of sprite with 16 px of its own edge bled around it, 32 cells to a side.
+// `horizon::skin` pins these with a test.
+const ATLAS_GRID: f32 = 32.0;
+const ATLAS_CELL: f32 = 32.0;
+const ATLAS_PAD: f32 = 16.0;
+const ATLAS_STRIDE: f32 = ATLAS_CELL + ATLAS_PAD * 2.0;
+const ATLAS_SIDE: f32 = ATLAS_GRID * ATLAS_STRIDE;
+
+// Where a coarse surface reads the sprite from, in world tiles.
+//
+// A terrace slab is one quad six to forty-eight tiles across, so the repeat
+// cannot live in its UVs: the atlas has no room around a cell to tile into.
+// The vertex carries the cell's centre instead and the surface's own world
+// position supplies the phase, which puts one sprite on every world tile —
+// Dwarf Fortress's own density, and the fine map's, so the two meet without a
+// change of scale.
+fn surface_coords(world: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    if abs(normal.y) > 0.5 {
+        return world.xz;
+    }
+    if abs(normal.x) > 0.5 {
+        return vec2(world.z, -world.y);
+    }
+    return vec2(world.x, -world.y);
+}
+
+// The sprite the coarse ground's own UV names, wrapped across the surface.
+//
+// Derivatives come from the unwrapped coordinate, so the mip level is
+// continuous across a tile boundary; taking them from the wrapped one would
+// spike at every seam and rule a sharp grid over the whole band.
+fn horizon_texel(uv: vec2<f32>, tile: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
+    let slot = floor(uv * ATLAS_GRID);
+    let origin = slot * ATLAS_STRIDE + ATLAS_PAD;
+    let inside = origin + fract(tile) * ATLAS_CELL + 0.5;
+    let grad = ATLAS_CELL / ATLAS_SIDE;
+    return textureSampleGrad(
+        base_color_texture,
+        base_color_sampler,
+        inside / ATLAS_SIDE,
+        ddx * grad,
+        ddy * grad,
+    );
+}
+
+// The canopy's leaf surface on a far crown.
+//
+// A crown out here is one shared mesh at one transform per tree, so its UVs
+// cannot be world-space in the vertex buffer the way a chunk's are: the
+// instance's own scale would take them with it and every tree would wear a
+// different texel size. Deriving them from the world position gives every
+// crown, grown or boxed, exactly the near canopy's density — one repeat to a
+// world tile — however large the instance is.
+fn horizon_leaf(tile: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
+    return textureSampleGrad(base_color_texture, base_color_sampler, tile, ddx, ddy);
 }
 
 // Fraction of sunlight reaching a point on the ground.
@@ -78,7 +139,29 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     if masked(in.world_position.xyz) {
         discard;
     }
+    // The surface's own world coordinate in tiles, and its derivatives, taken
+    // once and outside the branch: a gradient asked for inside one is not
+    // guaranteed to be uniform across the quad.
+    let tile = surface_coords(in.world_position.xyz, in.world_normal);
+    let ddx = dpdx(tile);
+    let ddy = dpdy(tile);
     var pbr_input = pbr_input_from_standard_material(in, is_front);
+#ifdef VERTEX_COLORS
+    // A horizon surface samples its own texture: the coarse ground's UV names
+    // an atlas cell rather than a point, and a far crown has no usable UV at
+    // all. Both are wrapped across the surface by its world position, so the
+    // texel density is the fine map's whatever the geometry's scale.
+    // Untextured horizon geometry — the world grid, rivers, buildings, the
+    // blob shadows — points at the white cell and comes through as its own
+    // vertex colour.
+    if cloud.horizon > 0.5 {
+        var texel = horizon_leaf(tile, ddx, ddy);
+        if cloud.horizon < 1.5 {
+            texel = horizon_texel(in.uv, tile, ddx, ddy);
+        }
+        pbr_input.material.base_color = vec4(texel.rgb, 1.0) * in.color;
+    }
+#endif
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);
 

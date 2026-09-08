@@ -25,8 +25,11 @@
 pub mod features;
 pub mod field;
 pub mod fine;
+pub mod grown;
 pub mod scatter;
 pub mod shade;
+pub mod skin;
+pub mod stitch;
 pub mod terrace;
 
 use crate::mesh::{MeshData, Z_SCALE};
@@ -39,7 +42,8 @@ use std::collections::HashMap;
 
 use field::{Cell, Field};
 use fine::FineSurface;
-use scatter::{CrownInstance, Patch, Stage};
+use scatter::{CrownInstance, Patch, STAGES, Stage};
+use skin::Skins;
 use shade::{WATER, jitter, to_linear, top_color};
 use terrace::{FAR, Terrain, smooth_height};
 
@@ -57,27 +61,58 @@ const FIELD_MARGIN: i32 = 3;
 #[derive(Default)]
 pub struct Horizon {
     pub mesh: MeshData,
-    /// One entry per species and detail stage in view; Bevy batches instances
-    /// that share a mesh, so this is a handful of draw calls however many trees
-    /// there are.
+    /// One entry per species, growth variant and detail stage; Bevy batches
+    /// instances that share a mesh, so this is a handful of draw calls however
+    /// many trees there are.
+    ///
+    /// Every tree appears once in each stage: which one draws is the camera's
+    /// distance to it, decided by the `VisibilityRange` on each entity.
     pub crowns: Vec<CrownBatch>,
 }
 
 impl Horizon {
+    /// Triangles the ground costs, plus the coarsest tree stage: what a view
+    /// with no tree near it draws.
     pub fn triangle_count(&self) -> usize {
-        self.mesh.triangle_count()
-            + self.crowns.iter().map(|b| b.mesh.triangle_count() * b.instances.len()).sum::<usize>()
+        self.mesh.triangle_count() + self.stage_triangles(Stage::Box)
     }
 
+    /// Triangles one stage of the tree chain would cost if every tree drew at
+    /// it. The stages are alternatives, never a sum.
+    pub fn stage_triangles(&self, stage: Stage) -> usize {
+        self.crowns
+            .iter()
+            .filter(|b| b.stage == stage)
+            .map(|b| b.mesh.triangle_count() * b.instances.len())
+            .sum()
+    }
+
+    /// Distinct trees. Each is one entity per stage, so the entity count is
+    /// this times [`STAGES`]'s length.
     pub fn instance_count(&self) -> usize {
+        self.crowns
+            .iter()
+            .filter(|b| b.stage == STAGES[0])
+            .map(|b| b.instances.len())
+            .sum()
+    }
+
+    pub fn entity_count(&self) -> usize {
         self.crowns.iter().map(|b| b.instances.len()).sum()
     }
 }
 
-/// One species at one detail stage: the mesh, and every place it stands.
+/// One species at one growth variant and one detail stage: the mesh, and every
+/// place it stands.
 pub struct CrownBatch {
     pub preset: Preset,
     pub stage: Stage,
+    /// Which of the species' canonical growths, for [`Stage::Grown`]. The two
+    /// box stages have one mesh a species and leave this at zero.
+    pub variant: u32,
+    /// How tall the mesh itself stands, in tiles: an instance's transform is
+    /// scaled by its own height over this.
+    pub mesh_height: f32,
     pub mesh: MeshData,
     pub instances: Vec<CrownInstance>,
 }
@@ -164,6 +199,7 @@ pub fn build(
     regions: &RegionMaps,
     world_map: &WorldMap,
     world: &World,
+    skins: &Skins,
     transpose: bool,
 ) -> Horizon {
     let window = Window::from_info(info, origin);
@@ -252,6 +288,7 @@ pub fn build(
         field: &field,
         fine: &fine,
         window: &window,
+        skins,
         crown_near: scatter::NEAR,
         crown_reach: scatter::REACH,
     };
@@ -264,7 +301,7 @@ pub fn build(
     // live window itself, since a walked-and-cached tile still needs its coarse
     // building drawn.
     let bounds = live_window(info, origin);
-    let mut crowns: Vec<(Preset, Stage, CrownInstance)> = Vec::new();
+    let mut crowns: Vec<(Preset, CrownInstance)> = Vec::new();
     let mut mixes: std::collections::BTreeMap<(i32, i32), (Vec<Preset>, i32)> = Default::default();
     for map in &regions.region_maps {
         let (wx, wy) = (map.map_x(), map.map_y());
@@ -442,30 +479,42 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
     [v[0] / len, v[1] / len, v[2] / len]
 }
 
-/// Groups the placed trees by species and stage, and builds the one mesh each
-/// group shares.
-fn batch_crowns(instances: Vec<(Preset, Stage, CrownInstance)>) -> Vec<CrownBatch> {
-    let mut groups: HashMap<(Preset, Stage), Vec<CrownInstance>> = HashMap::new();
-    for (preset, stage, instance) in instances {
-        groups.entry((preset, stage)).or_default().push(instance);
+/// Groups the placed trees by species, growth variant and stage, and builds
+/// the one mesh each group shares.
+///
+/// Every tree lands in one group per stage. Only the nearest stage varies by
+/// growth variant; the two box stages have one mesh a species, so their groups
+/// hold the whole species.
+fn batch_crowns(instances: Vec<(Preset, CrownInstance)>) -> Vec<CrownBatch> {
+    let mut groups: HashMap<(Preset, Stage, u32), Vec<CrownInstance>> = HashMap::new();
+    for (preset, instance) in instances {
+        for stage in STAGES {
+            let variant = if stage == Stage::Grown { instance.variant } else { 0 };
+            groups.entry((preset, stage, variant)).or_default().push(instance);
+        }
     }
     let mut batches: Vec<CrownBatch> = groups
         .into_iter()
-        .map(|((preset, stage), instances)| CrownBatch {
-            preset,
-            stage,
-            mesh: crown_mesh(preset, stage),
-            instances,
+        .map(|((preset, stage, variant), instances)| {
+            let mesh = crown_mesh(preset, stage, variant);
+            CrownBatch { preset, stage, variant, mesh_height: mesh_height(&mesh), mesh, instances }
         })
         .collect();
     // A stable order, so a rebuild spawns the same batches in the same order.
-    batches.sort_by_key(|b| (b.preset.name(), b.stage));
+    batches.sort_by_key(|b| (b.preset.name(), b.stage, b.variant));
     batches
 }
 
+/// How tall a stage's mesh stands, so an instance can be scaled to the height
+/// the scatter gave it whichever stage is drawing.
+fn mesh_height(mesh: &MeshData) -> f32 {
+    mesh.positions.iter().map(|p| p[1]).fold(0.0f32, f32::max).max(0.5)
+}
+
 /// One species' crown at one stage, in this crate's mesh buffers.
-fn crown_mesh(preset: Preset, stage: Stage) -> MeshData {
+fn crown_mesh(preset: Preset, stage: Stage, variant: u32) -> MeshData {
     let source = match stage {
+        Stage::Grown => return grown::mesh(preset, variant),
         Stage::Crown => dwarf_eye_trees::crown(preset),
         Stage::Box => dwarf_eye_trees::crown_box(preset),
     };
@@ -519,10 +568,12 @@ mod tests {
         let field = flat_field(140.7);
         let window = window();
         let fine = FineSurface::default();
+        let skins = Skins::default();
         let terrain = Terrain {
             field: &field,
             fine: &fine,
             window: &window,
+            skins: &skins,
             crown_near: scatter::NEAR,
             crown_reach: scatter::REACH,
         };
@@ -549,10 +600,12 @@ mod tests {
         // One grounded block column, at block (0, 0), whose ground is 11
         // levels below what the survey says.
         let fine = FineSurface::from_columns(&[((0, 0), 29)]);
+        let skins = Skins::default();
         let terrain = Terrain {
             field: &field,
             fine: &fine,
             window: &window,
+            skins: &skins,
             crown_near: scatter::NEAR,
             crown_reach: scatter::REACH,
         };
@@ -565,11 +618,20 @@ mod tests {
         assert_eq!(terrain.level_at(28, 8), Some(40), "clear of the column");
     }
 
+    const NO_SKINS: Skins = Skins::none();
+
     fn terrain_for<'a>(field: &'a Field, fine: &'a FineSurface, window: &'a Window) -> Terrain<'a> {
-        Terrain { field, fine, window, crown_near: scatter::NEAR, crown_reach: scatter::REACH }
+        Terrain {
+            field,
+            fine,
+            window,
+            skins: &NO_SKINS,
+            crown_near: scatter::NEAR,
+            crown_reach: scatter::REACH,
+        }
     }
 
-    fn placed(vegetation: i32, fine: &FineSurface) -> Vec<(Preset, Stage, CrownInstance)> {
+    fn placed(vegetation: i32, fine: &FineSurface) -> Vec<(Preset, CrownInstance)> {
         let field = flat_field(140.0);
         let window = window();
         let terrain = terrain_for(&field, fine, &window);
@@ -598,7 +660,7 @@ mod tests {
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.0, y.0);
-            assert_eq!(x.2, y.2);
+            assert_eq!(x.1, y.1);
         }
     }
 
@@ -611,7 +673,7 @@ mod tests {
         let dense = placed(90, &fine);
         assert!(sparse.len() < dense.len(), "{} vs {}", sparse.len(), dense.len());
         for (i, tree) in sparse.iter().enumerate() {
-            assert_eq!(tree.2, dense[i].2, "instance {i} moved");
+            assert_eq!(tree.1, dense[i].1, "instance {i} moved");
             assert_eq!(tree.0, dense[i].0, "instance {i} changed species");
         }
     }
@@ -632,11 +694,53 @@ mod tests {
     #[test]
     fn every_preset_and_stage_meshes() {
         for preset in [Preset::Oak, Preset::Birch, Preset::Pine, Preset::Willow, Preset::MushroomTree] {
-            for stage in [Stage::Crown, Stage::Box] {
-                let mesh = crown_mesh(preset, stage);
+            for stage in STAGES {
+                let mesh = crown_mesh(preset, stage, 1);
                 assert!(!mesh.indices.is_empty(), "{preset:?} {stage:?}");
                 assert_eq!(mesh.uvs.len(), mesh.positions.len());
+                assert!(mesh_height(&mesh) > 1.0, "{preset:?} {stage:?} is flat");
             }
+        }
+    }
+
+    /// Every tree carries every stage, so Bevy can swap between them by the
+    /// camera's own distance; the stages are alternatives, never a sum.
+    #[test]
+    fn every_tree_carries_every_stage() {
+        let trees = placed(90, &FineSurface::default());
+        assert!(!trees.is_empty());
+        let batches = batch_crowns(trees.clone());
+        for stage in STAGES {
+            let held: usize =
+                batches.iter().filter(|b| b.stage == stage).map(|b| b.instances.len()).sum();
+            assert_eq!(held, trees.len(), "{stage:?} is missing trees");
+        }
+        // Only the grown stage splits by growth variant.
+        for stage in [Stage::Crown, Stage::Box] {
+            assert!(
+                batches.iter().filter(|b| b.stage == stage).all(|b| b.variant == 0),
+                "{stage:?} split by variant"
+            );
+        }
+    }
+
+    /// A stage's mesh has a height of its own and the instance scales to the
+    /// one the scatter gave it, so a tree is the same size whichever stage
+    /// draws it.
+    #[test]
+    fn a_tree_is_the_same_height_at_every_stage() {
+        let trees = placed(90, &FineSurface::default());
+        let batches = batch_crowns(trees);
+        let mut seen: HashMap<([i32; 3], Stage), f32> = HashMap::new();
+        for batch in &batches {
+            for instance in &batch.instances {
+                let key = std::array::from_fn(|i| (instance.pos[i] * 8.0) as i32);
+                seen.insert((key, batch.stage), instance.height / batch.mesh_height * batch.mesh_height);
+            }
+        }
+        for ((key, stage), height) in &seen {
+            let grown = seen[&(*key, Stage::Grown)];
+            assert!((grown - height).abs() < 1e-3, "{stage:?} stands {height} not {grown}");
         }
     }
 
