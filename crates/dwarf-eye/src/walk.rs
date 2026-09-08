@@ -35,7 +35,7 @@ use crate::worker::Bridge;
 use anyhow::Result;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use dwarf_eye_world::mesh::Z_SCALE;
+use dwarf_eye_world::mesh::{FLOOR_HEIGHT, Z_SCALE};
 use dwarf_eye_world::{BLOCK, BlockBounds, Session, Solid, World};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -47,11 +47,23 @@ use std::time::{Duration, Instant};
 /// at, so a held key flows rather than stuttering against the cell edge.
 const SPEED: f32 = 3.2;
 
-/// Eye height above the tile's standing surface, in levels.
-const EYE: f32 = 0.8;
+/// Eye height above the surface the character stands on, in levels. A tile is
+/// about two metres across and a level about three tall in the game's fiction,
+/// and a cube here is one of each, so a person's eye sits near the top of the
+/// cell they are standing in.
+const EYE: f32 = 0.85 * Z_SCALE;
 
-/// How high a ramp or a staircase carries its footing inside its own cell.
-const RAISED: f32 = 0.5 * Z_SCALE;
+/// How high a ramp carries its footing inside its own cell, matching the wedge
+/// the mesh draws there.
+const RAMP_FOOTING: f32 = 0.55 * Z_SCALE;
+
+/// The same for the lower step of a staircase.
+const STAIR_FOOTING: f32 = 0.5 * Z_SCALE;
+
+/// How close the drawn camera may come to the ground beneath it. The glide
+/// that smooths a change of level would otherwise dip the eye through a floor
+/// it is still easing up onto.
+const CLEARANCE: f32 = 0.25 * Z_SCALE;
 
 /// How close to a shut edge the camera may press.
 const MARGIN: f32 = 0.12;
@@ -323,12 +335,25 @@ impl WalkMode {
         self.ground.as_ref().and_then(|g| g.get(tile))
     }
 
-    /// How high the footing in a cell stands inside it.
+    /// How high the footing in a cell stands above the cell's own base: the
+    /// surface the character's feet are on, as the mesh draws it. Dwarf
+    /// Fortress puts a unit on the level whose floor it stands on, and that
+    /// floor is a thin slab resting in the bottom of the cell, not the cell's
+    /// base itself.
     fn footing(&self, cell: IVec3) -> f32 {
         match self.solid(cell) {
-            Some(Solid::Ramp | Solid::Stair) => RAISED,
-            _ => 0.0,
+            Some(Solid::Ramp) => RAMP_FOOTING,
+            Some(Solid::Stair) => STAIR_FOOTING,
+            // Ground we have not seen yet is taken for ordinary floor, which
+            // is what almost all of it is.
+            _ => FLOOR_HEIGHT,
         }
+    }
+
+    /// The height of the ground in a cell, in render space.
+    fn surface(&self, cell: IVec3) -> f32 {
+        let z = cell.z - self.origin.unwrap_or(IVec3::ZERO).z;
+        z as f32 * Z_SCALE + self.footing(cell)
     }
 
     /// Where the camera logically stands, in render space, before the glide.
@@ -336,7 +361,7 @@ impl WalkMode {
         let cell = self.cell - self.origin.unwrap_or(IVec3::ZERO);
         Vec3::new(
             cell.x as f32 + self.offset.x,
-            cell.z as f32 * Z_SCALE + self.footing(self.cell) + EYE,
+            self.surface(self.cell) + EYE,
             cell.y as f32 + self.offset.y,
         )
     }
@@ -645,7 +670,10 @@ pub fn walk(
     if walk.glide.length() < 0.001 {
         walk.glide = Vec3::ZERO;
     }
-    transform.translation = walk.anchor() + walk.glide;
+    // The glide may not carry the eye into the ground it is easing onto.
+    let mut drawn = walk.anchor() + walk.glide;
+    drawn.y = drawn.y.max(walk.surface(walk.cell) + CLEARANCE);
+    transform.translation = drawn;
 
     let shut = walk.blocked.iter().filter(|&&b| b > 0.0).count();
     let state = match (walk.strikes, walk.pending.is_some(), shut) {
