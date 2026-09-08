@@ -93,6 +93,10 @@ pub struct TreeParams {
     /// porosity, what makes a conifer's spray read as see-through next to an
     /// oak's solid crown. Renderers author the cutout from it.
     pub cutout_openness: f32,
+    /// How thickly streamers hang off the crown, 0 for none. A weeping tree
+    /// carries its foliage on hanging strands as well as in clusters; this is
+    /// the chance that a crown-edge leaf cluster grows one.
+    pub streamer_density: f32,
     pub palette: Palette,
 
     // Habit tuning. Sensible for every preset, so callers rarely touch them.
@@ -207,6 +211,7 @@ pub fn oak() -> TreeParams {
         thickness_ratio: 0.62,
         leaf_density: 0.5,
         cutout_openness: 0.3,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(94, 66, 44), Rgb(74, 51, 34), Rgb(112, 82, 55)],
             leaf: vec![Rgb(58, 106, 30), Rgb(98, 148, 44), Rgb(38, 74, 24)],
@@ -239,6 +244,7 @@ pub fn birch() -> TreeParams {
         thickness_ratio: 0.58,
         leaf_density: 0.42,
         cutout_openness: 0.36,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(216, 214, 204), Rgb(186, 184, 176), Rgb(96, 94, 90)],
             leaf: vec![Rgb(104, 148, 52), Rgb(126, 168, 62), Rgb(80, 122, 44)],
@@ -271,6 +277,7 @@ pub fn pine() -> TreeParams {
         thickness_ratio: 0.5,
         leaf_density: 0.6,
         cutout_openness: 0.52,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(118, 74, 46), Rgb(88, 55, 34), Rgb(140, 96, 58)],
             leaf: vec![Rgb(44, 88, 46), Rgb(58, 108, 52), Rgb(32, 68, 38)],
@@ -304,6 +311,7 @@ pub fn spruce() -> TreeParams {
         thickness_ratio: 0.5,
         leaf_density: 0.52,
         cutout_openness: 0.56,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(84, 62, 44), Rgb(64, 46, 32), Rgb(100, 76, 52)],
             leaf: vec![Rgb(34, 76, 44), Rgb(48, 96, 50), Rgb(24, 58, 34)],
@@ -327,28 +335,31 @@ pub fn spruce() -> TreeParams {
 pub fn willow() -> TreeParams {
     TreeParams {
         kind: VegetationKind::Tree,
-        habit: Habit::Broad,
-        height: 12.0,
+        // A willow's weeping is in its streamers, not its limbs: the crown
+        // itself is an ordinary dense rounded canopy.
+        habit: Habit::Deciduous,
+        height: 13.0,
         trunk_width: 1.4,
-        branch_levels: 3,
+        branch_levels: 4,
         children_per_node: (2, 3),
-        spread_deg: (36.0, 62.0),
-        length_ratio: 0.66,
+        spread_deg: (24.0, 46.0),
+        length_ratio: 0.7,
         thickness_ratio: 0.58,
-        leaf_density: 0.4,
-        cutout_openness: 0.4,
+        leaf_density: 0.48,
+        cutout_openness: 0.34,
+        streamer_density: 0.85,
         palette: Palette {
             bark: vec![Rgb(96, 80, 56), Rgb(74, 60, 42), Rgb(114, 96, 68)],
             leaf: vec![Rgb(104, 136, 56), Rgb(126, 156, 68), Rgb(82, 110, 44)],
             tip: Rgb(158, 182, 88),
         },
-        clear_frac: 0.32,
-        limb_frac: 0.26,
-        wander: 0.3,
-        droop: 0.5,
-        leaf_radius: 0.95,
-        leaf_clusters: 2,
-        crown_stretch: 0.72,
+        clear_frac: 0.34,
+        limb_frac: 0.3,
+        wander: 0.28,
+        droop: 0.06,
+        leaf_radius: 1.15,
+        leaf_clusters: 3,
+        crown_stretch: 0.82,
         whorl_step: 0.0,
         whorl_count: 0,
         crown_hollow: 1.0,
@@ -369,6 +380,7 @@ pub fn bush() -> TreeParams {
         thickness_ratio: 0.6,
         leaf_density: 0.52,
         cutout_openness: 0.3,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(84, 66, 46), Rgb(66, 52, 36)],
             leaf: vec![Rgb(72, 116, 40), Rgb(96, 140, 48), Rgb(54, 92, 32)],
@@ -457,9 +469,27 @@ impl Envelope {
     }
 
     pub fn contains(&self, p: Vec3) -> bool {
+        self.contains_within(p, 0.0)
+    }
+
+    /// Whether `p` is inside, or within `slack` tiles of it.
+    ///
+    /// The envelope is a hull, not a mould: a footprint says which tiles a tree
+    /// occupies, and a tile is tree all the way to its edge, not only at its
+    /// middle. Without slack a limb stepping half a tile at a time cannot cross
+    /// from one tile's centre to the next and dies at the first jog.
+    pub fn contains_within(&self, p: Vec3, slack: f32) -> bool {
         let Some(footprint) = self.level_at(p.y) else { return false };
-        let (ix, iz) = Self::cell(footprint, p);
-        footprint.get(ix, iz)
+        if slack <= 0.0 {
+            let (ix, iz) = Self::cell(footprint, p);
+            return footprint.get(ix, iz);
+        }
+        [-slack, slack].iter().any(|&dx| {
+            [-slack, slack].iter().any(|&dz| {
+                let (ix, iz) = Self::cell(footprint, vec3(p.x + dx, p.y, p.z + dz));
+                footprint.get(ix, iz)
+            })
+        })
     }
 
     /// World-space centre of the open cells on the level `p` sits in.
@@ -483,6 +513,7 @@ pub fn shrub() -> TreeParams {
         thickness_ratio: 0.6,
         leaf_density: 0.6,
         cutout_openness: 0.32,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(78, 62, 44), Rgb(60, 48, 34)],
             leaf: vec![Rgb(66, 106, 40), Rgb(88, 128, 48), Rgb(50, 84, 32)],
@@ -515,6 +546,7 @@ pub fn sapling() -> TreeParams {
         thickness_ratio: 0.6,
         leaf_density: 0.6,
         cutout_openness: 0.3,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(96, 74, 48), Rgb(74, 58, 38)],
             leaf: vec![Rgb(86, 132, 46), Rgb(108, 152, 56), Rgb(66, 108, 38)],
@@ -548,6 +580,7 @@ pub fn tall_grass() -> TreeParams {
         thickness_ratio: 1.0,
         leaf_density: 1.0,
         cutout_openness: 0.34,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(96, 112, 52)],
             leaf: vec![Rgb(104, 142, 52), Rgb(126, 162, 62), Rgb(84, 120, 44)],
@@ -580,6 +613,7 @@ pub fn dead_tree() -> TreeParams {
         thickness_ratio: 0.6,
         leaf_density: 0.0,
         cutout_openness: 0.0,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(112, 100, 84), Rgb(88, 78, 64), Rgb(134, 122, 104)],
             leaf: vec![Rgb(112, 100, 84)],
@@ -612,6 +646,7 @@ pub fn mushroom_tree() -> TreeParams {
         thickness_ratio: 0.9,
         leaf_density: 0.95,
         cutout_openness: 0.18,
+        streamer_density: 0.0,
         palette: Palette {
             bark: vec![Rgb(198, 190, 172), Rgb(172, 164, 148), Rgb(146, 138, 124)],
             leaf: vec![Rgb(124, 106, 132), Rgb(148, 128, 154), Rgb(102, 86, 110)],

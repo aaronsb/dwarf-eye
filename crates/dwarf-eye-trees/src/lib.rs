@@ -44,8 +44,9 @@ pub mod mesh;
 pub mod params;
 pub mod raster;
 pub mod rng;
+pub mod texture;
 
-pub use grow::{LeafCluster, Segment, Skeleton, grow};
+pub use grow::{LeafCluster, Segment, Skeleton, Streamer, grow};
 pub use math::{IVec3, Vec3, ivec3, vec3};
 pub use mesh::{Stats, TreeMesh, mesh, mesh_of, stats};
 pub use params::{
@@ -164,6 +165,51 @@ mod tests {
     }
 
     #[test]
+    fn a_willow_hangs_streamers_and_others_do_not() {
+        let willow = rasterise(&grow(&willow(), 9, None), 4);
+        assert!(willow.streamers.len() > 20, "only {} streamers", willow.streamers.len());
+        let quads = mesh_of(&willow, Some(Kind::Streamer));
+        assert_eq!(quads.indices.len() / 3, quads.positions.len() / 4 * 2);
+        assert!(quads.kinds.iter().all(|k| *k == 2));
+        assert!(rasterise(&grow(&oak(), 9, None), 4).streamers.is_empty());
+    }
+
+    #[test]
+    fn a_tree_fills_a_tall_narrow_envelope() {
+        // The shape Dwarf Fortress gives: a one-tile bole for a few levels and
+        // a wider crown above it. Forking only at the bole's top left the tree
+        // a stub, because those first limbs had nowhere to go.
+        const SIDE: u32 = 9;
+        let levels = (0..15)
+            .map(|i| {
+                let mut foot = Footprint {
+                    width: SIDE,
+                    depth: SIDE,
+                    cells: vec![false; (SIDE * SIDE) as usize],
+                };
+                let r: i32 = if i < 4 { 0 } else { 3 };
+                for z in 0..SIDE as i32 {
+                    for x in 0..SIDE as i32 {
+                        let (dx, dz) = (x - 4, z - 4);
+                        if dx * dx + dz * dz <= r * r {
+                            foot.cells[(z * SIDE as i32 + x) as usize] = true;
+                        }
+                    }
+                }
+                foot
+            })
+            .collect();
+        let envelope = Envelope { levels };
+        let mut params = oak();
+        params.height = 15.0;
+        params.clear_frac = 0.2;
+        for seed in 0..6 {
+            let tree = grow(&params, seed, Some(&envelope));
+            assert!(tree.height > 9.0, "seed {seed} grew only {} of 15 levels", tree.height);
+        }
+    }
+
+    #[test]
     fn meshing_culls_interior_faces() {
         // A solid 4x4x4 block has 6 sides; greedy merging should give 12
         // triangles, not 6 per voxel face.
@@ -178,7 +224,7 @@ mod tests {
                 }
             }
         }
-        let tree = VoxelTree { voxels, voxels_per_tile: 1 };
+        let tree = VoxelTree { voxels, streamers: Vec::new(), voxels_per_tile: 1 };
         assert_eq!(mesh(&tree).indices.len() / 3, 12);
     }
 }

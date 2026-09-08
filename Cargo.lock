@@ -2407,6 +2407,7 @@ dependencies = [
  "anyhow",
  "dfhack-remote",
  "dwarf-eye-art",
+ "dwarf-eye-trees",
  "image",
 ]
 

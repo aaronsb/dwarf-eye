@@ -17,6 +17,7 @@ fn main() -> Result<()> {
     let fetched = df.fetch(bounds, true)?;
     println!("fetched {} blocks", fetched.len());
 
+    let origin = df.origin();
     let opts = MeshOptions { z_ceiling: view.2 + 16, show_hidden: true };
     let mut total = Budget::default();
     let mut canopy = CanopyBudget::default();
@@ -34,7 +35,7 @@ fn main() -> Result<()> {
         total.liquids += budget.liquids;
         total.other += budget.other;
         if let Some(lib) = library.as_mut() {
-            let _ = forest.build_budgeted(&df.world, chunk, opts, lib, &mut canopy);
+            let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, &mut canopy);
         }
         chunks += 1;
     }

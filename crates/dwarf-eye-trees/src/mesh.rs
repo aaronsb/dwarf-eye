@@ -1,9 +1,12 @@
 //! Greedy meshing: cull the faces between neighbours, then merge the survivors
 //! into the largest rectangles of one colour and kind.
 
+use crate::grow::Streamer;
 use crate::math::{IVec3, ivec3};
 use crate::params::Rgb;
 use crate::raster::{Kind, VoxelTree};
+use crate::rng::hash_unit;
+use crate::texture::{DEFAULT_TEXELS, STREAMER_CELLS, STREAMER_TIP, streamer_uv};
 
 #[derive(Clone, Debug, Default)]
 pub struct TreeMesh {
@@ -16,7 +19,7 @@ pub struct TreeMesh {
     /// repeats. Needs a Repeat sampler.
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
-    /// Per vertex: 0 bark, 1 leaf.
+    /// Per vertex: 0 bark, 1 leaf, 2 streamer.
     pub kinds: Vec<u8>,
 }
 
@@ -24,8 +27,10 @@ pub struct TreeMesh {
 pub struct Stats {
     pub bark_voxels: usize,
     pub leaf_voxels: usize,
+    pub streamers: usize,
     pub bark_triangles: usize,
     pub leaf_triangles: usize,
+    pub streamer_triangles: usize,
 }
 
 impl Stats {
@@ -34,7 +39,7 @@ impl Stats {
     }
 
     pub fn triangles(&self) -> usize {
-        self.bark_triangles + self.leaf_triangles
+        self.bark_triangles + self.leaf_triangles + self.streamer_triangles
     }
 }
 
@@ -45,8 +50,10 @@ pub fn stats(tree: &VoxelTree) -> Stats {
     Stats {
         bark_voxels: counts.bark,
         leaf_voxels: counts.leaf,
+        streamers: tree.streamers.len(),
         bark_triangles: mesh_of(tree, Some(Kind::Bark)).indices.len() / 3,
         leaf_triangles: mesh_of(tree, Some(Kind::Leaf)).indices.len() / 3,
+        streamer_triangles: mesh_of(tree, Some(Kind::Streamer)).indices.len() / 3,
     }
 }
 
@@ -60,6 +67,14 @@ pub fn mesh(tree: &VoxelTree) -> TreeMesh {
 /// Positions are in tiles, with the trunk's base at the origin.
 pub fn mesh_of(tree: &VoxelTree, only: Option<Kind>) -> TreeMesh {
     let mut out = TreeMesh::default();
+    if only.is_none_or(|k| k == Kind::Streamer) {
+        for strand in &tree.streamers {
+            emit_streamer(&mut out, strand, tree.voxels_per_tile);
+        }
+    }
+    if only == Some(Kind::Streamer) {
+        return out;
+    }
     let Some((lo, hi)) = tree.bounds() else { return out };
 
     let dims = [hi.x - lo.x + 3, hi.y - lo.y + 3, hi.z - lo.z + 3];
@@ -72,7 +87,7 @@ pub fn mesh_of(tree: &VoxelTree, only: Option<Kind>) -> TreeMesh {
         if only.is_some_and(|k| k != voxel.kind) {
             continue;
         }
-        let kind = if voxel.kind == Kind::Bark { 0 } else { 1 };
+        let kind = if voxel.kind == Kind::Bark { 0u8 } else { 1 };
         grid[index(at.x - lo.x + 1, at.y - lo.y + 1, at.z - lo.z + 1)] = Some((kind, voxel.color));
     }
 
@@ -153,6 +168,54 @@ pub fn mesh_of(tree: &VoxelTree, only: Option<Kind>) -> TreeMesh {
     }
 
     out
+}
+
+/// One hanging strand: a chain of quads a voxel square, each hung off the one
+/// above so the strand can bend, all in one seeded vertical plane. The material
+/// draws them double sided, so a strand reads from any angle for two triangles
+/// a segment.
+fn emit_streamer(out: &mut TreeMesh, strand: &Streamer, voxels_per_tile: u32) {
+    let step = 1.0 / voxels_per_tile.max(1) as f32;
+    let count = (strand.length / step).round().max(1.0) as u32;
+    // Across the strand, in its plane; the normal is the other way.
+    let across = [strand.yaw.cos(), 0.0, strand.yaw.sin()];
+    let normal = [strand.yaw.sin(), 0.0, -strand.yaw.cos()];
+    let color = strand.color.to_linear();
+    let half = step * 0.5;
+
+    let mut top = [strand.anchor.x, strand.anchor.y, strand.anchor.z];
+    for n in 0..count {
+        // A seeded sideways wander, inside the plane, so a curtain is not a
+        // rank of plumb lines.
+        let sway = (hash_unit(n as i32, 0, 0, strand.seed) - 0.5) * 2.0 * strand.drift;
+        let bottom = [
+            top[0] + across[0] * sway,
+            top[1] - step,
+            top[2] + across[2] * sway,
+        ];
+        let cell = if n + 1 == count {
+            STREAMER_TIP
+        } else {
+            (hash_unit(n as i32, 1, 0, strand.seed) * (STREAMER_CELLS - 1) as f32) as u32
+        };
+        let [[u0, v0], [u1, v1]] = streamer_uv(cell, DEFAULT_TEXELS);
+        let edge = |p: [f32; 3], side: f32| {
+            [p[0] + across[0] * half * side, p[1], p[2] + across[2] * half * side]
+        };
+
+        let start = out.positions.len() as u32;
+        let quad = [edge(top, -1.0), edge(top, 1.0), edge(bottom, 1.0), edge(bottom, -1.0)];
+        let uvs = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+        for k in 0..4 {
+            out.positions.push(quad[k]);
+            out.normals.push(normal);
+            out.colors.push(color);
+            out.uvs.push(uvs[k]);
+            out.kinds.push(2);
+        }
+        out.indices.extend([start, start + 1, start + 2, start, start + 2, start + 3]);
+        top = bottom;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

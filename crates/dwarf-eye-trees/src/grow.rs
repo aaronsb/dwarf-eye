@@ -2,7 +2,7 @@
 //! conifers, and leaf clusters hung on the outer growth.
 
 use crate::math::{Vec3, vec3};
-use crate::params::{Envelope, Habit, TreeParams, VegetationKind};
+use crate::params::{Envelope, Habit, Rgb, TreeParams, VegetationKind};
 use crate::rng::Rng;
 
 /// One straight length of wood. Limbs are chains of these.
@@ -26,20 +26,45 @@ pub struct LeafCluster {
     pub seed: u64,
 }
 
+/// A strand of hanging foliage. Drawn as a chain of quads one voxel square,
+/// not as voxels: a weeping tree's curtains are far too thin to voxelise, and a
+/// voxel strand costs six faces where a quad costs one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Streamer {
+    /// Where the strand hangs from, in tiles.
+    pub anchor: Vec3,
+    /// Which way the strand's plane faces.
+    pub yaw: f32,
+    /// How far it hangs, in tiles.
+    pub length: f32,
+    /// Sideways wander per segment, in tiles, inside the strand's own plane.
+    pub drift: f32,
+    /// Filled in when the tree is rasterised, from the leaf palette.
+    pub color: Rgb,
+    pub seed: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Skeleton {
     pub segments: Vec<Segment>,
     pub leaves: Vec<LeafCluster>,
+    pub streamers: Vec<Streamer>,
     pub params: TreeParams,
     /// Centre of the foliage, for the shell and underside bias.
     pub crown_center: Vec3,
     pub crown_radius: f32,
+    /// Highest point any foliage reaches, for the dome the crown ends in.
+    pub crown_top: f32,
     /// Height actually reached, in tiles.
     pub height: f32,
 }
 
 /// Distance grown between skeleton segments, in tiles.
 const STEP: f32 = 0.5;
+
+/// How far past an envelope's footprint a limb may reach before it gives up,
+/// in tiles. Half a tile is the edge of the tile the footprint names.
+const SLACK: f32 = 0.5;
 
 struct Grower<'a> {
     params: &'a TreeParams,
@@ -80,16 +105,78 @@ pub fn grow(params: &TreeParams, seed: u64, envelope: Option<&Envelope>) -> Skel
     let mut skeleton = Skeleton {
         segments: g.segments,
         leaves: g.leaves,
+        streamers: Vec::new(),
         params: params.clone(),
         crown_center: Vec3::ZERO,
         crown_radius: 1.0,
+        crown_top: 0.0,
         height: 0.0,
     };
     if envelope.is_none() {
         normalise_height(&mut skeleton, params.height);
     }
     measure(&mut skeleton);
+    // Streamers need the crown measured first: they hang from its edge and its
+    // underside, and how far out a cluster sits decides whether it grows one.
+    hang_streamers(&mut skeleton, &mut rng);
     skeleton
+}
+
+/// Hangs weeping strands off the crown.
+///
+/// Longest and thickest at the crown's outer edge, thinning toward the middle
+/// and the top, with a few sprigs left on the trunk. The crown itself is
+/// untouched: a willow is a normal dense canopy with curtains under it.
+fn hang_streamers(skeleton: &mut Skeleton, rng: &mut Rng) {
+    let density = skeleton.params.streamer_density;
+    if density <= 0.0 || skeleton.leaves.is_empty() {
+        return;
+    }
+    let crown = skeleton.crown_center;
+    let mut streamers = Vec::new();
+    for cluster in &skeleton.leaves {
+        // The underside and the outer edge carry them; the crown's top does not.
+        let under = if cluster.center.y <= crown.y { 1.0 } else { 0.3 };
+        let chance = density * (0.12 + 0.88 * cluster.shell) * under;
+        if !rng.chance(chance) {
+            continue;
+        }
+        // Three voxels at the middle of the crown, a dozen at its rim, taking a
+        // voxel as a quarter tile; one in six hangs half as far again, which is
+        // what puts a few strands almost on the ground.
+        let long = if rng.chance(0.16) { 1.5 } else { 1.0 };
+        let length = (0.75 + 2.25 * cluster.shell) * rng.range(0.75, 1.15) * long;
+        streamers.push(Streamer {
+            anchor: cluster.center - Vec3::Y * cluster.radius * 0.5,
+            yaw: rng.range(0.0, std::f32::consts::TAU),
+            length,
+            drift: rng.range(0.02, 0.09),
+            color: Rgb(0, 0, 0),
+            seed: rng.next_u64(),
+        });
+    }
+
+    // A few sprigs straight off the trunk, as a willow carries.
+    let sprigs = (streamers.len() / 12).clamp(1, 6);
+    let trunk: Vec<&Segment> = skeleton
+        .segments
+        .iter()
+        .filter(|s| s.depth == 0 && s.a.y > crown.y * 0.35)
+        .collect();
+    if !trunk.is_empty() {
+        for _ in 0..sprigs {
+            let at = trunk[(rng.next_u64() % trunk.len() as u64) as usize];
+            streamers.push(Streamer {
+                anchor: at.b,
+                yaw: rng.range(0.0, std::f32::consts::TAU),
+                length: rng.range(0.6, 1.4),
+                drift: rng.range(0.02, 0.07),
+                color: Rgb(0, 0, 0),
+                seed: rng.next_u64(),
+            });
+        }
+    }
+    skeleton.streamers = streamers;
 }
 
 impl Grower<'_> {
@@ -221,13 +308,33 @@ impl Grower<'_> {
         }
     }
 
+    /// A clear bole, then a trunk that carries on up through the crown throwing
+    /// limbs as it rises.
+    ///
+    /// Forking only at the trunk's top makes the whole crown depend on one
+    /// node: inside a tight envelope, if those first limbs cannot spread the
+    /// tree ends as a stub. Tiers give it several chances, and match what a
+    /// real trunk does anyway.
     fn deciduous(&mut self, base_radius: f32, rng: &mut Rng) {
         let p = self.params;
-        let trunk_len = p.height * p.clear_frac;
-        let dir = jitter_up(rng, 0.06);
-        let top = self.limb(Vec3::ZERO, dir, trunk_len, base_radius, 0, rng);
+        let mut node =
+            self.limb(Vec3::ZERO, jitter_up(rng, 0.06), p.height * p.clear_frac, base_radius, 0, rng);
+
+        const TIERS: u8 = 3;
+        // The trunk dies out around two thirds of the way up; above that it is
+        // just another limb.
+        let rise = p.height * (0.66 - p.clear_frac).max(0.12) / TIERS as f32;
         let limb_len = p.height * p.limb_frac;
-        self.fork(top.pos, top.dir, limb_len, top.radius, 1, rng);
+        for tier in 0..TIERS {
+            let t = tier as f32 / TIERS as f32;
+            let mut sub = rng.fork();
+            self.fork(node.pos, node.dir, limb_len * (1.0 - 0.22 * t), node.radius, 1, &mut sub);
+            if tier + 1 == TIERS {
+                break;
+            }
+            node = self.limb(node.pos, node.dir, rise, node.radius, 0, rng);
+        }
+        self.hang_leaves(node.pos, node.dir, rng, 1.0);
     }
 
     fn broad(&mut self, base_radius: f32, rng: &mut Rng) {
@@ -365,10 +472,13 @@ impl Grower<'_> {
             let child_radius = radius * p.thickness_ratio;
             let mut sub = rng.fork();
             let end = self.limb(pos, child_dir, child_len, child_radius, level, &mut sub);
-            if end.grown < child_len * 0.4 {
-                // The envelope cut it short; finish it with a tuft.
-                self.hang_leaves(end.pos, end.dir, &mut sub, 0.8);
+            if end.grown <= 0.0 {
                 continue;
+            }
+            if end.grown < child_len * 0.4 {
+                // The envelope cut it short. Tuft it, but keep branching: a
+                // child heading elsewhere may still have room.
+                self.hang_leaves(end.pos, end.dir, &mut sub, 0.8);
             }
             grown += 1;
             // The outermost two levels carry foliage along the limb as well as
@@ -427,7 +537,7 @@ impl Grower<'_> {
 
             let mut next = pos + next_dir * STEP;
             if let Some(envelope) = self.envelope
-                && !envelope.contains(next)
+                && !envelope.contains_within(next, SLACK)
             {
                 // Bend back toward the open middle of this level.
                 if let Some(centroid) = envelope.centroid_at(pos) {
@@ -435,7 +545,7 @@ impl Grower<'_> {
                     next_dir = (next_dir + inward * 0.8).normalize();
                     next = pos + next_dir * STEP;
                 }
-                if !envelope.contains(next) {
+                if !envelope.contains_within(next, SLACK) {
                     break;
                 }
             }
@@ -502,6 +612,10 @@ fn normalise_height(skeleton: &mut Skeleton, target: f32) {
         l.center = l.center * k;
         l.radius *= k.clamp(0.8, 1.25);
     }
+    for st in &mut skeleton.streamers {
+        st.anchor = st.anchor * k;
+        st.length *= k;
+    }
 }
 
 /// Find the crown and score each cluster's distance out to its shell.
@@ -522,6 +636,10 @@ fn measure(skeleton: &mut Skeleton) {
     }
     skeleton.crown_center = center;
     skeleton.crown_radius = radius;
+    skeleton.crown_top = skeleton
+        .leaves
+        .iter()
+        .fold(f32::MIN, |top, l| top.max(l.center.y + l.radius));
     for l in &mut skeleton.leaves {
         l.shell = (shell_distance(l.center, center, stretch) / radius).clamp(0.0, 1.0);
     }
