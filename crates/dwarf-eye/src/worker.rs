@@ -49,7 +49,7 @@ pub enum Event {
     /// "despawn this one".
     Chunks(Vec<(ChunkKey, MeshData, CanopyMeshes)>),
     /// Coarse terrain beyond the loaded map, sent once the map's surface is known.
-    Horizon(MeshData),
+    Horizon(dwarf_eye_world::horizon::Horizon),
     /// Blocks whose fine chunks reach the ground, where the horizon must yield.
     Coverage(Vec<(i32, i32)>),
     Status(String),
@@ -334,7 +334,7 @@ fn read_weather(map: &rfr::WorldMap) -> Weather {
 
 /// Meshes every loaded chunk and ships the results in batches.
 /// Pulls the region and world maps and stitches the land beyond the loaded map.
-fn build_horizon(df: &mut Session) -> Result<MeshData> {
+fn build_horizon(df: &mut Session) -> Result<dwarf_eye_world::horizon::Horizon> {
     let regions: rfr::RegionMaps = df.client.call_empty(methods::GET_REGION_MAPS_NEW)?;
     let world_map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP)?;
     let transpose = std::env::var("DWARF_EYE_HORIZON_TRANSPOSE").is_ok();

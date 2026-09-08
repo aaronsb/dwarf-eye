@@ -38,6 +38,7 @@
 //!   the mesh stays inside the space the fortress map gave it.
 //! - **Resolution** is `voxels_per_tile`, matched to the rest of the map.
 
+pub mod crown;
 pub mod grow;
 pub mod math;
 pub mod mesh;
@@ -46,6 +47,7 @@ pub mod raster;
 pub mod rng;
 pub mod texture;
 
+pub use crown::{crown, crown_box, crown_triangles};
 pub use grow::{LeafCluster, Segment, Skeleton, Streamer, grow};
 pub use math::{IVec3, Vec3, ivec3, vec3};
 pub use mesh::{Stats, TreeMesh, mesh, mesh_of, stats};

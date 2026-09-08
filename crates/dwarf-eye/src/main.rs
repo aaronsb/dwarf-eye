@@ -28,6 +28,7 @@ use bevy::light::{
     Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, atmosphere::ScatteringMedium,
     light_consts::lux,
 };
+use bevy::light::NotShadowCaster;
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
@@ -450,14 +451,36 @@ fn drain_worker(
                 for entity in &horizon {
                     commands.entity(entity).despawn();
                 }
-                let triangles = data.indices.len() / 3;
-                status.detail = format!("horizon: {triangles} triangles");
+                let (triangles, instances) = (data.triangle_count(), data.instance_count());
+                status.detail = format!("horizon: {triangles} triangles, {instances} crowns");
                 commands.spawn((
-                    Mesh3d(meshes.add(to_bevy_mesh(data))),
+                    Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),
                     MeshMaterial3d(horizon_material.0.clone()),
                     Transform::IDENTITY,
                     Horizon,
                 ));
+                // One mesh per species and detail stage, one entity per tree:
+                // Bevy batches entities that share a mesh and a material, so a
+                // whole forest costs a handful of draw calls. They ride the
+                // horizon material, so the block mask discards any that stand
+                // where fine chunks have since arrived.
+                for batch in data.crowns {
+                    let mesh = meshes.add(to_bevy_mesh(batch.mesh));
+                    for tree in &batch.instances {
+                        commands.spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(horizon_material.0.clone()),
+                            Transform::from_translation(Vec3::from(tree.pos))
+                                .with_rotation(Quat::from_rotation_y(tree.yaw))
+                                .with_scale(Vec3::splat(tree.scale)),
+                            Horizon,
+                            // A tree a thousand tiles off contributes nothing
+                            // to the shadow map but its own cost, four
+                            // cascades over.
+                            NotShadowCaster,
+                        ));
+                    }
+                }
             }
             Event::Coverage(blocks) => {
                 mask.blocks = blocks;
