@@ -1,16 +1,16 @@
 # Level of detail
 
 Status: fine chunks landed (`crates/dwarf-eye-world/src/mesh.rs`); coarse
-horizon landed (`crates/dwarf-eye-world/src/horizon.rs`); near and mid canopy
-bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); mid terrain
-heightfield planned (issue #10); far band from region data in flight (issue
-#31); seam skirt planned (issue #9).
+horizon landed (`crates/dwarf-eye-world/src/horizon.rs`); near, mid and far
+canopy bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); mid
+terrain heightfield planned (issue #10); far band from region data in flight
+(issue #31); seam skirt planned (issue #9).
 
 ## What it does
 
 Draws three tiers of ground: full voxel detail where DF has tiles, nothing yet
 in between, and a coarse heightfield from the region and world maps out to the
-horizon. Crowns are the exception: they already have two bands, because the
+horizon. Crowns are the exception: they already have three bands, because the
 canopy is where the triangles are — about five thousand a chunk, nearly all of
 them alpha-masked leaf voxels.
 
@@ -43,17 +43,22 @@ by projected tile size on screen, not by which source fed it.
 | coarse ring | `GetRegionMapsNew` | 48 tiles | landed |
 | far world | `GetWorldMap`, interpolated | 768 tiles | landed |
 
-Canopy bands, both built from the same growth and spawned together:
+Canopy bands, all built from the same growth and spawned together. The edge is
+where that band's own leaf voxel falls to two pixels (`canopy.rs:Band::edge`);
+the tile figures are Bevy's 45-degree lens into a 720-tall window:
 
-| Band | Voxels per tile | Carries | Meshes per chunk | Material |
-|---|---|---|---|---|
-| near | 4 (`tree.rs:DETAIL`) | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
-| mid | 1 (`canopy.rs:MID_DETAIL`) | trees only | 1 | one opaque leaf material, bark included |
+| Band | Voxels per tile | Ends at | Carries | Meshes per chunk | Material |
+|---|---|---|---|---|---|
+| near | 4 (`tree.rs:DETAIL`) | N, 109 tiles | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
+| mid | 2 (`canopy.rs:MID_DETAIL`) | 2N, 217 tiles | trees and strands | up to 4 | the same four |
+| far | 1 (`canopy.rs:FAR_DETAIL`) | far plane | trees only | 1 | one opaque leaf material, bark included |
 
-`canopy.rs:Band::slot` is what merges the mid band into one mesh: one mesh on
-one material is one entity and one draw call for a chunk's whole crown, and at
-that distance there is no bark grain or leaf hole left to tell apart.
-`canopy.rs:Band::coats` says what each mesh wears.
+The mid band is a half-resolution crown still wearing the cutout, so sun and sky
+keep coming through a canopy well past the first hand-off; only the far band
+trades the holes away. `canopy.rs:Band::slot` is what merges the far band into
+one mesh: one mesh on one material is one entity and one draw call for a chunk's
+whole crown, and at that distance there is no bark grain or leaf hole left to
+tell apart. `canopy.rs:Band::coats` says what each mesh wears.
 
 Fine terrain stays at full detail however far away, out to
 `worker.rs:RETAIN_RADIUS` 40 blocks horizontally. What remains of issue #10 is
@@ -75,19 +80,26 @@ blocks) into a 1190-tall one: a taller window or a longer lens pushes the band
 out, which is the point of measuring in pixels. `DWARF_EYE_LOD_NEAR` overrides
 it, in blocks.
 
+Every later hand-off is the same rule on that band's own leaf voxel, which is
+`DETAIL / detail` times as wide and so stays two pixels that many times further
+out (`canopy.rs:Band::edge`): the mid band's half-tile voxel reaches 2N, 217
+tiles at 720, and the far band runs from there to the camera's far plane.
+
 The bands are a list, not a pair: `canopy.rs:BANDS` orders them nearest first,
 `main.rs:band_edges` gives one handover distance per gap and
 `main.rs:band_ranges` turns those into one `VisibilityRange` per band. A coarser
-stage — a canonical crown per species, a green box — is one more entry in each,
-one more mesh per chunk from the worker, and nothing else.
+stage — a canonical crown per species, a green box — is one more entry in
+`BANDS`, one more mesh per chunk from the worker, and nothing else: the edges
+follow from the detail.
 
 `main.rs:size_bands` recomputes N from the window and the camera's own
 projection, and rewrites the ranges already on the GPU when either changes.
-Bevy does the swapping: each canopy entity carries a `VisibilityRange`, near
-`0..N` and mid `N..far`, sharing the margin `N..N*1.15` so one band dithers into
-the other rather than popping. The ranges measure from the mesh's bounds
-(`use_aabb: true`), since chunk meshes hold world-space vertices at an identity
-transform and would otherwise all sit at the world origin.
+Bevy does the swapping: each canopy entity carries a `VisibilityRange` — near
+`0..N`, mid `N..2N`, far `2N..far` — and each hand-off shares its margin
+`E..E*1.15` so one band dithers into the next rather than popping. The ranges
+measure from the mesh's bounds (`use_aabb: true`), since chunk meshes hold
+world-space vertices at an identity transform and would otherwise all sit at the
+world origin.
 
 Terrain and water carry no `VisibilityRange` at all: they are drawn wherever
 they are retained, and the bands beyond that are the heightfield's job.
@@ -126,17 +138,19 @@ tiles beyond `world.map.block_index`
   ground under it.
 - Retention is horizontal only, so a mid tier has to keep the same rule.
 - A tree is cached per origin **and** per resolution (`canopy.rs:Forest.trees`),
-  and both cuts come off one growth: the skeleton is the expensive half, so
-  rasterising twice costs a fraction of growing twice. Retiring a tree takes
-  both cuts.
-- The worker builds both bands for every chunk it meshes and ships them in one
+  and every cut comes off one growth: the skeleton is the expensive half, so
+  rasterising three times costs a fraction of growing three times. Retiring a
+  tree takes all of its cuts.
+- The worker builds every band for every chunk it meshes and ships them in one
   `Event::Chunks` entry; a chunk arrives whole or not at all.
-- The mid band drops plants, tufts and strands, and its leaves are opaque: a
-  cutout costs a masked pass, a discard in the depth prepass and the overdraw
-  behind every hole, for holes that are under a pixel there.
+- The mid band drops plants and tufts but keeps the strands, which are quads the
+  growth crate has already meshed.
+- Only the far band's leaves are opaque: a cutout costs a masked pass, a discard
+  in the depth prepass and the overdraw behind every hole, which is worth paying
+  while a hole is still about a pixel and not after.
 - A crossfading range is not free: Bevy compiles every mesh that carries one
   with `VISIBILITY_RANGE_DITHER`, which discards, whenever it draws and not
-  only inside the margin. An abrupt range would keep the mid band's opaque
+  only inside the margin. An abrupt range would keep the far band's opaque
   shader opaque, at the cost of popping.
 - `cargo run --release -p dwarf-eye-world --example budget` reports where the
   triangles go, and `--example horizon` reports what DFHack knows beyond the

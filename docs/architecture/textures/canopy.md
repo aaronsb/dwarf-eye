@@ -33,12 +33,14 @@ roughness 0.97, and `diffuse_transmission` from `shadow.rs:leaf_transmission`
 (default 0.1, `DWARF_EYE_LEAF_LIGHT`) so a backlit leaf glows.
 
 A fifth material, `CanopyMaterials::leaf`, carries the same leaf shading with no
-texture and `AlphaMode::Opaque`, back faces culled. It is what the mid canopy
-band wears (`docs/architecture/lod/README.md`): past the band edge a hole in the
-cutout is under a pixel, so the mask buys nothing and costs a masked pass, a
-discard in the depth prepass and the overdraw behind every hole.
-`canopy.rs:Band::coats` is where a band's four meshes are matched to materials,
-and it is the one place that says the mid band wears no cutout.
+texture and `AlphaMode::Opaque`, back faces culled. It is what the far canopy
+band wears (`docs/architecture/lod/README.md`). The near and mid bands both keep
+the cutouts — a half-resolution crown at 2N still shows holes about a pixel
+wide, and they are what lets light through it — and only past the far edge does
+the mask buy nothing while still costing a masked pass, a discard in the depth
+prepass and the overdraw behind every hole. `canopy.rs:Band::coats` is where a
+band's four meshes are matched to materials, and it is the one place that says
+the far band wears no cutout.
 
 ## Invariants and gotchas
 
