@@ -105,6 +105,54 @@ fn main() -> Result<()> {
             println!("  region tile ({rx}, {ry}) surface z {:?}  region elevation x-major {:?} y-major {:?}", surface, elev, elev_t);
         }
     }
+
+    // Rivers and buildings: how many region tiles carry each, across every
+    // region map fetched. River edges with no data read back as a -30000
+    // sentinel rather than being absent, so a live edge is one that isn't.
+    const RIVER_SENTINEL: i32 = -30000;
+    let river_valid = |e: &rfr::RiverEdge| e.min_pos() != RIVER_SENTINEL && e.max_pos() != RIVER_SENTINEL;
+    let (mut river_tiles, mut river_edges, mut buildings, mut towers, mut trenches) = (0, 0, 0, 0, 0);
+    let mut river_samples = Vec::new();
+    let mut building_samples = Vec::new();
+    for map in &regions.region_maps {
+        for (i, tile) in map.tiles.iter().enumerate() {
+            if let Some(river) = tile.river_tiles.as_ref() {
+                let edges: [(&str, &Option<rfr::RiverEdge>); 4] =
+                    [("north", &river.north), ("south", &river.south), ("east", &river.east), ("west", &river.west)];
+                let valid: Vec<_> = edges.into_iter().filter_map(|(name, e)| e.as_ref().filter(|e| river_valid(e)).map(|e| (name, e))).collect();
+                if !valid.is_empty() {
+                    river_tiles += 1;
+                    river_edges += valid.len();
+                    if river_samples.len() < 8 {
+                        for (name, e) in &valid {
+                            river_samples.push(format!(
+                                "  river region ({},{}) tile#{i}: {name} min {} max {} active {} elev {}",
+                                map.map_x(), map.map_y(), e.min_pos(), e.max_pos(), e.active(), e.elevation()
+                            ));
+                        }
+                    }
+                }
+            }
+            for b in &tile.buildings {
+                buildings += 1;
+                towers += b.tower_info.is_some() as i32;
+                trenches += b.trench_info.is_some() as i32;
+                if building_samples.len() < 8 {
+                    building_samples.push(format!(
+                        "  building region ({},{}) tile#{i}: id {} bbox ({},{})-({},{}) type {} tower {} trench {}",
+                        map.map_x(), map.map_y(), b.id(), b.min_x(), b.min_y(), b.max_x(), b.max_y(), b.r#type(),
+                        b.tower_info.is_some(), b.trench_info.is_some()
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "rivers: {river_tiles} region tiles with a live river edge, {river_edges} edges total; buildings: {buildings} ({towers} towers, {trenches} trenches)"
+    );
+    for line in river_samples.iter().chain(building_samples.iter()) {
+        println!("{line}");
+    }
     Ok(())
 }
 
