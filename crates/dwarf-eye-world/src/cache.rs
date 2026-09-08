@@ -11,15 +11,26 @@
 //! after a 4-byte magic. The format is private to this crate, and the magic
 //! carries its version: a file written by an older layout fails to read and is
 //! deleted.
+//!
+//! Alongside them sits `floors`, one line per block column: the level at which
+//! that column turned to unrevealed rock, so a later session knows how deep to
+//! ask rather than rediscovering it. It carries its own version line and is
+//! ignored outright if that does not match, and a build that knows nothing of
+//! it simply leaves it alone.
 
 use crate::palette::Solid;
 use crate::world::{Chunk, TILES_PER_BLOCK, Voxel};
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"DEC2";
 const VOXEL_BYTES: usize = 19;
+
+/// Name and version of the column-floor sidecar.
+const FLOORS: &str = "floors";
+const FLOORS_VERSION: &str = "def1";
 
 fn solid_to_u8(s: Solid) -> u8 {
     match s {
@@ -104,6 +115,52 @@ impl Cache {
         let _ = fs::remove_file(self.path(key));
     }
 
+    /// How many chunk files the cache holds, and what they weigh.
+    pub fn size(&self) -> (usize, u64) {
+        let Ok(entries) = fs::read_dir(&self.dir) else { return (0, 0) };
+        entries
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("chunk"))
+            .filter_map(|e| e.metadata().ok())
+            .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
+    }
+
+    /// Where each block column stopped being worth asking about, as an
+    /// absolute block column and level.
+    ///
+    /// A file from another version is not an error, just nothing known: the
+    /// floors are rediscovered by the next few passes.
+    pub fn load_floors(&self) -> HashMap<(i32, i32), i32> {
+        let mut floors = HashMap::new();
+        let Ok(text) = fs::read_to_string(self.dir.join(FLOORS)) else { return floors };
+        let mut lines = text.lines();
+        if lines.next() != Some(FLOORS_VERSION) {
+            return floors;
+        }
+        for line in lines {
+            let n: Vec<i32> = line.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            if n.len() == 3 {
+                floors.insert((n[0], n[1]), n[2]);
+            }
+        }
+        floors
+    }
+
+    pub fn store_floors(&self, floors: &HashMap<(i32, i32), i32>) {
+        let mut text = String::from(FLOORS_VERSION);
+        // Sorted, so the file is the same file when nothing has changed.
+        let mut rows: Vec<_> = floors.iter().collect();
+        rows.sort();
+        for ((bx, by), z) in rows {
+            text.push_str(&format!("\n{bx} {by} {z}"));
+        }
+        let path = self.dir.join(FLOORS);
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, text).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+
     /// Reads every chunk in the cache, with its absolute key.
     pub fn load_all(&self) -> Result<Vec<((i32, i32, i32), Vec<Voxel>)>> {
         let mut out = Vec::new();
@@ -125,6 +182,34 @@ impl Cache {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> Cache {
+        let dir = std::env::temp_dir().join(format!("dwarf-eye-cache-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Cache { dir }
+    }
+
+    #[test]
+    fn floors_survive_a_round_trip() {
+        let cache = scratch("floors");
+        assert!(cache.load_floors().is_empty(), "nothing written yet");
+        let floors = HashMap::from([((3, -4), 118), ((0, 0), -7)]);
+        cache.store_floors(&floors);
+        assert_eq!(cache.load_floors(), floors);
+    }
+
+    #[test]
+    fn floors_from_another_version_are_not_read() {
+        let cache = scratch("floors-version");
+        fs::write(cache.dir().join(FLOORS), "def0\n1 1 5").unwrap();
+        assert!(cache.load_floors().is_empty(), "a version we do not know is nothing known");
     }
 }
 

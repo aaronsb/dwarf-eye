@@ -1,5 +1,11 @@
 //! Turning a skeleton into voxels: wood along the segments, foliage as ragged
 //! clusters that thin out toward the crown's core and underside.
+//!
+//! Foliage is offered to the volume far more often than it is kept: a crown of
+//! a few thousand clusters proposes millions of candidate cells and settles
+//! tens of thousands of them. So the volume being written is a dense box, where
+//! "is this cell taken?" is one array index, and a candidate is rejected on a
+//! squared distance before it is asked to hash anything.
 
 use std::collections::BTreeMap;
 
@@ -11,6 +17,10 @@ use crate::rng::{hash3, hash_unit};
 /// Voxels per patch of one shade. Bigger than one, so a crown reads as blocks
 /// of colour and coplanar faces can merge.
 const SHADE_PATCH: i32 = 2;
+
+/// The most a cluster's wobble can widen it. `hash_unit` stays under one, so no
+/// leaf is ever kept further out than this multiple of its cluster's radius.
+const WOBBLE_MAX: f32 = 0.72 + 0.55;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -73,14 +83,116 @@ impl VoxelTree {
     }
 }
 
+/// The box a skeleton writes into, laid out so a linear walk of it visits
+/// coordinates in [`IVec3`]'s own order: y, then z, then x. That is what lets
+/// the finished voxels be handed to a `BTreeMap` already sorted.
+struct Grid {
+    lo: IVec3,
+    /// Cells along each axis.
+    span: IVec3,
+    cells: Vec<Option<Voxel>>,
+}
+
+impl Grid {
+    fn new(lo: IVec3, hi: IVec3) -> Self {
+        let span = ivec3(hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1);
+        let n = span.x as usize * span.y as usize * span.z as usize;
+        Grid { lo, span, cells: vec![None; n] }
+    }
+
+    fn index(&self, x: i32, y: i32, z: i32) -> Option<usize> {
+        let (i, j, k) = (x - self.lo.x, y - self.lo.y, z - self.lo.z);
+        if i < 0 || j < 0 || k < 0 || i >= self.span.x || j >= self.span.y || k >= self.span.z {
+            return None;
+        }
+        Some(((j * self.span.z + k) * self.span.x + i) as usize)
+    }
+
+    fn taken(&self, x: i32, y: i32, z: i32) -> bool {
+        self.index(x, y, z).is_some_and(|at| self.cells[at].is_some())
+    }
+
+    /// Writes over whatever is there. Wood does that: a later limb crossing an
+    /// earlier one takes the cell.
+    fn set(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) {
+        if let Some(at) = self.index(x, y, z) {
+            self.cells[at] = Some(voxel);
+        }
+    }
+
+    /// Every occupied cell with its coordinate, in ascending [`IVec3`] order.
+    fn drain(self) -> Vec<(IVec3, Voxel)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for j in 0..self.span.y {
+            for k in 0..self.span.z {
+                for i in 0..self.span.x {
+                    if let Some(voxel) = self.cells[at] {
+                        out.push((ivec3(self.lo.x + i, self.lo.y + j, self.lo.z + k), voxel));
+                    }
+                    at += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The box every ball and every cluster of a skeleton can reach, in voxels.
+///
+/// Two voxels of slack on each side covers the rounding the fill loops do: they
+/// centre on a rounded coordinate and reach a ceiled radius from it.
+fn extent(skeleton: &Skeleton, scale: f32) -> Option<(IVec3, IVec3)> {
+    const SLACK: f32 = 2.0;
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    let mut any = false;
+    let mut widen = |p: Vec3, r: f32| {
+        any = true;
+        lo.x = lo.x.min(p.x - r);
+        lo.y = lo.y.min(p.y - r);
+        lo.z = lo.z.min(p.z - r);
+        hi.x = hi.x.max(p.x + r);
+        hi.y = hi.y.max(p.y + r);
+        hi.z = hi.z.max(p.z + r);
+    };
+
+    for segment in &skeleton.segments {
+        // The widest ball the sweep draws: the radius is interpolated and then
+        // clamped, and both are monotone, so the end radii bound it.
+        let wide = segment.radius_a.max(segment.radius_b) * scale;
+        let r = if segment.depth == 0 { wide.max(0.55) } else { wide.clamp(0.5, 1.05) };
+        widen(segment.a * scale, r + SLACK);
+        widen(segment.b * scale, r + SLACK);
+    }
+    for cluster in &skeleton.leaves {
+        let r = (cluster.radius * scale).max(0.45);
+        widen(cluster.center * scale, r + 1.0 + SLACK);
+    }
+    if !any {
+        return None;
+    }
+    Some((
+        ivec3(lo.x.floor() as i32, lo.y.floor() as i32, lo.z.floor() as i32),
+        ivec3(hi.x.ceil() as i32, hi.y.ceil() as i32, hi.z.ceil() as i32),
+    ))
+}
+
 /// Voxelise a skeleton at `voxels_per_tile` resolution.
 ///
 /// Wood is drawn first and foliage never overwrites it, so limbs stay readable
 /// through the canopy.
 pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
     let scale = voxels_per_tile.max(1) as f32;
-    let mut voxels: BTreeMap<IVec3, Voxel> = BTreeMap::new();
     let palette = &skeleton.params.palette;
+    let Some((lo, hi)) = extent(skeleton, scale) else {
+        return VoxelTree {
+            voxels: BTreeMap::new(),
+            streamers: streamers(skeleton, scale),
+            voxels_per_tile: voxels_per_tile.max(1),
+        };
+    };
+    let mut grid = Grid::new(lo, hi);
 
     for segment in &skeleton.segments {
         let a = segment.a * scale;
@@ -93,7 +205,7 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
             let mut r = (segment.radius_a + (segment.radius_b - segment.radius_a) * t) * scale;
             // Past the trunk a limb is a thread: one or two voxels, no more.
             r = if segment.depth == 0 { r.max(0.55) } else { r.clamp(0.5, 1.05) };
-            fill_ball(&mut voxels, p, r, |v| Voxel {
+            fill_ball(&mut grid, p, r, |v| Voxel {
                 kind: Kind::Bark,
                 color: pick(
                     &palette.bark,
@@ -126,17 +238,36 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
         let cx = center.x.round() as i32;
         let cy = center.y.round() as i32;
         let cz = center.z.round() as i32;
+        // No wobble reaches past this, so a candidate beyond it is dropped
+        // before it costs a hash or a square root.
+        let reach = (radius * WOBBLE_MAX).powi(2);
         for z in (cz - ri)..=(cz + ri) {
+            let dz = z as f32 - center.z;
+            let flat = reach - dz * dz;
+            if flat < 0.0 {
+                continue;
+            }
             for y in (cy - ri)..=(cy + ri) {
-                for x in (cx - ri)..=(cx + ri) {
-                    let key = ivec3(x, y, z);
-                    if voxels.contains_key(&key) {
+                let dy = y as f32 - center.y;
+                let left = flat - dy * dy;
+                if left < 0.0 {
+                    continue;
+                }
+                // The row's own span, widened by a voxel so the exact test
+                // inside is still what decides.
+                let half = left.sqrt() + 1.0;
+                let x0 = ((center.x - half).floor() as i32).max(cx - ri);
+                let x1 = ((center.x + half).ceil() as i32).min(cx + ri);
+                for x in x0..=x1 {
+                    let p = Vec3 { x: x as f32, y: y as f32, z: z as f32 };
+                    let away = p - center;
+                    let d2 = away.dot(away);
+                    if d2 > reach || grid.taken(x, y, z) {
                         continue;
                     }
-                    let p = Vec3 { x: x as f32, y: y as f32, z: z as f32 };
                     // A wobbly edge, so clusters read as foliage not spheres.
                     let wobble = 0.72 + hash_unit(x, y, z, cluster.seed ^ 0x51E1) * 0.55;
-                    let d = (p - center).length();
+                    let d = d2.sqrt();
                     if d > radius * wobble {
                         continue;
                     }
@@ -159,21 +290,38 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
                     // reads as foliage in patches rather than static, and it
                     // lets the mesher merge runs of one colour instead of
                     // breaking every face apart.
-                    let patch = ivec3(x.div_euclid(SHADE_PATCH), y.div_euclid(SHADE_PATCH), z.div_euclid(SHADE_PATCH));
+                    let patch = ivec3(
+                        x.div_euclid(SHADE_PATCH),
+                        y.div_euclid(SHADE_PATCH),
+                        z.div_euclid(SHADE_PATCH),
+                    );
                     let mut color = pick(&palette.leaf, patch, 0x2C71);
                     // The outermost leaves catch the light.
                     let lit = cluster.shell * 0.6 + shell * 0.4;
-                    if lit > 0.6 && hash_unit(patch.x, patch.y, patch.z, 0x77A3) < (lit - 0.6) * 2.2 {
+                    if lit > 0.6 && hash_unit(patch.x, patch.y, patch.z, 0x77A3) < (lit - 0.6) * 2.2
+                    {
                         color = color.lerp(palette.tip, 0.85);
                     }
-                    voxels.insert(key, Voxel { kind: Kind::Leaf, color });
+                    grid.set(x, y, z, Voxel { kind: Kind::Leaf, color });
                 }
             }
         }
     }
 
-    // Streamers are geometry, not voxels; all they need here is a leaf colour.
-    let streamers = skeleton
+    // The grid walks in key order, so the map is bulk-built rather than grown
+    // one insertion at a time.
+    let voxels = BTreeMap::from_iter(grid.drain());
+    VoxelTree {
+        voxels,
+        streamers: streamers(skeleton, scale),
+        voxels_per_tile: voxels_per_tile.max(1),
+    }
+}
+
+/// Streamers are geometry, not voxels; all they need here is a leaf colour.
+fn streamers(skeleton: &Skeleton, scale: f32) -> Vec<Streamer> {
+    let palette = &skeleton.params.palette;
+    skeleton
         .streamers
         .iter()
         .map(|s| {
@@ -188,17 +336,10 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
             }
             Streamer { color, ..*s }
         })
-        .collect();
-
-    VoxelTree { voxels, streamers, voxels_per_tile: voxels_per_tile.max(1) }
+        .collect()
 }
 
-fn fill_ball(
-    voxels: &mut BTreeMap<IVec3, Voxel>,
-    center: Vec3,
-    radius: f32,
-    make: impl Fn(IVec3) -> Voxel,
-) {
+fn fill_ball(grid: &mut Grid, center: Vec3, radius: f32, make: impl Fn(IVec3) -> Voxel) {
     let ri = radius.ceil() as i32;
     let cx = center.x.round() as i32;
     let cy = center.y.round() as i32;
@@ -208,7 +349,7 @@ fn fill_ball(
             for x in (cx - ri)..=(cx + ri) {
                 let d = Vec3 { x: x as f32, y: y as f32, z: z as f32 } - center;
                 if d.length() <= radius {
-                    voxels.insert(ivec3(x, y, z), make(ivec3(x, y, z)));
+                    grid.set(x, y, z, make(ivec3(x, y, z)));
                 }
             }
         }
@@ -223,4 +364,48 @@ fn pick(shades: &[Rgb], at: IVec3, salt: u64) -> Rgb {
     }
     let h = hash3(at.x, at.y, at.z, salt);
     shades[(h % shades.len() as u64) as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::{Preset, TreeParams};
+
+    /// What each preset rasterises to, pinned so that a faster rasteriser has
+    /// to be the same rasteriser. These came off the map-and-tree-walk
+    /// implementation the dense grid replaced.
+    const PINNED: [(Preset, usize, u64); 11] = [
+        (Preset::Oak, 43873, 0x9b2f234d2de46d7f),
+        (Preset::Birch, 12072, 0x3c9e9ae7252e2889),
+        (Preset::Pine, 17262, 0xf81518a98dedcf1a),
+        (Preset::Spruce, 24741, 0xc5b0f59e979e8826),
+        (Preset::Willow, 29834, 0xded0713dfc5428f8),
+        (Preset::Bush, 9867, 0xdd92f7e2ca5fadf9),
+        (Preset::Shrub, 1261, 0xbde1fd554357ce2e),
+        (Preset::Sapling, 117, 0xdc6115b79ec6be74),
+        (Preset::TallGrass, 67, 0x530a6f2ec6adbe5c),
+        (Preset::DeadTree, 1544, 0x637f2efcd28c1172),
+        (Preset::MushroomTree, 13361, 0x1391c392a0b3750e),
+    ];
+
+    fn checksum(tree: &VoxelTree) -> u64 {
+        let mut h: u64 = 0;
+        for (at, voxel) in &tree.voxels {
+            h = h.wrapping_mul(0x100000001B3)
+                ^ hash3(at.x, at.y, at.z, voxel.color.0 as u64)
+                ^ (voxel.color.1 as u64) << 8
+                ^ (voxel.color.2 as u64) << 16
+                ^ (voxel.kind as u64) << 32;
+        }
+        h
+    }
+
+    #[test]
+    fn every_preset_rasterises_to_what_it_always_did() {
+        for (preset, count, sum) in PINNED {
+            let tree = rasterise(&crate::grow(&TreeParams::preset(preset), 11, None), 4);
+            assert_eq!(tree.voxels.len(), count, "{preset:?} voxel count");
+            assert_eq!(checksum(&tree), sum, "{preset:?} voxels");
+        }
+    }
 }
