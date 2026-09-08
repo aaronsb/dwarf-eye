@@ -14,6 +14,8 @@ functions:
 - ramp corner heights, the 47 sprite names and the skirt's texture walk
   (`ramp.rs`), including the cross-check that walk mode reads the same
   fractions the mesher draws;
+- water corner heights and which faces survive, on synthetic 3x3 tile grids
+  (`water.rs`);
 - walk classification, bearings, the ground square and the heading's run,
   weighting, decay and turn (`walk.rs`);
 - tree growth and rasterisation pinned by voxel counts and checksums, envelope

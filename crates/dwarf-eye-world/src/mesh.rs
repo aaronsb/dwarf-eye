@@ -21,6 +21,10 @@ pub struct MeshData {
     pub colors: Vec<[f32; 4]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// Water surfaces, which want a translucent material of their own. Carried
+    /// here so a chunk still travels as one value; the renderer splits it off
+    /// before uploading (`main.rs:upload_chunks`).
+    pub water: Option<Box<MeshData>>,
 }
 
 impl Default for MeshData {
@@ -31,6 +35,7 @@ impl Default for MeshData {
             colors: Vec::new(),
             uvs: Vec::new(),
             indices: Vec::new(),
+            water: None,
         }
     }
 }
@@ -42,6 +47,30 @@ impl MeshData {
 
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Lifts the water surfaces out, leaving the terrain behind.
+    pub fn take_water(&mut self) -> MeshData {
+        self.water.take().map(|w| *w).unwrap_or_default()
+    }
+
+    /// A quad whose corners each carry their own colour, for a surface that
+    /// shades across a tile rather than in one step.
+    pub fn push_quad_colors(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        normal: [f32; 3],
+        colors: [[f32; 4]; 4],
+    ) {
+        let base = self.positions.len() as u32;
+        for (c, color) in corners.into_iter().zip(colors) {
+            self.positions.push(c);
+            self.normals.push(normal);
+            self.colors.push(color);
+            self.uvs.push(dwarf_eye_art::atlas::WHITE_UV);
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
     /// Appends a quad wound counter-clockwise when seen from `normal`.
@@ -150,7 +179,7 @@ struct Faces {
 
 /// Bakes directional lighting into vertex colour so a single unlit-ish material
 /// still reads as a lit scene.
-fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
+pub(crate) fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
     [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
 }
 
@@ -181,7 +210,7 @@ fn jitter(x: i32, y: i32, z: i32) -> f32 {
     0.94 + (h & 0xFFF) as f32 / 4095.0 * 0.12
 }
 
-fn to_linear(rgb: Rgb, alpha: f32) -> [f32; 4] {
+pub(crate) fn to_linear(rgb: Rgb, alpha: f32) -> [f32; 4] {
     // sRGB -> linear, so colours survive Bevy's tonemapping unmuddied.
     let f = |c: u8| {
         let c = c as f32 / 255.0;
@@ -477,20 +506,25 @@ pub fn build_chunk_budgeted(
             }
             let before = mesh.indices.len();
 
-            // Liquids sit inside the cell at a height set by their fill level.
-            let liquid = if voxel.magma > 0 {
-                Some((voxel.magma, to_linear([255, 90, 20], 0.9)))
-            } else if voxel.water > 0 {
-                Some((voxel.water, to_linear([50, 105, 190], 0.65)))
-            } else {
-                None
-            };
-            if let Some((level, tint)) = liquid {
-                let h = (level as f32 / 7.0).clamp(0.15, 1.0) * Z_SCALE;
+            // Magma sits inside the cell at a height set by its fill level and
+            // stays opaque. Water is a surface, meshed apart from here.
+            if voxel.magma > 0 {
+                let h = (voxel.magma as f32 / 7.0).clamp(0.15, 1.0) * Z_SCALE;
+                let tint = to_linear([255, 90, 20], 1.0);
                 mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + h, fz + 1.0], tint, Faces::default());
             }
             tally(&mesh, before, &mut budget.liquids);
         }
+    }
+
+    // Water is a sheet across tiles rather than a box inside one, and it is
+    // meshed whatever else a tile is drawing: a pool's rim tiles are ramps, and
+    // the sprite paths above have already moved on from them.
+    let mut water = MeshData::default();
+    crate::water::build_chunk(world, chunk, opts, &mut water);
+    budget.liquids += water.triangle_count();
+    if !water.is_empty() {
+        mesh.water = Some(Box::new(water));
     }
 
     mesh
