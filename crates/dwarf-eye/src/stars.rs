@@ -1,6 +1,6 @@
 //! A night sky that turns with Dwarf Fortress's clock.
 //!
-//! The stars are one mesh of small emissive quads on a far sphere, spun by a
+//! The stars are one mesh of small unlit quads on a far sphere, spun by a
 //! parent transform and faded by the sun's elevation. Drawing them as geometry
 //! rather than into the sky texture keeps them independent of the atmosphere.
 
@@ -10,12 +10,13 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 
-/// How far out the stars sit. Beyond the terrain, and inside the camera's
-/// default 1000-unit far plane — past that they are simply clipped away.
-const SPHERE_RADIUS: f32 = 620.0;
+/// How far out the stars sit: beyond the horizon mesh, which reaches some nine
+/// thousand tiles, and well inside the camera's 40000-unit far plane. Nearer
+/// than the terrain they would show through distant hills.
+const SPHERE_RADIUS: f32 = 20000.0;
 const STAR_COUNT: usize = 1800;
 /// Angular size on that sphere, in world units.
-const STAR_SIZE: f32 = 0.42;
+const STAR_SIZE: f32 = 13.6;
 
 /// The axis the sky turns about, tilted off vertical so stars arc rather than
 /// spin flat overhead.
@@ -43,9 +44,12 @@ pub fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    // Unlit takes its colour from base_color alone — emissive belongs to the
+    // lit path — and the mesh's vertex colours carry each star's brightness.
+    // Being unlit also keeps them clear of the exposure, so they hold steady
+    // while the scene's own stop opens at night.
     let material = materials.add(StandardMaterial {
-        base_color: Color::BLACK,
-        emissive: LinearRgba::BLACK,
+        base_color: Color::srgba(1.0, 1.0, 1.0, 0.0),
         unlit: true,
         alpha_mode: AlphaMode::Blend,
         ..default()
@@ -108,7 +112,9 @@ fn build_star_mesh() -> Mesh {
             colors.push(color);
             uvs.push([u, v]);
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        // Wound so the face the viewer sees is the front one: the quads look
+        // inward from the sphere, and back-face culling eats the other order.
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
 
     let mut mesh = Mesh::new(
@@ -144,7 +150,6 @@ pub fn drive(
     let elevation = clock.sun_direction().y;
     let visibility = (-elevation * 6.0).clamp(0.0, 1.0);
     if let Some(mut m) = materials.get_mut(&material.0) {
-        m.emissive = LinearRgba::rgb(visibility, visibility, visibility);
-        m.base_color = Color::srgba(0.0, 0.0, 0.0, visibility);
+        m.base_color = Color::srgba(1.0, 1.0, 1.0, visibility);
     }
 }

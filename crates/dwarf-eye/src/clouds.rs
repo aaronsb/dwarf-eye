@@ -533,7 +533,10 @@ pub fn bake_shadow(
         let u = &mut terrain.extension.uniform;
         u.wind = state.params.wind;
         u.period = WEATHER_PERIOD;
-        u.strength = state.params.tuning.shadow_strength;
+        // Cloud shadows belong to the sun, and the bake stops once it sets. Fade
+        // the last map out with the light rather than leaving it printed on the
+        // ground all night.
+        u.strength = state.params.tuning.shadow_strength * clock.sun_light();
         u.enabled = if weather.is_clear() || bake.baked_for.is_none() { 0.0 } else { 1.0 };
     }
 

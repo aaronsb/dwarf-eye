@@ -80,7 +80,8 @@ fn main() {
                 upload_chunks,
                 handle_input,
                 camera::fly.run_if(walk::flying),
-                sky::drive_sun,
+                sky::drive_lights,
+                sky::drive_exposure,
                 stars::drive,
                 poll_weather,
                 poll_clock,
@@ -233,11 +234,9 @@ fn setup(
             ..default()
         },
         // RAW_SUNLIGHT is pre-scattering, so the exposure has to be raised to
-        // bring the scene back into range.
-        // DWARF_EYE_EV100 overrides it, for finding the right stop.
-        Exposure {
-            ev100: std::env::var("DWARF_EYE_EV100").ok().and_then(|v| v.parse().ok()).unwrap_or(13.0),
-        },
+        // bring the scene back into range. The clock drives it from here on:
+        // day sits where it always did, night opens five stops.
+        Exposure { ev100: sky::ev100_override().unwrap_or(sky::DAY_EV100) },
         Tonemapping::AcesFitted,
         // A dark sky gradient bands badly at 8 bits; dithering breaks up the
         // steps that otherwise read as seams.
@@ -261,6 +260,23 @@ fn setup(
         // A real 32-arcminute disk, so it reads as the sun rather than a glare.
         SunDisk::EARTH,
         Transform::from_xyz(60.0, 120.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
+        sky::Sun,
+    ));
+
+    // The moon: dim, cool, on the far side of the sun's arc, and shadowless.
+    // A second set of cascades would cost a whole shadow pass for light the
+    // scene barely resolves.
+    commands.spawn((
+        DirectionalLight {
+            illuminance: sky::MOON_ILLUMINANCE,
+            color: sky::MOON_COLOUR,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        // The moon's disk is the sun's angular size; only its brightness differs.
+        SunDisk { angular_size: SunDisk::EARTH.angular_size, intensity: sky::MOON_DISK_INTENSITY },
+        Transform::from_xyz(-60.0, 120.0, -40.0).looking_at(Vec3::ZERO, Vec3::Y),
+        sky::Moon,
     ));
 
     let mask = images.add(empty_mask());
@@ -364,7 +380,9 @@ fn drain_worker(
                 *weather = Weather::from_env().unwrap_or(reported);
             }
             Event::Clock { year, tick } => {
-                *clock = Clock { year, tick };
+                // DWARF_EYE_HOUR pins the hour the view is lit at without
+                // moving the game's own clock.
+                *clock = Clock { year, tick }.with_hour_override();
             }
             Event::Atlas { width, height, pixels } => {
                 let handle = images.add(texture::atlas_image(width, height, pixels));
@@ -589,7 +607,9 @@ fn handle_input(
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let step = if shift { sky::TICKS_PER_DAY / 4 } else { sky::TICKS_PER_DAY / 24 };
     let nudge = keys.just_pressed(KeyCode::Period) as i32 - keys.just_pressed(KeyCode::Comma) as i32;
-    if nudge != 0 {
+    // With the hour pinned from the environment the clock resource is the
+    // viewer's own, so stepping it would drag the game somewhere it never was.
+    if nudge != 0 && sky::hour_override().is_none() {
         let target = clock.tick + nudge * step;
         let _ = bridge.tx.send(Command::Run {
             command: "lua".into(),

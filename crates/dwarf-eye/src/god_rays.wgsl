@@ -85,16 +85,33 @@ fn medium(y: f32) -> f32 {
     return rays.density * exp(-max(y - rays.ground, 0.0) * rays.falloff);
 }
 
+// The sky's brightest directional light. Bevy sorts the lights by their shadow
+// flags rather than by entity, so with a moon in the scene index 0 is as likely
+// to be the moon as the sun; the shafts belong to whichever is brighter.
+fn brightest_light() -> u32 {
+    var best = 0u;
+    var best_lum = -1.0;
+    for (var i = 0u; i < lights.n_directional_lights; i = i + 1u) {
+        let c = lights.directional_lights[i].color.rgb;
+        let lum = c.r + c.g + c.b;
+        if lum > best_lum {
+            best_lum = lum;
+            best = i;
+        }
+    }
+    return best;
+}
+
 // Whether the sun's shadow map sees a point. Outside the cascades the map has
 // nothing to say, so the point counts as lit rather than as a black disc.
-fn sun_visibility(p: vec3<f32>, view_z: f32) -> f32 {
-    let light = &lights.directional_lights[0];
-    let cascade_index = get_cascade_index(0u, view_z);
+fn sun_visibility(light_id: u32, p: vec3<f32>, view_z: f32) -> f32 {
+    let light = &lights.directional_lights[light_id];
+    let cascade_index = get_cascade_index(light_id, view_z);
     if cascade_index >= (*light).num_cascades {
         return 1.0;
     }
     let offset = (*light).shadow_depth_bias * (*light).direction_to_light.xyz;
-    let light_local = world_to_directional_light_local(0u, cascade_index, vec4(p + offset, 1.0));
+    let light_local = world_to_directional_light_local(light_id, cascade_index, vec4(p + offset, 1.0));
     if light_local.w == 0.0 {
         return 1.0;
     }
@@ -114,7 +131,8 @@ fn sun_transmittance(r: f32, mu: f32) -> vec3<f32> {
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    let light = &lights.directional_lights[0];
+    let light_id = brightest_light();
+    let light = &lights.directional_lights[light_id];
     let sun = (*light).direction_to_light.xyz;
     if rays.strength <= 0.0 || rays.density <= 0.0 || sun.y <= 0.0 {
         return vec4(0.0);
@@ -161,7 +179,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         let sigma = medium(p.y);
         if sigma > 1.0e-7 {
             let step_transmittance = exp(-sigma * dt);
-            let visibility = sun_visibility(p, -dot(p - ro, forward)) * cloud_transmittance(p);
+            let visibility =
+                sun_visibility(light_id, p, -dot(p - ro, forward)) * cloud_transmittance(p);
             // Energy-conserving integration of in-scatter over the step.
             scatter = scatter + transmittance * visibility * (1.0 - step_transmittance);
             transmittance = transmittance * step_transmittance;
