@@ -251,6 +251,16 @@ struct HorizonStage(usize);
 /// — may begin.
 const SHADOW_DISTANCE: f32 = 150.0;
 
+/// How far the grown stage runs, as a multiple of the canopy's near band.
+///
+/// The projected-size rule would put it at four times that — a one-tile leaf
+/// voxel is two pixels out to four times where a quarter-tile one is — and the
+/// triangle budget will not carry it: a grown far tree is about eight hundred
+/// triangles and the count goes with the square of the reach. Half again is
+/// where a box crown starts reading as a box, which is what this stage exists
+/// to push back.
+const GROWN_REACH: f32 = 1.5;
+
 /// How much of a hand-off the far band's tree stages dither across. Wider than
 /// the canopy's, because the shapes either side differ more: a grown tree into
 /// a handful of boxes wants a long fade, and there is no cutout to pay for.
@@ -265,7 +275,7 @@ const HORIZON_CROSSFADE: f32 = 0.35;
 /// stage runs three times as far, and never stops short of the shadow
 /// cascades, so the one stage that casts no shadow is wholly outside them.
 fn horizon_ranges(near: f32) -> Vec<VisibilityRange> {
-    let edges = [near, (near * 3.0).max(SHADOW_DISTANCE)];
+    let edges = [near * GROWN_REACH, (near * 3.0).max(SHADOW_DISTANCE)];
     let fade = |at: f32| at..at * (1.0 + HORIZON_CROSSFADE);
     (0..=edges.len())
         .map(|stage| VisibilityRange {
@@ -840,8 +850,12 @@ fn drain_worker(
                     .map(|s| format!("{:?} {}k", s, data.stage_triangles(*s) / 1000))
                     .collect();
                 status.detail = format!(
-                    "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances",
-                    per_stage.join(" / ")
+                    "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances; \
+                     fine map {:.3} trees/tile, {:.3} at the edge, {} clearings",
+                    per_stage.join(" / "),
+                    data.fine_density,
+                    data.edge_density,
+                    data.clearings,
                 );
                 commands.spawn((
                     Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),

@@ -42,7 +42,7 @@ use std::collections::HashMap;
 
 use field::{Cell, Field};
 use fine::FineSurface;
-use scatter::{CrownInstance, Patch, STAGES, Stage};
+use scatter::{Clearing, CrownInstance, Patch, STAGES, Stage};
 use skin::Skins;
 use shade::{WATER, jitter, to_linear, top_color};
 use terrace::{FAR, Terrain, smooth_height};
@@ -68,6 +68,12 @@ pub struct Horizon {
     /// Every tree appears once in each stage: which one draws is the camera's
     /// distance to it, decided by the `VisibilityRange` on each entity.
     pub crowns: Vec<CrownBatch>,
+    /// Trees per tile the fine map holds, over the whole window and at its
+    /// edge: the cue the scatter blends away from. Reported, not used.
+    pub fine_density: f32,
+    pub edge_density: f32,
+    /// Site footprints the scatter kept clear of.
+    pub clearings: usize,
 }
 
 impl Horizon {
@@ -302,7 +308,9 @@ pub fn build(
     // building drawn.
     let bounds = live_window(info, origin);
     let mut crowns: Vec<(Preset, CrownInstance)> = Vec::new();
-    let mut mixes: std::collections::BTreeMap<(i32, i32), (Vec<Preset>, i32)> = Default::default();
+    let mut clearings: Vec<Clearing> = Vec::new();
+    let mut mixes: std::collections::BTreeMap<(i32, i32), (Vec<Preset>, i32, f32)> =
+        Default::default();
     for map in &regions.region_maps {
         let (wx, wy) = (map.map_x(), map.map_y());
         for (i, tile) in map.tiles.iter().enumerate() {
@@ -318,22 +326,34 @@ pub fn build(
                 tile.stone_materials.first().and_then(|p| palette.material_color(p)),
             );
             for building in &tile.buildings {
-                if overlaps(features::building_bounds(&window, rx, ry, building), bounds) {
+                let footprint = features::building_bounds(&window, rx, ry, building);
+                // A site keeps a clearing around itself whether or not its own
+                // box is drawn: the live window draws the real thing.
+                clearings.push(Clearing {
+                    x0: footprint.0 as f32,
+                    z0: footprint.1 as f32,
+                    x1: footprint.2 as f32,
+                    z1: footprint.3 as f32,
+                });
+                if overlaps(footprint, bounds) {
                     continue;
                 }
                 features::emit_building(&mut mesh, &terrain, &window, rx, ry, building, stone);
             }
 
-            mixes.insert((rx, ry), (species_mix(palette, tile), tile.vegetation()));
+            mixes.insert(
+                (rx, ry),
+                (species_mix(palette, tile), tile.vegetation(), tile.elevation() as f32),
+            );
         }
     }
 
     // A patch takes a few of its trees from next door, so a biome boundary
     // interleaves rather than switching on a 48-tile line.
-    for (&(rx, ry), (presets, vegetation)) in &mixes {
+    for (&(rx, ry), (presets, vegetation, elevation)) in &mixes {
         let mut neighbours: Vec<Preset> = Vec::new();
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let Some((mix, _)) = mixes.get(&(rx + dx, ry + dy)) else { continue };
+            let Some((mix, _, _)) = mixes.get(&(rx + dx, ry + dy)) else { continue };
             for preset in mix {
                 if !presets.contains(preset) && !neighbours.contains(preset) {
                     neighbours.push(*preset);
@@ -342,15 +362,32 @@ pub fn build(
         }
         neighbours.sort_by_key(|p| p.name());
         scatter::scatter(
-            &Patch { rx, ry, vegetation: *vegetation, presets: presets.clone(), neighbours },
+            &Patch {
+                rx,
+                ry,
+                vegetation: *vegetation,
+                elevation: *elevation,
+                presets: presets.clone(),
+                neighbours,
+            },
             &terrain,
             &window,
+            &clearings,
             &mut crowns,
         );
     }
 
     emit_world_grid(&mut mesh, &window, world_map, bias, &fine);
-    Horizon { mesh, crowns: batch_crowns(crowns) }
+    Horizon {
+        mesh,
+        crowns: batch_crowns(crowns),
+        fine_density: fine.mean_density(),
+        edge_density: fine
+            .nearby_density(window.centre.0, window.centre.1, scatter::BLEND_BLOCKS)
+            .map(|(d, _)| d)
+            .unwrap_or(0.0),
+        clearings: clearings.len(),
+    }
 }
 
 /// The species a region tile names, in the order DF listed them, deduplicated.
@@ -641,11 +678,13 @@ mod tests {
                 rx: 5,
                 ry: -3,
                 vegetation,
+                elevation: 120.0,
                 presets: vec![Preset::Oak, Preset::Birch],
                 neighbours: vec![Preset::Willow],
             },
             &terrain,
             &window,
+            &[],
             &mut out,
         );
         out
@@ -676,6 +715,25 @@ mod tests {
             assert_eq!(tree.1, dense[i].1, "instance {i} moved");
             assert_eq!(tree.0, dense[i].0, "instance {i} changed species");
         }
+    }
+
+    /// The first ring of coarse cells beyond a treeless window carries no
+    /// crowns at all, whatever the survey says.
+    #[test]
+    fn a_treeless_window_edge_leaves_the_first_ring_bare() {
+        // Region tile (5, -3) starts at tile (240, -144). Fine ground right
+        // beside it, with no trees on it.
+        let columns: Vec<((i32, i32), i32)> =
+            (-12..12).flat_map(|by| (11..16).map(move |bx| ((bx, by), 40))).collect();
+        let bare: Vec<((i32, i32), usize)> = columns.iter().map(|(k, _)| (*k, 0)).collect();
+        let fine = FineSurface::from_columns(&columns).with_trees(&bare);
+        assert!(!placed(90, &FineSurface::default()).is_empty());
+        assert!(placed(90, &fine).is_empty(), "trees grew beside a bare window");
+
+        // The same window with a forest on it fills the ring again.
+        let dense: Vec<((i32, i32), usize)> = columns.iter().map(|(k, _)| (*k, 24)).collect();
+        let wooded = FineSurface::from_columns(&columns).with_trees(&dense);
+        assert!(!placed(90, &wooded).is_empty(), "a wooded window edge grew nothing");
     }
 
     /// Crowns give way to the fine map exactly where the block mask does.
