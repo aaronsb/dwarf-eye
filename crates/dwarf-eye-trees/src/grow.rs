@@ -2,7 +2,7 @@
 //! conifers, and leaf clusters hung on the outer growth.
 
 use crate::math::{Vec3, vec3};
-use crate::params::{Envelope, Habit, TreeParams, VegetationKind};
+use crate::params::{Envelope, Habit, Rgb, TreeParams, VegetationKind};
 use crate::rng::Rng;
 
 /// One straight length of wood. Limbs are chains of these.
@@ -26,10 +26,29 @@ pub struct LeafCluster {
     pub seed: u64,
 }
 
+/// A strand of hanging foliage. Drawn as a chain of quads one voxel square,
+/// not as voxels: a weeping tree's curtains are far too thin to voxelise, and a
+/// voxel strand costs six faces where a quad costs one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Streamer {
+    /// Where the strand hangs from, in tiles.
+    pub anchor: Vec3,
+    /// Which way the strand's plane faces.
+    pub yaw: f32,
+    /// How far it hangs, in tiles.
+    pub length: f32,
+    /// Sideways wander per segment, in tiles, inside the strand's own plane.
+    pub drift: f32,
+    /// Filled in when the tree is rasterised, from the leaf palette.
+    pub color: Rgb,
+    pub seed: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Skeleton {
     pub segments: Vec<Segment>,
     pub leaves: Vec<LeafCluster>,
+    pub streamers: Vec<Streamer>,
     pub params: TreeParams,
     /// Centre of the foliage, for the shell and underside bias.
     pub crown_center: Vec3,
@@ -80,6 +99,7 @@ pub fn grow(params: &TreeParams, seed: u64, envelope: Option<&Envelope>) -> Skel
     let mut skeleton = Skeleton {
         segments: g.segments,
         leaves: g.leaves,
+        streamers: Vec::new(),
         params: params.clone(),
         crown_center: Vec3::ZERO,
         crown_radius: 1.0,
@@ -89,7 +109,67 @@ pub fn grow(params: &TreeParams, seed: u64, envelope: Option<&Envelope>) -> Skel
         normalise_height(&mut skeleton, params.height);
     }
     measure(&mut skeleton);
+    // Streamers need the crown measured first: they hang from its edge and its
+    // underside, and how far out a cluster sits decides whether it grows one.
+    hang_streamers(&mut skeleton, &mut rng);
     skeleton
+}
+
+/// Hangs weeping strands off the crown.
+///
+/// Longest and thickest at the crown's outer edge, thinning toward the middle
+/// and the top, with a few sprigs left on the trunk. The crown itself is
+/// untouched: a willow is a normal dense canopy with curtains under it.
+fn hang_streamers(skeleton: &mut Skeleton, rng: &mut Rng) {
+    let density = skeleton.params.streamer_density;
+    if density <= 0.0 || skeleton.leaves.is_empty() {
+        return;
+    }
+    let crown = skeleton.crown_center;
+    let mut streamers = Vec::new();
+    for cluster in &skeleton.leaves {
+        // The underside and the outer edge carry them; the crown's top does not.
+        let under = if cluster.center.y <= crown.y { 1.0 } else { 0.3 };
+        let chance = density * (0.12 + 0.88 * cluster.shell) * under;
+        if !rng.chance(chance) {
+            continue;
+        }
+        // Three voxels at the middle of the crown, a dozen at its rim, taking a
+        // voxel as a quarter tile; one in six hangs half as far again, which is
+        // what puts a few strands almost on the ground.
+        let long = if rng.chance(0.16) { 1.5 } else { 1.0 };
+        let length = (0.75 + 2.25 * cluster.shell) * rng.range(0.75, 1.15) * long;
+        streamers.push(Streamer {
+            anchor: cluster.center - Vec3::Y * cluster.radius * 0.5,
+            yaw: rng.range(0.0, std::f32::consts::TAU),
+            length,
+            drift: rng.range(0.02, 0.09),
+            color: Rgb(0, 0, 0),
+            seed: rng.next_u64(),
+        });
+    }
+
+    // A few sprigs straight off the trunk, as a willow carries.
+    let sprigs = (streamers.len() / 12).clamp(1, 6);
+    let trunk: Vec<&Segment> = skeleton
+        .segments
+        .iter()
+        .filter(|s| s.depth == 0 && s.a.y > crown.y * 0.35)
+        .collect();
+    if !trunk.is_empty() {
+        for _ in 0..sprigs {
+            let at = trunk[(rng.next_u64() % trunk.len() as u64) as usize];
+            streamers.push(Streamer {
+                anchor: at.b,
+                yaw: rng.range(0.0, std::f32::consts::TAU),
+                length: rng.range(0.6, 1.4),
+                drift: rng.range(0.02, 0.07),
+                color: Rgb(0, 0, 0),
+                seed: rng.next_u64(),
+            });
+        }
+    }
+    skeleton.streamers = streamers;
 }
 
 impl Grower<'_> {
@@ -501,6 +581,10 @@ fn normalise_height(skeleton: &mut Skeleton, target: f32) {
     for l in &mut skeleton.leaves {
         l.center = l.center * k;
         l.radius *= k.clamp(0.8, 1.25);
+    }
+    for st in &mut skeleton.streamers {
+        st.anchor = st.anchor * k;
+        st.length *= k;
     }
 }
 

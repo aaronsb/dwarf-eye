@@ -26,7 +26,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use camera::FlyCamera;
-use dwarf_eye_trees::{Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise, rng::Rng};
+use dwarf_eye_trees::texture::{self, Texels};
+use dwarf_eye_trees::{Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise};
 
 /// Tiles between trunks along a row.
 const SPACING: f32 = 16.0;
@@ -42,7 +43,7 @@ fn main() {
             ..default()
         }))
         .init_resource::<Lab>()
-        .init_resource::<Texels>()
+        .init_resource::<TexelDensity>()
         .init_resource::<Report>()
         .add_systems(Startup, setup)
         .add_systems(Update, (handle_input, rebuild, retexture, update_hud, screenshot))
@@ -86,12 +87,12 @@ fn requested_camera() -> Option<(Vec3, f32, f32)> {
 /// Texels per world tile. Dwarf Fortress's art is 32 to a tile and the main
 /// app draws the ground at that density, so tree surfaces match it by default.
 #[derive(Resource)]
-struct Texels {
+struct TexelDensity {
     per_tile: u32,
     dirty: bool,
 }
 
-impl Default for Texels {
+impl Default for TexelDensity {
     fn default() -> Self {
         let per_tile = std::env::var("DWARF_EYE_TEXELS")
             .ok()
@@ -111,6 +112,8 @@ struct Report(String);
 struct Materials {
     bark: Handle<StandardMaterial>,
     leaves: HashMap<Preset, Handle<StandardMaterial>>,
+    /// Weeping strands, on their own leaflet strip.
+    streamers: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -125,7 +128,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut mediums: ResMut<Assets<ScatteringMedium>>,
-    texels: Res<Texels>,
+    texels: Res<TexelDensity>,
 ) {
     commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::earth(256, 256))));
 
@@ -174,7 +177,8 @@ fn setup(
     ));
 
     let tex = texels.per_tile;
-    let bark_texture = images.add(pixels(bark_texture(tex), tex));
+    let bark_texture = images.add(pixels(texture::bark(tex)));
+    let streamer_texture = images.add(pixels(texture::streamer_strip(tex)));
 
     let foliage = |texture: Handle<Image>| StandardMaterial {
         base_color: Color::WHITE,
@@ -195,11 +199,12 @@ fn setup(
     for preset in Preset::ALL {
         let params = TreeParams::preset(preset);
         let needle = params.habit == Habit::Conifer;
-        let texture = images.add(pixels(leaf_texture(needle, params.cutout_openness, tex), tex));
-        leaves.insert(preset, materials.add(foliage(texture)));
+        let cutout = images.add(pixels(texture::leaf_cutout(needle, params.cutout_openness, tex)));
+        leaves.insert(preset, materials.add(foliage(cutout)));
     }
 
     commands.insert_resource(Materials {
+        streamers: materials.add(foliage(streamer_texture)),
         bark: materials.add(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: Some(bark_texture),
@@ -221,7 +226,7 @@ fn setup(
 fn handle_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut lab: ResMut<Lab>,
-    mut texels: ResMut<Texels>,
+    mut texels: ResMut<TexelDensity>,
 ) {
     if keys.just_pressed(KeyCode::Minus) && texels.per_tile > 4 {
         texels.per_tile /= 2;
@@ -309,6 +314,7 @@ fn rebuild(
         for (kind, material) in [
             (Kind::Bark, materials.bark.clone()),
             (Kind::Leaf, materials.leaves[&preset].clone()),
+            (Kind::Streamer, materials.streamers.clone()),
         ] {
             let built = mesh_of(&voxels, Some(kind));
             if built.indices.is_empty() {
@@ -323,10 +329,11 @@ fn rebuild(
             ));
         }
         lines.push(format!(
-            "{}: {} bark + {} leaf voxels, {triangles} tris",
+            "{}: {} bark + {} leaf voxels, {} strands, {triangles} tris",
             preset.name(),
             counts.bark,
-            counts.leaf
+            counts.leaf,
+            voxels.streamers.len(),
         ));
     }
     report.0 = lines.join("\n");
@@ -336,7 +343,7 @@ fn rebuild(
 /// Rebuild the procedural textures at a new density, in place, so the meshes
 /// and the camera stay put while the pixel scale changes.
 fn retexture(
-    mut texels: ResMut<Texels>,
+    mut texels: ResMut<TexelDensity>,
     materials: Res<Materials>,
     mut images: ResMut<Assets<Image>>,
     mut standard: ResMut<Assets<StandardMaterial>>,
@@ -347,14 +354,18 @@ fn retexture(
     texels.dirty = false;
     let tex = texels.per_tile;
 
-    let bark = images.add(pixels(bark_texture(tex), tex));
+    let bark = images.add(pixels(texture::bark(tex)));
     if let Some(mut material) = standard.get_mut(&materials.bark) {
         material.base_color_texture = Some(bark);
+    }
+    let strip = images.add(pixels(texture::streamer_strip(tex)));
+    if let Some(mut material) = standard.get_mut(&materials.streamers) {
+        material.base_color_texture = Some(strip);
     }
     for preset in Preset::ALL {
         let params = TreeParams::preset(preset);
         let needle = params.habit == Habit::Conifer;
-        let leaf = images.add(pixels(leaf_texture(needle, params.cutout_openness, tex), tex));
+        let leaf = images.add(pixels(texture::leaf_cutout(needle, params.cutout_openness, tex)));
         if let Some(mut material) = standard.get_mut(&materials.leaves[&preset]) {
             material.base_color_texture = Some(leaf);
         }
@@ -373,7 +384,7 @@ fn to_bevy(source: &dwarf_eye_trees::TreeMesh) -> Mesh {
 
 fn update_hud(
     lab: Res<Lab>,
-    texels: Res<Texels>,
+    texels: Res<TexelDensity>,
     report: Res<Report>,
     hud: Query<&mut Text, With<Hud>>,
 ) {
@@ -419,11 +430,11 @@ fn screenshot(
     }
 }
 
-fn pixels(data: Vec<u8>, tex: u32) -> Image {
+fn pixels(texels: Texels) -> Image {
     let mut image = Image::new(
-        Extent3d { width: tex, height: tex, depth_or_array_layers: 1 },
+        Extent3d { width: texels.width, height: texels.height, depth_or_array_layers: 1 },
         TextureDimension::D2,
-        data,
+        texels.rgba,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
@@ -437,131 +448,4 @@ fn pixels(data: Vec<u8>, tex: u32) -> Image {
         ..default()
     });
     image
-}
-
-/// A cutout mask at `tex` texels to a world tile. Features scale with the
-/// density, so at Dwarf Fortress's 32 the clumps are three to five texels
-/// across. `openness` is the fraction of air, which is what keeps a conifer's
-/// spray see-through and an oak's crown solid.
-fn leaf_texture(needle: bool, openness: f32, tex: u32) -> Vec<u8> {
-    let mut rng = Rng::new(if needle { 0x_1EED_1E5F_u64 } else { 0x_B20A_D1E5_u64 });
-    let mut cover = vec![0u8; (tex * tex) as usize];
-
-    if needle {
-        // Short strokes, four or five texels long, wrapped so the tile repeats.
-        let strokes = ((tex * tex) as f32 * 0.107 * (1.0 - openness)).round().max(8.0) as u32;
-        for _ in 0..strokes {
-            let sx = (rng.unit() * tex as f32) as i32;
-            let sy = (rng.unit() * tex as f32) as i32;
-            let dir = if rng.chance(0.5) { 1 } else { -1 };
-            let len = (tex as i32 / 8).max(2) + (rng.unit() * 2.0) as i32;
-            for t in 0..len {
-                let y = (sy + t).rem_euclid(tex as i32) as u32;
-                for wide in 0..2 {
-                    let x = (sx + t * dir + wide).rem_euclid(tex as i32) as u32;
-                    cover[(y * tex + x) as usize] = 255;
-                }
-            }
-        }
-    } else {
-        // Value noise on an 8x8 grid: clumps about four texels across. The
-        // threshold is raised until the mask is as open as asked for.
-        let grid = (tex / 4).max(2) as usize;
-        let mut field = vec![0.0f32; grid * grid];
-        for v in field.iter_mut() {
-            *v = rng.unit();
-        }
-        let mut value = vec![0.0f32; (tex * tex) as usize];
-        for y in 0..tex {
-            for x in 0..tex {
-                let fx = x as f32 * grid as f32 / tex as f32;
-                let fy = y as f32 * grid as f32 / tex as f32;
-                // Grain roughens the edge so no clump is a smooth oval.
-                let grain = ((x * 7 + y * 13) % 5) as f32 * 0.03;
-                value[(y * tex + x) as usize] = sample(&field, grid, fx, fy) + grain;
-            }
-        }
-        let mut sorted = value.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let cut = sorted[((sorted.len() as f32 * openness) as usize).min(sorted.len() - 1)];
-        for (i, v) in value.iter().enumerate() {
-            if *v > cut {
-                cover[i] = 255;
-            }
-        }
-        // Pinholes, for the light that comes through a real crown.
-        for _ in 0..(tex / 4).max(2) {
-            let cx = (rng.unit() * tex as f32) as i32;
-            let cy = (rng.unit() * tex as f32) as i32;
-            let r = (tex as i32 / 32).max(1) + (rng.unit() * 2.0) as i32;
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    if dx * dx + dy * dy > r * r {
-                        continue;
-                    }
-                    let x = (cx + dx).rem_euclid(tex as i32) as u32;
-                    let y = (cy + dy).rem_euclid(tex as i32) as u32;
-                    cover[(y * tex + x) as usize] = 0;
-                }
-            }
-        }
-    }
-
-    let solid = cover.iter().filter(|c| **c > 0).count();
-    info!(
-        "{} cutout at openness {openness}: {}% cover",
-        if needle { "needle" } else { "broadleaf" },
-        solid * 100 / cover.len()
-    );
-
-    let mut data = Vec::with_capacity((tex * tex * 4) as usize);
-    for y in 0..tex {
-        for x in 0..tex {
-            let alpha = cover[(y * tex + x) as usize];
-            // Near-white, so the vertex colour carries the hue.
-            let shade = 200 + ((x * 5 + y * 3) % 7) as u8 * 8;
-            data.extend_from_slice(&[shade, shade, shade, alpha]);
-        }
-    }
-    data
-}
-
-fn sample(field: &[f32], grid: usize, x: f32, y: f32) -> f32 {
-    let at = |ix: i32, iy: i32| {
-        field[(iy.rem_euclid(grid as i32) as usize) * grid + ix.rem_euclid(grid as i32) as usize]
-    };
-    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
-    let (tx, ty) = (x - x0 as f32, y - y0 as f32);
-    let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
-    let top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * sx;
-    let bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * sx;
-    top + (bottom - top) * sy
-}
-
-/// Bark fissures at the same texel density: stripes a sixteenth of a tile wide
-/// running along the trunk axis, opaque and tinted by the vertex colour.
-fn bark_texture(tex: u32) -> Vec<u8> {
-    let mut rng = Rng::new(0xBA2C_0000);
-    let mut columns = vec![1.0f32; tex as usize];
-    let mut x = 0usize;
-    while x < tex as usize {
-        let width = (tex as usize / 16).max(1) + (rng.unit() * 2.0) as usize;
-        let shade = rng.range(0.6, 1.0);
-        for c in columns.iter_mut().skip(x).take(width) {
-            *c = shade;
-        }
-        x += width;
-    }
-    let mut data = Vec::with_capacity((tex * tex * 4) as usize);
-    for y in 0..tex {
-        for x in 0..tex {
-            // Fissures wander a little down the trunk rather than ruling straight.
-            let shift = ((y as f32 * 11.2 / tex as f32).sin() * (tex as f32 / 16.0)).round() as i32;
-            let column = columns[(x as i32 + shift).rem_euclid(tex as i32) as usize];
-            let grain = ((x * 3 + y * 11) % 4) as f32 * 0.04;
-            let v = ((column + grain) * 255.0).clamp(0.0, 255.0) as u8;
-            data.extend_from_slice(&[v, v, v, 255]);
-        }
-    }
-    data
 }

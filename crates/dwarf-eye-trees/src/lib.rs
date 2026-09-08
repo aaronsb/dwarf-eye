@@ -44,8 +44,9 @@ pub mod mesh;
 pub mod params;
 pub mod raster;
 pub mod rng;
+pub mod texture;
 
-pub use grow::{LeafCluster, Segment, Skeleton, grow};
+pub use grow::{LeafCluster, Segment, Skeleton, Streamer, grow};
 pub use math::{IVec3, Vec3, ivec3, vec3};
 pub use mesh::{Stats, TreeMesh, mesh, mesh_of, stats};
 pub use params::{
@@ -164,6 +165,16 @@ mod tests {
     }
 
     #[test]
+    fn a_willow_hangs_streamers_and_others_do_not() {
+        let willow = rasterise(&grow(&willow(), 9, None), 4);
+        assert!(willow.streamers.len() > 20, "only {} streamers", willow.streamers.len());
+        let quads = mesh_of(&willow, Some(Kind::Streamer));
+        assert_eq!(quads.indices.len() / 3, quads.positions.len() / 4 * 2);
+        assert!(quads.kinds.iter().all(|k| *k == 2));
+        assert!(rasterise(&grow(&oak(), 9, None), 4).streamers.is_empty());
+    }
+
+    #[test]
     fn meshing_culls_interior_faces() {
         // A solid 4x4x4 block has 6 sides; greedy merging should give 12
         // triangles, not 6 per voxel face.
@@ -178,7 +189,7 @@ mod tests {
                 }
             }
         }
-        let tree = VoxelTree { voxels, voxels_per_tile: 1 };
+        let tree = VoxelTree { voxels, streamers: Vec::new(), voxels_per_tile: 1 };
         assert_eq!(mesh(&tree).indices.len() / 3, 12);
     }
 }

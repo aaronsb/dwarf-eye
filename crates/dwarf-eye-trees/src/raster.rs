@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::grow::{Skeleton, shell_distance};
+use crate::grow::{Skeleton, Streamer, shell_distance};
 use crate::math::{IVec3, Vec3, ivec3};
 use crate::params::Rgb;
 use crate::rng::{hash3, hash_unit};
@@ -12,6 +12,9 @@ use crate::rng::{hash3, hash_unit};
 pub enum Kind {
     Bark,
     Leaf,
+    /// A hanging strand. Never the kind of a [`Voxel`]: streamers are quads,
+    /// and the kind exists so `mesh_of` can hand them to the leaf material.
+    Streamer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +26,9 @@ pub struct Voxel {
 #[derive(Clone, Debug)]
 pub struct VoxelTree {
     pub voxels: BTreeMap<IVec3, Voxel>,
+    /// Carried through from the skeleton with their colours resolved; drawn as
+    /// quads by the mesher, not as voxels.
+    pub streamers: Vec<Streamer>,
     pub voxels_per_tile: u32,
 }
 
@@ -38,7 +44,8 @@ impl VoxelTree {
         for v in self.voxels.values() {
             match v.kind {
                 Kind::Bark => counts.bark += 1,
-                Kind::Leaf => counts.leaf += 1,
+                // Streamers are never voxels, so this only ever sees leaves.
+                Kind::Leaf | Kind::Streamer => counts.leaf += 1,
             }
         }
         counts
@@ -142,7 +149,25 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
         }
     }
 
-    VoxelTree { voxels, voxels_per_tile: voxels_per_tile.max(1) }
+    // Streamers are geometry, not voxels; all they need here is a leaf colour.
+    let streamers = skeleton
+        .streamers
+        .iter()
+        .map(|s| {
+            let at = ivec3(
+                (s.anchor.x * scale) as i32,
+                (s.anchor.y * scale) as i32,
+                (s.anchor.z * scale) as i32,
+            );
+            let mut color = pick(&palette.leaf, at, 0x2C71);
+            if hash_unit(at.x, at.y, at.z, 0x77A3) < 0.3 {
+                color = color.lerp(palette.tip, 0.6);
+            }
+            Streamer { color, ..*s }
+        })
+        .collect();
+
+    VoxelTree { voxels, streamers, voxels_per_tile: voxels_per_tile.max(1) }
 }
 
 fn fill_ball(
