@@ -29,8 +29,9 @@ make test                     # unit tests
 
 | Key | |
 |---|---|
+| `Tab` | free flight or walk sync |
 | `WASD` | move |
-| `Q` / `E` | down / up |
+| `Q` / `E` | down / up (on stairs, in walk sync) |
 | `Shift` | 4x speed |
 | right-drag | look |
 | wheel | move speed |
@@ -43,6 +44,28 @@ make test                     # unit tests
 (default +16, high enough to clear a tree canopy); `-8` starts it below ground,
 for looking straight into the rock. `DWARF_EYE_CAM` scales how far back the
 camera starts and `DWARF_EYE_VIEW=yaw,pitch` (degrees) aims it.
+
+### Walk sync
+
+`Tab` hands the camera to the adventurer. It stands in the character's tile at
+eye height, `WASD` walks freely inside that one cell, and crossing a cell edge
+asks Dwarf Fortress to step the character that way. The camera does not wait
+for the answer — it walks on into the next cell, and the position poll settles
+up: a confirmed step needs nothing, a step the game will not take springs the
+camera back and shuts that edge for a couple of seconds. It is never more than
+one cell ahead of the game, so a second edge waits for the first step to land.
+Ramps carry the eye up and down on their own; stairs take `Q` and `E`.
+
+The sync runs both ways. Move the character in the game — click a far tile,
+travel, get shoved — and the camera follows the tile it finds itself in,
+keeping your place in the cell and where you were looking.
+
+Walk mode holds its own DFHack connection on its own thread, because a step has
+to be confirmed in a fraction of a second and one map collection pass can take
+many. `DWARF_EYE_WALK=1` starts in walk sync, and
+`DWARF_EYE_WALK_DRIVE=bearing,seconds;…` walks a scripted route — compass
+degrees, 0 north, 90 east, an empty bearing to stand still — for testing the
+mode with no hand on the keyboard.
 
 `F12` saves a screenshot in the working directory.
 `DWARF_EYE_SHOT=path[:seconds]` saves one after the delay and exits, for
