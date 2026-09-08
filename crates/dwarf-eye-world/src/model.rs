@@ -83,13 +83,8 @@ pub fn build_flat_tile(uv: Rect, height: f32) -> MeshData {
         ],
     );
 
-    // The rim is too shallow to be worth texturing; shade it off the surface.
-    let side = shade(white, 0.72);
-    mesh.push_quad([[0.0, 0.0, 0.0], [0.0, y, 0.0], [1.0, y, 0.0], [1.0, 0.0, 0.0]], [0.0, 0.0, -1.0], side);
-    mesh.push_quad([[1.0, 0.0, 1.0], [1.0, y, 1.0], [0.0, y, 1.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 1.0], side);
-    mesh.push_quad([[0.0, 0.0, 1.0], [0.0, y, 1.0], [0.0, y, 0.0], [0.0, 0.0, 0.0]], [-1.0, 0.0, 0.0], side);
-    mesh.push_quad([[1.0, 0.0, 0.0], [1.0, y, 0.0], [1.0, y, 1.0], [1.0, 0.0, 1.0]], [1.0, 0.0, 0.0], side);
-
+    // Only the top. The rim shows at a drop-off alone, and the mesher adds it
+    // there, where it knows the neighbours.
     mesh
 }
 

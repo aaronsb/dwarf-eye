@@ -10,6 +10,8 @@ use crate::world::{BLOCK, Chunk, World};
 ///
 /// DF z-levels read as taller than one tile is wide; 1.0 gives Minecraft cubes.
 pub const Z_SCALE: f32 = 1.0;
+/// Thickness of a floor slab, in cells.
+pub const FLOOR_HEIGHT: f32 = 0.12 * Z_SCALE;
 
 /// Buffers for one chunk's geometry, in Bevy's Y-up convention.
 pub struct MeshData {
@@ -206,13 +208,40 @@ impl Default for MeshOptions {
 ///
 /// When `library` is given, tiles that have a Dwarf Fortress sprite are stamped
 /// from that sprite's extruded mask instead of drawn as plain blocks.
+/// Where a chunk's triangles went, for aiming reductions.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Budget {
+    pub models: usize,
+    pub ramps: usize,
+    pub ground_under: usize,
+    pub cubes: usize,
+    pub floors: usize,
+    pub foliage: usize,
+    pub liquids: usize,
+    pub other: usize,
+}
+
 pub fn build_chunk(
     world: &World,
     chunk: &Chunk,
     opts: MeshOptions,
+    library: Option<&mut TileLibrary>,
+) -> MeshData {
+    build_chunk_budgeted(world, chunk, opts, library, &mut Budget::default())
+}
+
+/// `build_chunk`, tallying triangles by kind into `budget`.
+pub fn build_chunk_budgeted(
+    world: &World,
+    chunk: &Chunk,
+    opts: MeshOptions,
     mut library: Option<&mut TileLibrary>,
+    budget: &mut Budget,
 ) -> MeshData {
     let mut mesh = MeshData::default();
+    let tally = |mesh: &MeshData, before: usize, slot: &mut usize| {
+        *slot += (mesh.indices.len() - before) / 3;
+    };
     if chunk.z > opts.z_ceiling {
         return mesh;
     }
@@ -236,9 +265,34 @@ pub fn build_chunk(
                     return false;
                 }
                 match world.voxel(x + dx, y + dy, z + dz) {
-                    Some(n) => n.solid.occludes() && (opts.show_hidden || !n.hidden),
-                    // Unloaded neighbours stay open so chunk borders keep their walls.
-                    None => false,
+                    Some(n) => {
+                        let visible = opts.show_hidden || !n.hidden;
+                        // A floor above hides the top of whatever it rests on.
+                        let lid = dz == 1 && n.solid == Solid::Floor;
+                        visible && (n.solid.occludes() || lid)
+                    }
+                    // Nothing is ever seen from under the lowest loaded level.
+                    // Sideways, unloaded neighbours stay open so chunk borders
+                    // keep their walls.
+                    None => dz == -1,
+                }
+            };
+
+            // Sides of a floor slab that face a drop, where alone they show.
+            let rim_faces = || {
+                let drop = |dx: i32, dy: i32| {
+                    let beside = world.voxel(x + dx, y + dy, z);
+                    let below = world.voxel(x + dx, y + dy, z - 1);
+                    beside.is_some_and(|n| n.solid.is_empty())
+                        && !below.is_some_and(|n| n.solid.occludes())
+                };
+                Faces {
+                    top: false,
+                    bottom: true,
+                    north: !drop(0, -1),
+                    south: !drop(0, 1),
+                    west: !drop(-1, 0),
+                    east: !drop(1, 0),
                 }
             };
 
@@ -278,7 +332,9 @@ pub fn build_chunk(
                             } else {
                                 [wobble, wobble, wobble]
                             };
+                            let before = mesh.indices.len();
                             mesh.stamp(&model.mesh, [fx, fy, fz], tint);
+                            tally(&mesh, before, &mut budget.ramps);
                             continue;
                         }
                     }
@@ -293,7 +349,11 @@ pub fn build_chunk(
                         } else {
                             [wobble, wobble, wobble]
                         };
+                        let before = mesh.indices.len();
                         mesh.stamp(&ground.mesh, [fx, fy, fz], tint);
+                        let rims = rim_faces();
+                        mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0], color, Faces { top: true, ..rims });
+                        tally(&mesh, before, &mut budget.ground_under);
                     }
 
                     if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, caps) {
@@ -307,7 +367,15 @@ pub fn build_chunk(
                         } else {
                             [wobble, wobble, wobble]
                         };
+                        let before = mesh.indices.len();
                         mesh.stamp(&model.mesh, [fx, fy, fz], tint);
+                        if lib.mode(voxel.tile_id) == Some(RenderMode::FlatTile) {
+                            let rims = rim_faces();
+                            mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0], color, Faces { top: true, ..rims });
+                            tally(&mesh, before, &mut budget.floors);
+                        } else {
+                            tally(&mesh, before, &mut budget.models);
+                        }
                         continue;
                     }
                 }
@@ -321,18 +389,19 @@ pub fn build_chunk(
                 west: occluded(-1, 0, 0),
             };
 
+            let before = mesh.indices.len();
             match voxel.solid {
                 Solid::Empty => {}
                 Solid::Cube | Solid::Fortification => {
                     mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + Z_SCALE, fz + 1.0], color, full);
                 }
                 Solid::Floor => {
-                    let h = 0.12 * Z_SCALE;
+                    let rims = rim_faces();
                     mesh.cuboid(
                         [fx, fy, fz],
-                        [fx + 1.0, fy + h, fz + 1.0],
+                        [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0],
                         color,
-                        Faces { bottom: full.bottom, ..Default::default() },
+                        Faces { top: false, ..rims },
                     );
                 }
                 Solid::Ramp => {
@@ -366,6 +435,14 @@ pub fn build_chunk(
                 }
             }
 
+            match voxel.solid {
+                Solid::Cube | Solid::Fortification => tally(&mesh, before, &mut budget.cubes),
+                Solid::Floor => tally(&mesh, before, &mut budget.floors),
+                Solid::Foliage => tally(&mesh, before, &mut budget.foliage),
+                _ => tally(&mesh, before, &mut budget.other),
+            }
+            let before = mesh.indices.len();
+
             // Liquids sit inside the cell at a height set by their fill level.
             let liquid = if voxel.magma > 0 {
                 Some((voxel.magma, to_linear([255, 90, 20], 0.9)))
@@ -378,6 +455,7 @@ pub fn build_chunk(
                 let h = (level as f32 / 7.0).clamp(0.15, 1.0) * Z_SCALE;
                 mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + h, fz + 1.0], tint, Faces::default());
             }
+            tally(&mesh, before, &mut budget.liquids);
         }
     }
 

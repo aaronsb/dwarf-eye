@@ -9,9 +9,11 @@ use std::collections::HashMap;
 
 /// Side length in cells. 32 cells of 32px each fits 1024 sprites in 1024x1024.
 const GRID: u32 = 32;
-/// Sprites are 32x32; the padding stops neighbours bleeding in under mipmaps.
+/// Sprites are 32x32. The padding is edge-bled from the sprite and keeps
+/// neighbours out of its mip levels: at level four a cell is 4 px with 1 px
+/// of its own bleed each side, so four levels are safe.
 const CELL: u32 = 32;
-const PAD: u32 = 2;
+const PAD: u32 = 16;
 const STRIDE: u32 = CELL + PAD * 2;
 /// Atlas side length in pixels.
 pub const SIDE: u32 = GRID * STRIDE;

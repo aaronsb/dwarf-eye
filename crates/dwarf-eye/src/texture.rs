@@ -10,9 +10,9 @@ use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerD
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-/// Levels below the base. Cells are 32 px, so five halvings reach one texel
-/// per cell; past that, cells only smear into their neighbours.
-const MIP_LEVELS: u32 = 5;
+/// Levels below the base. The atlas pads each 32 px sprite by 16 px of its
+/// own edge, which keeps neighbours out of the chain for four halvings.
+const MIP_LEVELS: u32 = 4;
 
 /// sRGB bytes to linear and back, so averages are done on light rather than
 /// on encoded values.
