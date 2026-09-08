@@ -219,8 +219,6 @@ pub struct Budget {
     pub foliage: usize,
     pub liquids: usize,
     pub other: usize,
-    /// Tree crowns, meshed as merged volumes.
-    pub canopy: usize,
 }
 
 pub fn build_chunk(
@@ -248,14 +246,6 @@ pub fn build_chunk_budgeted(
         return mesh;
     }
     let (ox, oy, oz) = chunk.origin();
-
-    // Tree crowns are one merged surface per chunk rather than one model per
-    // tile, so they are built before the tile loop and skipped inside it.
-    if let Some(lib) = library.as_deref_mut() {
-        let before = mesh.indices.len();
-        crate::canopy::build(world, chunk, opts, lib, &mut mesh);
-        tally(&mesh, before, &mut budget.canopy);
-    }
 
     for ly in 0..BLOCK {
         for lx in 0..BLOCK {
@@ -310,6 +300,7 @@ pub fn build_chunk_budgeted(
 
             // A sprite-derived model, when this tiletype has one.
             if let Some(lib) = library.as_deref_mut() {
+                // Crowns are voxelised separately, onto their own material.
                 if lib.canopy_part(voxel.tile_id).is_some() {
                     continue;
                 }

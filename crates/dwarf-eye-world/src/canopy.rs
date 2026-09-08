@@ -1,137 +1,106 @@
-//! Tree crowns as merged volumes.
+//! Tree crowns as voxel clumps and branch rods.
 //!
-//! A branch tile extruded from its sprite costs a few hundred triangles and a
-//! grown tree holds dozens of them, so a forest is most of the frame's
-//! geometry. Here every canopy tile instead drops a sphere of density into a
-//! field, and the isosurface through that field is meshed once for the whole
-//! chunk. Neighbouring tiles merge into one rounded crown, and the cost falls
-//! with the crown's surface area rather than its tile count.
+//! DF grows a crown as a filled block of tiles, and extruding each of those
+//! tiles from its 32x32 sprite put 98.8% of the live window's triangles in
+//! trees. Drawing the block as one smooth surface only traded that for green
+//! marshmallows. So the tiles are treated as an envelope rather than as
+//! matter: limbs become rods along the connections DF reports, leaves become
+//! clumps scattered where the crown opens onto air, and the inside is left
+//! empty. Sky comes through the gaps, and the cost follows the leaf surface
+//! rather than the tile count.
 //!
-//! The mesher is naive surface nets: one vertex per cell that straddles the
-//! isolevel, one quad per grid edge that crosses it. It needs no lookup table,
-//! and it emits about half the triangles marching cubes would for the same
-//! surface.
+//! Everything is rasterised into a sub-tile voxel grid and meshed with the same
+//! face emitter the rest of the renderer uses, with coplanar faces of one
+//! colour merged greedily. `DETAIL` sub-voxels per tile edge is the one knob:
+//! six now, three for a distant level of detail later.
 //!
-//! Chunks are single z-levels, so a crown is meshed in slices. The field is a
-//! function of world position alone, and a chunk owns exactly the grid edges
-//! whose low corner lies inside it, so the slices meet without seams or
-//! duplicates as long as both sides can see the same tiles. That is what the
-//! `REACH` halo is for.
+//! Determinism: every clump is seeded from its tree's origin and its own tile,
+//! and every element is placed from the tile it belongs to alone, so the chunks
+//! either side of a seam agree without talking to each other.
 
 use crate::library::TileLibrary;
 use crate::mesh::{MeshData, MeshOptions, Z_SCALE};
+use crate::skeleton::{Part, Skeleton, step};
 use crate::world::{BLOCK, Chunk, World};
-use std::collections::HashSet;
+use dwarf_eye_art::raws;
+use std::collections::HashMap;
 
-/// Grid cells per tile edge. Two gives half-tile resolution.
-const RES: i32 = 2;
-
-/// Density at which the surface sits.
-const LEVEL: f32 = 0.5;
-
-/// Support radius of the sphere each canopy tile adds to the summed field.
+/// Sub-voxels per tile edge, and where the override lives.
 ///
-/// DF grows a crown as a filled box — the trees here are seven tiles across and
-/// nine levels tall — so the roundness has to come from the field. A sphere
-/// this wide smooths a corner away over about a tile while a flat face barely
-/// moves, which is what turns the box into a crown.
-const SUPPORT: f32 = 2.4;
+/// Four is what the live window affords: six costs 2.0M triangles across it and
+/// four costs 977k, and four reads blockier, which is the look. Three is the
+/// intended far level of detail. `DWARF_EYE_CANOPY_DETAIL` overrides it.
+pub const DEFAULT_DETAIL: i32 = 4;
 
-/// How much of a sphere a tile contributes, by which part of the crown it is.
-/// Twigs are thin growth at the edge and press outward less than a limb.
-const BRANCH_WEIGHT: f32 = 1.0;
-const TWIG_WEIGHT: f32 = 0.85;
-const CAP_WEIGHT: f32 = 1.0;
+pub fn detail() -> i32 {
+    std::env::var("DWARF_EYE_CANOPY_DETAIL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DETAIL)
+        .clamp(2, 16)
+}
 
-/// Weight kept by a tile with none of its twenty-six neighbours filled.
+/// Tiles of world beyond the chunk whose elements can still reach into it.
 ///
-/// DF grows a crown as a squared-off block — the trees here are seven tiles
-/// across, solid to a flat underside — so weighting a tile by how enclosed it
-/// is erodes the corners, edges and that flat bottom while leaving the middle
-/// untouched. It is what turns the block into something crown-shaped.
-const EXPOSED_WEIGHT: f32 = 0.3;
+/// A rod runs half a tile out and a clump sits within half a tile of its own
+/// centre, so two tiles of margin covers the one voxel of halo the face culling
+/// needs.
+const REACH: i32 = 2;
 
-/// Summed density a crown reaches just outside its outermost tiles.
-///
-/// Dividing by it puts the surface there, so a crown clears its own footprint
-/// by about half a tile however wide the smoothing sphere is.
-const CROWN_FILL: f32 = 2.05;
-
-/// Support radius of the sphere a tile keeps to itself.
-///
-/// The summed field needs a high divisor to stay near the crown's footprint,
-/// and a tile standing alone never reaches it. Taking the larger of the two
-/// fields draws that tile as its own small ball, just inside its own tile, so
-/// a lone sprig is not erased.
-const LONE_SUPPORT: f32 = 0.9;
-
-/// Tiles of world beyond the chunk that can still reach into its grid.
-const REACH: i32 = 3;
-
-/// Corners along one tile-space axis, per tile.
-const NX: i32 = BLOCK * RES;
-const NY: i32 = RES;
-
-/// Corner counts including the one-cell halo on each side.
-const CX: usize = (NX + 2) as usize;
-const CY: usize = (NY + 2) as usize;
-
-/// Which part of a crown a tile is, which sets how far its sphere reaches.
+/// Which part of a crown a tile is.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum CanopyPart {
-    /// A limb: the bulk of the crown.
+    /// A limb, including the heavy branches DF calls trunk branches.
     Branch,
     /// The outermost, thinnest growth.
     Twig,
-    /// The solid treetop, which DF reports as floor, wall or ramp.
+    /// The solid treetop of a cap tree, which DF reports as floor, wall or ramp.
     Cap,
 }
 
 impl CanopyPart {
-    fn weight(self) -> f32 {
+    /// Radius of a leaf clump, in tiles.
+    fn clump_radius(self) -> f32 {
         match self {
-            CanopyPart::Branch => BRANCH_WEIGHT,
-            CanopyPart::Twig => TWIG_WEIGHT,
-            CanopyPart::Cap => CAP_WEIGHT,
+            CanopyPart::Branch => 0.38,
+            CanopyPart::Twig => 0.31,
+            CanopyPart::Cap => 0.44,
+        }
+    }
+
+    /// Most clumps a tile of this part ever scatters.
+    fn clump_limit(self) -> f32 {
+        match self {
+            CanopyPart::Branch => 3.0,
+            CanopyPart::Twig => 4.0,
+            CanopyPart::Cap => 4.0,
+        }
+    }
+
+    /// Radius of the rod along a limb, in tiles.
+    ///
+    /// DF's own BRANCH_RADIUS is how far a branch reaches, not how thick it is,
+    /// so thickness is set here. TODO: take it from MAX_TRUNK_DIAMETER once the
+    /// L-system grows real tapered limbs.
+    fn rod_radius(self) -> f32 {
+        match self {
+            CanopyPart::Branch => 0.13,
+            CanopyPart::Twig => 0.07,
+            CanopyPart::Cap => 0.0,
         }
     }
 }
 
-/// A canopy tile reduced to the sphere it contributes.
-struct Blob {
-    /// Centre, in render space.
-    centre: [f32; 3],
-    weight: f32,
-    /// Linear colour of this species' foliage.
-    color: [f32; 3],
-}
-
-/// The sampled field over one chunk plus its halo.
-struct Field {
-    /// Every tile's sphere added together, which is what merges a crown.
-    sum: Vec<f32>,
-    /// The largest single sphere, which is what keeps a lone tile visible.
-    lone: Vec<f32>,
-    /// Colour summed against the same weights, so a vertex reads the species
-    /// that actually built it.
-    color: Vec<[f32; 3]>,
-}
-
-impl Field {
-    fn new() -> Self {
-        let n = CX * CY * CX;
-        Self { sum: vec![0.0; n], lone: vec![0.0; n], color: vec![[0.0; 3]; n] }
-    }
-
-    /// Corner indices run -1..=N; the halo is folded into the offset.
-    fn index(i: i32, j: i32, k: i32) -> usize {
-        ((i + 1) as usize * CY + (j + 1) as usize) * CX + (k + 1) as usize
-    }
-
-    fn at(&self, i: i32, j: i32, k: i32) -> f32 {
-        let at = Self::index(i, j, k);
-        (self.sum[at] * (LEVEL / CROWN_FILL)).max(self.lone[at])
-    }
+/// A deterministic value in 0..1 from four integers.
+fn hash01(a: i32, b: i32, c: i32, d: i32) -> f32 {
+    let mut h = (a as u32).wrapping_mul(0x9E3779B1)
+        ^ (b as u32).wrapping_mul(0x85EBCA77)
+        ^ (c as u32).wrapping_mul(0xC2B2AE3D)
+        ^ (d as u32).wrapping_mul(0x27D4EB2F);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545F491);
+    h ^= h >> 13;
+    (h & 0xFFFF) as f32 / 65535.0
 }
 
 fn to_linear(rgb: [u8; 3]) -> [f32; 3] {
@@ -142,357 +111,483 @@ fn to_linear(rgb: [u8; 3]) -> [f32; 3] {
     [f(rgb[0]), f(rgb[1]), f(rgb[2])]
 }
 
-/// A hash in 0..1 from three integers, for variation that survives a reload.
-fn hash01(a: i32, b: i32, c: i32) -> f32 {
-    let mut h = (a as u32).wrapping_mul(0x9E3779B1)
-        ^ (b as u32).wrapping_mul(0x85EBCA77)
-        ^ (c as u32).wrapping_mul(0xC2B2AE3D);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x2545F491);
-    h ^= h >> 13;
-    (h & 0xFFFF) as f32 / 65535.0
+/// A sub-tile voxel grid over one chunk, with a voxel of halo so faces at the
+/// chunk's edge can be culled against what the neighbour holds.
+struct Volume {
+    detail: i32,
+    /// Own voxels per horizontal axis, and vertically.
+    nx: i32,
+    ny: i32,
+    /// Zero is empty; anything else is a palette entry plus one.
+    cells: Vec<u8>,
+    palette: Vec<[f32; 3]>,
+    keys: HashMap<u64, u8>,
+    origin: (i32, i32, i32),
 }
 
-/// Collects every canopy tile that can reach into this chunk's grid.
-///
-/// Trunk tiles standing among the crown join it, so the surface closes over the
-/// top of the trunk instead of dipping around it and leaving a capped stump in
-/// the open air.
-///
-/// Sorted by position, so the field is summed in the same order however the
-/// chunks arrived.
-fn gather(world: &World, chunk: &Chunk, opts: MeshOptions, library: &mut TileLibrary) -> Vec<Blob> {
-    let (ox, oy, oz) = chunk.origin();
-    // Position, part, species, and whether it is a trunk drawn into the crown.
-    let mut found: Vec<(i32, i32, i32, CanopyPart, i32, bool)> = Vec::new();
-    let mut trunks: Vec<(i32, i32, i32, i32)> = Vec::new();
-
-    // One tile wider than the blobs need, so every blob can count all of its
-    // neighbours and the chunks either side of a seam agree on the answer.
-    let edge = REACH + 1;
-    for z in (oz - edge)..=(oz + edge) {
-        if z > opts.z_ceiling {
-            continue;
-        }
-        for bx in (ox - edge).div_euclid(BLOCK)..=(ox + BLOCK - 1 + edge).div_euclid(BLOCK) {
-            for by in (oy - edge).div_euclid(BLOCK)..=(oy + BLOCK - 1 + edge).div_euclid(BLOCK) {
-                let Some(near) = world.chunk(bx, by, z) else { continue };
-                for ly in 0..BLOCK {
-                    for lx in 0..BLOCK {
-                        let (x, y) = (bx * BLOCK + lx, by * BLOCK + ly);
-                        if x < ox - edge
-                            || x >= ox + BLOCK + edge
-                            || y < oy - edge
-                            || y >= oy + BLOCK + edge
-                        {
-                            continue;
-                        }
-                        let v = near.get(lx, ly);
-                        if v.hidden && !opts.show_hidden {
-                            continue;
-                        }
-                        match library.canopy_part(v.tile_id) {
-                            Some(part) => found.push((x, y, z, part, v.mat_index, false)),
-                            None if library.is_trunk(v.tile_id) => {
-                                trunks.push((x, y, z, v.mat_index))
-                            }
-                            None => {}
-                        }
-                    }
-                }
-            }
+impl Volume {
+    fn new(chunk: &Chunk, detail: i32) -> Self {
+        let (nx, ny) = (BLOCK * detail, detail);
+        let cells = vec![0u8; ((nx + 2) * (ny + 2) * (nx + 2)) as usize];
+        Self {
+            detail,
+            nx,
+            ny,
+            cells,
+            palette: Vec::new(),
+            keys: HashMap::new(),
+            origin: chunk.origin(),
         }
     }
-    let mut crown: HashSet<(i32, i32, i32)> =
-        found.iter().map(|&(x, y, z, ..)| (x, y, z)).collect();
-    for (x, y, z, mat_index) in trunks {
-        let among = (-1..=1).any(|dx| {
-            (-1..=1).any(|dy| (-1..=1).any(|dz| crown.contains(&(x + dx, y + dy, z + dz))))
-        });
-        if among {
-            found.push((x, y, z, CanopyPart::Branch, mat_index, true));
-        }
+
+    fn index(&self, i: i32, j: i32, k: i32) -> usize {
+        (((i + 1) * (self.ny + 2) + (j + 1)) * (self.nx + 2) + (k + 1)) as usize
     }
-    crown.extend(found.iter().map(|&(x, y, z, ..)| (x, y, z)));
-    found.sort_unstable();
 
-    // How enclosed a tile is, over its twenty-six neighbours.
-    let enclosure = |x: i32, y: i32, z: i32| -> f32 {
-        let mut n = 0;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if (dx, dy, dz) != (0, 0, 0) && crown.contains(&(x + dx, y + dy, z + dz)) {
-                        n += 1;
-                    }
-                }
-            }
+    fn get(&self, i: i32, j: i32, k: i32) -> u8 {
+        if i < -1 || j < -1 || k < -1 || i > self.nx || j > self.ny || k > self.nx {
+            return 0;
         }
-        let f = n as f32 / 26.0;
-        EXPOSED_WEIGHT + (1.0 - EXPOSED_WEIGHT) * f * f.sqrt()
-    };
+        self.cells[self.index(i, j, k)]
+    }
 
-    found
-        .into_iter()
-        .filter(|&(x, y, z, ..)| {
-            x >= ox - REACH
-                && x < ox + BLOCK + REACH
-                && y >= oy - REACH
-                && y < oy + BLOCK + REACH
-                && z >= oz - REACH
-                && z <= oz + REACH
-        })
-        .map(|(x, y, z, part, mat_index, trunk)| {
-            let color = to_linear(library.canopy_color(mat_index));
-            // Vary each tree's crown a little, seeded from where it stands.
-            let (tx, ty, tz) = world
-                .voxel(x, y, z)
-                .map(|v| v.tree_origin(x, y, z))
-                .unwrap_or((x, y, z));
-            let wobble = 0.85 + 0.3 * hash01(tx, ty, tz);
-            Blob {
-                centre: [x as f32 + 0.5, (z as f32 + 0.5) * Z_SCALE, y as f32 + 0.5],
-                // Wood does not erode: a trunk standing in a gap in the crown
-                // keeps enough weight to be covered rather than left as a
-                // capped stump in the open.
-                weight: part.weight() * enclosure(x, y, z).max(if trunk { 0.8 } else { 0.0 }) * wobble,
-                color,
-            }
-        })
-        .collect()
-}
+    /// Interns a colour, so faces of one shade can merge into one rectangle.
+    fn shade(&mut self, key: u64, color: [f32; 3]) -> u8 {
+        if let Some(&found) = self.keys.get(&key) {
+            return found;
+        }
+        // 255 shades is far more than a chunk of forest ever asks for; beyond
+        // that, reuse rather than lose the voxel.
+        if self.palette.len() >= 255 {
+            return 1;
+        }
+        self.palette.push(color);
+        let slot = self.palette.len() as u8;
+        self.keys.insert(key, slot);
+        slot
+    }
 
-/// Sums the blobs into the chunk's corner grid.
-fn splat(blobs: &[Blob], chunk: &Chunk) -> Field {
-    let (ox, oy, oz) = chunk.origin();
-    let mut field = Field::new();
-    let step = 1.0 / RES as f32;
+    /// Centre of a voxel, in render space.
+    fn centre(&self, i: i32, j: i32, k: i32) -> [f32; 3] {
+        let d = self.detail as f32;
+        [
+            self.origin.0 as f32 + (i as f32 + 0.5) / d,
+            (self.origin.2 as f32 + (j as f32 + 0.5) / d) * Z_SCALE,
+            self.origin.1 as f32 + (k as f32 + 0.5) / d,
+        ]
+    }
 
-    for blob in blobs {
-        // Corner index range a sphere of `radius` around this blob can touch.
-        let span = |centre: f32, origin: f32, limit: i32, radius: f32| -> (i32, i32) {
-            let lo = ((centre - radius - origin) * RES as f32).ceil() as i32;
-            let hi = ((centre + radius - origin) * RES as f32).floor() as i32;
-            (lo.max(-1), hi.min(limit))
+    /// Voxel index range a world-space box covers, clipped to the halo.
+    fn span(&self, lo: [f32; 3], hi: [f32; 3]) -> [(i32, i32); 3] {
+        let d = self.detail as f32;
+        let axis = |a: f32, b: f32, origin: f32, limit: i32| -> (i32, i32) {
+            let first = ((a - origin) * d - 0.5).floor() as i32;
+            let last = ((b - origin) * d - 0.5).ceil() as i32;
+            (first.max(-1), last.min(limit))
         };
+        [
+            axis(lo[0], hi[0], self.origin.0 as f32, self.nx),
+            axis(lo[1] / Z_SCALE, hi[1] / Z_SCALE, self.origin.2 as f32, self.ny),
+            axis(lo[2], hi[2], self.origin.1 as f32, self.nx),
+        ]
+    }
 
-        for (radius, merged) in [(SUPPORT, true), (LONE_SUPPORT, false)] {
-            let r2 = radius * radius;
-            let (i0, i1) = span(blob.centre[0], ox as f32, NX, radius);
-            let (j0, j1) = span(blob.centre[1] / Z_SCALE, oz as f32, NY, radius);
-            let (k0, k1) = span(blob.centre[2], oy as f32, NX, radius);
-
-            for i in i0..=i1 {
-                let dx = ox as f32 + i as f32 * step - blob.centre[0];
-                for j in j0..=j1 {
-                    let dy = (oz as f32 + j as f32 * step) * Z_SCALE - blob.centre[1];
-                    for k in k0..=k1 {
-                        let dz = oy as f32 + k as f32 * step - blob.centre[2];
-                        let d2 = dx * dx + dy * dy + dz * dz;
-                        if d2 >= r2 {
-                            continue;
-                        }
-                        let t = 1.0 - d2 / r2;
-                        let w = t * t * blob.weight;
-                        let at = Field::index(i, j, k);
-                        if merged {
-                            field.sum[at] += w;
-                            for c in 0..3 {
-                                field.color[at][c] += w * blob.color[c];
-                            }
-                        } else {
-                            field.lone[at] = field.lone[at].max(w);
-                        }
+    /// Fills the voxels inside an ellipsoid.
+    fn ellipsoid(&mut self, centre: [f32; 3], radius: [f32; 3], shade: u8) {
+        let lo = [centre[0] - radius[0], centre[1] - radius[1], centre[2] - radius[2]];
+        let hi = [centre[0] + radius[0], centre[1] + radius[1], centre[2] + radius[2]];
+        let [(i0, i1), (j0, j1), (k0, k1)] = self.span(lo, hi);
+        for i in i0..=i1 {
+            for j in j0..=j1 {
+                for k in k0..=k1 {
+                    let p = self.centre(i, j, k);
+                    let mut d = 0.0;
+                    for a in 0..3 {
+                        let t = (p[a] - centre[a]) / radius[a];
+                        d += t * t;
+                    }
+                    if d <= 1.0 {
+                        let at = self.index(i, j, k);
+                        self.cells[at] = shade;
                     }
                 }
             }
         }
     }
-    field
+
+    /// Fills the voxels within `radius` of the segment `a`..`b`.
+    fn rod(&mut self, a: [f32; 3], b: [f32; 3], radius: f32, shade: u8) {
+        // Below about three quarters of a voxel a rod falls between the voxel
+        // centres and vanishes, so thin growth still draws a hairline.
+        let r = radius.max(0.75 / self.detail as f32);
+        let lo = [a[0].min(b[0]) - r, a[1].min(b[1]) - r, a[2].min(b[2]) - r];
+        let hi = [a[0].max(b[0]) + r, a[1].max(b[1]) + r, a[2].max(b[2]) + r];
+        let [(i0, i1), (j0, j1), (k0, k1)] = self.span(lo, hi);
+
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        for i in i0..=i1 {
+            for j in j0..=j1 {
+                for k in k0..=k1 {
+                    let p = self.centre(i, j, k);
+                    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+                    let t = if len2 > 1e-9 {
+                        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let mut d2 = 0.0;
+                    for c in 0..3 {
+                        let e = ap[c] - t * ab[c];
+                        d2 += e * e;
+                    }
+                    if d2 <= r * r {
+                        let at = self.index(i, j, k);
+                        self.cells[at] = shade;
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// The eight corners of a cell, as offsets.
-const CORNERS: [[i32; 3]; 8] = [
-    [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
-    [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
-];
+/// How the six faces are lit, so a voxel crown reads as a lit solid.
+const FACE_SHADE: [f32; 6] = [0.70, 0.70, 0.50, 1.0, 0.82, 0.82];
 
-/// The twelve edges of a cell, as corner index pairs.
-const EDGES: [(usize, usize); 12] = [
-    (0, 1), (2, 3), (4, 5), (6, 7),
-    (0, 2), (1, 3), (4, 6), (5, 7),
-    (0, 4), (1, 5), (2, 6), (3, 7),
-];
+/// Triangles a chunk's crown cost, with and without merging.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CanopyBudget {
+    pub triangles: usize,
+    /// What the same faces would have cost one quad each.
+    pub unmerged: usize,
+}
 
-/// Builds one chunk's canopy geometry into `mesh`.
+/// Builds one chunk's crown geometry.
 pub fn build(
     world: &World,
     chunk: &Chunk,
     opts: MeshOptions,
     library: &mut TileLibrary,
-    mesh: &mut MeshData,
-) {
-    let blobs = gather(world, chunk, opts, library);
-    if blobs.is_empty() {
+) -> MeshData {
+    build_budgeted(world, chunk, opts, library, &mut CanopyBudget::default())
+}
+
+/// `build`, counting what merging saved.
+pub fn build_budgeted(
+    world: &World,
+    chunk: &Chunk,
+    opts: MeshOptions,
+    library: &mut TileLibrary,
+    budget: &mut CanopyBudget,
+) -> MeshData {
+    let mut mesh = MeshData::default();
+    if chunk.z > opts.z_ceiling {
+        return mesh;
+    }
+    let skeleton = Skeleton::build(world, chunk, opts, library, REACH);
+    if skeleton.is_empty() {
+        return mesh;
+    }
+
+    let mut volume = Volume::new(chunk, detail());
+    for part in &skeleton.parts {
+        limbs(&mut volume, &skeleton, part, library);
+        leaves(&mut volume, &skeleton, part, library);
+    }
+    // A trunk standing among the crown gets leaves over it too, so its sawn-off
+    // top does not show through the gaps.
+    for (pos, tree, species) in skeleton.crowned_trunks() {
+        let part = Part { pos, kind: CanopyPart::Branch, links: 0, tree, species };
+        leaves(&mut volume, &skeleton, &part, library);
+    }
+    emit(&volume, &mut mesh, budget);
+    mesh
+}
+
+/// The centre of a tile, in render space.
+fn tile_centre(pos: (i32, i32, i32)) -> [f32; 3] {
+    [pos.0 as f32 + 0.5, (pos.2 as f32 + 0.5) * Z_SCALE, pos.1 as f32 + 0.5]
+}
+
+/// Lays one tile's limbs into the volume.
+///
+/// Each tile draws its own half of every joint, out to the tile boundary, so
+/// two joined tiles meet in the middle whichever chunk each of them lands in.
+fn limbs(volume: &mut Volume, skeleton: &Skeleton, part: &Part, library: &mut TileLibrary) {
+    let (x, y, z) = part.pos;
+    let centre = tile_centre(part.pos);
+    let bark = to_linear(library.bark_color(part.species));
+    let rod_radius = part.kind.rod_radius();
+    if rod_radius > 0.0 {
+        let shade = volume.shade(u64::MAX ^ (part.species as u32 as u64), bark);
+        let mut drawn = false;
+        for bit in [raws::NORTH, raws::SOUTH, raws::WEST, raws::EAST] {
+            if part.links & bit == 0 {
+                continue;
+            }
+            let (dx, dy) = step(bit);
+            let end = [
+                centre[0] + dx as f32 * 0.5,
+                centre[1],
+                centre[2] + dy as f32 * 0.5,
+            ];
+            volume.rod(centre, end, rod_radius, shade);
+            drawn = true;
+        }
+        // A limb that joins nothing, and the stub that meets the trunk below,
+        // still need a body.
+        if !drawn || skeleton.is_trunk((x, y, z - 1)) {
+            let below = [centre[0], centre[1] - 0.5 * Z_SCALE, centre[2]];
+            volume.rod(centre, below, rod_radius, shade);
+        }
+    }
+}
+
+/// Scatters one tile's leaf clumps.
+///
+/// Only where the tile opens onto air: a tile boxed in by more crown is never
+/// seen, so it stays an empty frame of limbs and the sky reaches the ground
+/// through the gaps.
+fn leaves(volume: &mut Volume, skeleton: &Skeleton, part: &Part, library: &mut TileLibrary) {
+    let (x, y, z) = part.pos;
+    let centre = tile_centre(part.pos);
+    let (tx, ty, tz) = part.tree;
+    let growth = library.growth(part.species);
+    let openness = skeleton.openness(part.pos);
+    if openness <= 0.0 {
         return;
     }
-    let field = splat(&blobs, chunk);
-    let (ox, oy, oz) = chunk.origin();
-    let step = 1.0 / RES as f32;
-
-    // One vertex per straddling cell. Cells run -1..=N-1, one halo cell on the
-    // low side of each axis so the chunk can close the edges it owns.
-    let cell_index = |ci: i32, cj: i32, ck: i32| -> usize {
-        ((ci + 1) as usize * (CY - 1) + (cj + 1) as usize) * (CX - 1) + (ck + 1) as usize
+    // A species that grows few branches carries fewer leaves.
+    let density = if growth.branch_density == 0 {
+        1.0
+    } else {
+        0.6 + 0.8 * (growth.branch_density as f32 / 100.0)
     };
-    let mut vertex = vec![u32::MAX; (CX - 1) * (CY - 1) * (CX - 1)];
+    let spread = 0.85 + 0.1 * growth.branch_radius.clamp(1, 4) as f32;
+    let count = (part.kind.clump_limit() * (0.25 + 0.75 * openness) * density).round() as i32;
 
-    for ci in -1..NX {
-        for cj in -1..NY {
-            for ck in -1..NX {
-                let mut d = [0.0f32; 8];
-                let mut inside = 0;
-                for (n, c) in CORNERS.iter().enumerate() {
-                    d[n] = field.at(ci + c[0], cj + c[1], ck + c[2]);
-                    if d[n] >= LEVEL {
-                        inside += 1;
-                    }
-                }
-                if inside == 0 || inside == 8 {
-                    continue;
-                }
-
-                // The vertex sits at the mean of the crossings on the cell's
-                // edges, which is what rounds the surface off.
-                let (mut sum, mut count) = ([0.0f32; 3], 0.0f32);
-                for &(a, b) in &EDGES {
-                    if (d[a] >= LEVEL) == (d[b] >= LEVEL) {
-                        continue;
-                    }
-                    let t = ((LEVEL - d[a]) / (d[b] - d[a])).clamp(0.0, 1.0);
-                    for c in 0..3 {
-                        sum[c] += CORNERS[a][c] as f32 + t * (CORNERS[b][c] - CORNERS[a][c]) as f32;
-                    }
-                    count += 1.0;
-                }
-                let local = [sum[0] / count, sum[1] / count, sum[2] / count];
-
-                // The field falls away from the crown, so its gradient points
-                // inward and the outward normal is its negation.
-                let face = |lo: [usize; 4]| -> f32 { lo.iter().map(|&n| d[n]).sum() };
-                let grad = [
-                    face([1, 3, 5, 7]) - face([0, 2, 4, 6]),
-                    face([2, 3, 6, 7]) - face([0, 1, 4, 5]),
-                    face([4, 5, 6, 7]) - face([0, 1, 2, 3]),
-                ];
-                let len = (grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2]).sqrt();
-                let normal = if len > 1e-6 {
-                    [-grad[0] / len, -grad[1] / len, -grad[2] / len]
-                } else {
-                    [0.0, 1.0, 0.0]
-                };
-
-                // Colour comes from whichever species weighs most here.
-                let (mut csum, mut wsum) = ([0.0f32; 3], 0.0f32);
-                for c in CORNERS {
-                    let at = Field::index(ci + c[0], cj + c[1], ck + c[2]);
-                    wsum += field.sum[at];
-                    for n in 0..3 {
-                        csum[n] += field.color[at][n];
-                    }
-                }
-                let base = if wsum > 1e-6 {
-                    [csum[0] / wsum, csum[1] / wsum, csum[2] / wsum]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
-
-                // Underside darker than crown, plus a per-vertex wobble so the
-                // surface does not read as one painted shell.
-                let lit = 0.52 + 0.48 * (0.5 + 0.5 * normal[1]);
-                let wobble = 0.92 + 0.16 * hash01(ox * RES + ci, oz * RES + cj, oy * RES + ck);
-                let shade = lit * wobble;
-
-                vertex[cell_index(ci, cj, ck)] = mesh.positions.len() as u32;
-                mesh.positions.push([
-                    ox as f32 + (ci as f32 + local[0]) * step,
-                    (oz as f32 + (cj as f32 + local[1]) * step) * Z_SCALE,
-                    oy as f32 + (ck as f32 + local[2]) * step,
-                ]);
-                mesh.normals.push(normal);
-                mesh.colors.push([base[0] * shade, base[1] * shade, base[2] * shade, 1.0]);
-                mesh.uvs.push(dwarf_eye_art::atlas::WHITE_UV);
-            }
-        }
+    let above = (x, y, z + 1);
+    let crown = !skeleton.holds(above) && !skeleton.is_trunk(above);
+    let leaf = to_linear(library.canopy_color(part.species));
+    for n in 0..count.max(1) {
+        let jitter = |slot: i32| hash01(tx ^ x, ty ^ y, tz ^ z, n * 8 + slot);
+        let offset = [
+            (jitter(0) - 0.5) * 0.62,
+            (jitter(1) - 0.5) * 0.62 * Z_SCALE,
+            (jitter(2) - 0.5) * 0.62,
+        ];
+        let scale = part.kind.clump_radius() * spread * (0.8 + 0.45 * jitter(3));
+        // Four shades, quantised so a clump's faces still merge with itself.
+        // Leaves at the top of the crown catch more sky, so they run lighter.
+        let level = (jitter(4) * 3.0) as i32 + crown as i32;
+        let lift = 0.84 + 0.08 * level as f32;
+        let key = ((part.species as u32 as u64) << 8) | level as u64;
+        let shade = volume.shade(key, [leaf[0] * lift, leaf[1] * lift, leaf[2] * lift]);
+        volume.ellipsoid(
+            [centre[0] + offset[0], centre[1] + offset[1], centre[2] + offset[2]],
+            [scale, scale * 0.82 * Z_SCALE, scale],
+            shade,
+        );
     }
+}
 
-    // One quad per crossing edge, from the four cells that ring it. The chunk
-    // owns the edges whose low corner is its own, so the slice above and the
-    // block beside it close their own halves and nothing is drawn twice.
-    for i in 0..NX {
-        for j in 0..NY {
-            for k in 0..NX {
-                let here = field.at(i, j, k) >= LEVEL;
-                // Ring of cells around each axis, wound counter-clockwise as
-                // seen from the positive end of that axis.
-                let rings: [(f32, [[i32; 3]; 4]); 3] = [
-                    (
-                        field.at(i + 1, j, k),
-                        [[i, j - 1, k - 1], [i, j, k - 1], [i, j, k], [i, j - 1, k]],
-                    ),
-                    (
-                        field.at(i, j + 1, k),
-                        [[i - 1, j, k - 1], [i - 1, j, k], [i, j, k], [i, j, k - 1]],
-                    ),
-                    (
-                        field.at(i, j, k + 1),
-                        [[i - 1, j - 1, k], [i, j - 1, k], [i, j, k], [i - 1, j, k]],
-                    ),
-                ];
-                for (far, cells) in rings {
-                    if (far >= LEVEL) == here {
+/// Turns the volume's surface into quads, merging coplanar runs of one shade.
+fn emit(volume: &Volume, mesh: &mut MeshData, budget: &mut CanopyBudget) {
+    let d = volume.detail as f32;
+    let (ox, oy, oz) = volume.origin;
+    let mut mask: Vec<u8> = Vec::new();
+
+    for face in 0..6usize {
+        // Axis 0 is x, 1 is y, 2 is z; even faces look toward the negative end.
+        let axis = face / 2;
+        let positive = face % 2 == 1;
+        let along = if axis == 1 { volume.ny } else { volume.nx };
+        let (wide, tall) = match axis {
+            0 => (volume.ny, volume.nx),
+            1 => (volume.nx, volume.nx),
+            _ => (volume.nx, volume.ny),
+        };
+
+        for slice in 0..along {
+            mask.clear();
+            mask.resize((wide * tall) as usize, 0);
+            let next = if positive { slice + 1 } else { slice - 1 };
+            for a in 0..wide {
+                for b in 0..tall {
+                    let (here, beyond) = match axis {
+                        0 => ((slice, a, b), (next, a, b)),
+                        1 => ((a, slice, b), (a, next, b)),
+                        _ => ((a, b, slice), (a, b, next)),
+                    };
+                    let cell = volume.get(here.0, here.1, here.2);
+                    if cell == 0 || volume.get(beyond.0, beyond.1, beyond.2) != 0 {
                         continue;
                     }
-                    let mut quad = [0u32; 4];
-                    let mut complete = true;
-                    for (n, c) in cells.iter().enumerate() {
-                        let v = vertex[cell_index(c[0], c[1], c[2])];
-                        complete &= v != u32::MAX;
-                        quad[n] = v;
-                    }
-                    if !complete {
+                    mask[(a * tall + b) as usize] = cell;
+                }
+            }
+
+            budget.unmerged += mask.iter().filter(|&&c| c != 0).count() * 2;
+
+            for a in 0..wide {
+                let mut b = 0;
+                while b < tall {
+                    let cell = mask[(a * tall + b) as usize];
+                    if cell == 0 {
+                        b += 1;
                         continue;
                     }
-                    // Wind so the face turns away from the dense side.
-                    let [a, b, c, e] = if here { quad } else { [quad[3], quad[2], quad[1], quad[0]] };
-                    mesh.indices.extend_from_slice(&[a, b, c, a, c, e]);
+                    // Grow along b, then along a while every row matches.
+                    let mut w = 1;
+                    while b + w < tall && mask[(a * tall + b + w) as usize] == cell {
+                        w += 1;
+                    }
+                    let mut h = 1;
+                    'grow: while a + h < wide {
+                        for t in 0..w {
+                            if mask[((a + h) * tall + b + t) as usize] != cell {
+                                break 'grow;
+                            }
+                        }
+                        h += 1;
+                    }
+                    for ra in a..a + h {
+                        for rb in b..b + w {
+                            mask[(ra * tall + rb) as usize] = 0;
+                        }
+                    }
+
+                    let plane = if positive { slice + 1 } else { slice };
+                    let color = volume.palette[(cell - 1) as usize];
+                    let lit = FACE_SHADE[face];
+                    let rgba = [color[0] * lit, color[1] * lit, color[2] * lit, 1.0];
+                    push_face(
+                        mesh, face, ox, oy, oz, d, plane, a, a + h, b, b + w, rgba,
+                    );
+                    b += w;
                 }
             }
         }
     }
+    budget.triangles += mesh.indices.len() / 3;
+}
+
+/// Appends one merged rectangle, wound so it faces out of the crown.
+#[allow(clippy::too_many_arguments)]
+fn push_face(
+    mesh: &mut MeshData,
+    face: usize,
+    ox: i32,
+    oy: i32,
+    oz: i32,
+    d: f32,
+    plane: i32,
+    a0: i32,
+    a1: i32,
+    b0: i32,
+    b1: i32,
+    color: [f32; 4],
+) {
+    // Voxel index to world coordinate, per axis.
+    let wx = |i: i32| ox as f32 + i as f32 / d;
+    let wy = |j: i32| (oz as f32 + j as f32 / d) * Z_SCALE;
+    let wz = |k: i32| oy as f32 + k as f32 / d;
+
+    let (corners, normal) = match face {
+        // -x, with the free axes running (y, z).
+        0 => {
+            let (x, y0, y1, z0, z1) = (wx(plane), wy(a0), wy(a1), wz(b0), wz(b1));
+            (
+                [[x, y0, z1], [x, y1, z1], [x, y1, z0], [x, y0, z0]],
+                [-1.0, 0.0, 0.0],
+            )
+        }
+        1 => {
+            let (x, y0, y1, z0, z1) = (wx(plane), wy(a0), wy(a1), wz(b0), wz(b1));
+            (
+                [[x, y0, z0], [x, y1, z0], [x, y1, z1], [x, y0, z1]],
+                [1.0, 0.0, 0.0],
+            )
+        }
+        // -y and +y, with the free axes running (x, z).
+        2 => {
+            let (y, x0, x1, z0, z1) = (wy(plane), wx(a0), wx(a1), wz(b0), wz(b1));
+            (
+                [[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]],
+                [0.0, -1.0, 0.0],
+            )
+        }
+        3 => {
+            let (y, x0, x1, z0, z1) = (wy(plane), wx(a0), wx(a1), wz(b0), wz(b1));
+            (
+                [[x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0]],
+                [0.0, 1.0, 0.0],
+            )
+        }
+        // -z and +z, with the free axes running (x, y).
+        4 => {
+            let (z, x0, x1, y0, y1) = (wz(plane), wx(a0), wx(a1), wy(b0), wy(b1));
+            (
+                [[x0, y0, z], [x0, y1, z], [x1, y1, z], [x1, y0, z]],
+                [0.0, 0.0, -1.0],
+            )
+        }
+        _ => {
+            let (z, x0, x1, y0, y1) = (wz(plane), wx(a0), wx(a1), wy(b0), wy(b1));
+            (
+                [[x1, y0, z], [x1, y1, z], [x0, y1, z], [x0, y0, z]],
+                [0.0, 0.0, 1.0],
+            )
+        }
+    };
+    mesh.push_quad(corners, normal, color);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The field is dense at a blob's centre and empty well away from it.
-    #[test]
-    fn blob_fills_its_centre() {
-        let chunk = Chunk { block_x: 0, block_y: 0, z: 0, voxels: Vec::new() };
-        let blobs = vec![Blob {
-            centre: [8.0, 0.5, 8.0],
-            weight: 1.0,
-            color: [0.2, 0.5, 0.2],
-        }];
-        let field = splat(&blobs, &chunk);
-        assert!(field.at(16, 1, 16) > LEVEL, "centre of the blob must be inside");
-        assert!(field.at(0, 0, 0) < LEVEL, "the corner must be outside");
+    fn chunk() -> Chunk {
+        Chunk { block_x: 0, block_y: 0, z: 0, voxels: Vec::new() }
     }
 
     #[test]
-    fn tree_origin_combines_axes_differently() {
-        let v = crate::world::Voxel { tree_dx: 2, tree_dy: -1, tree_dz: 3, ..Default::default() };
-        assert_eq!(v.tree_origin(10, 10, 10), (8, 11, 13));
+    fn a_clump_fills_voxels_around_its_centre() {
+        let mut volume = Volume::new(&chunk(), 6);
+        let shade = volume.shade(1, [0.2, 0.5, 0.2]);
+        volume.ellipsoid([8.0, 0.5, 8.0], [0.3, 0.3, 0.3], shade);
+        let filled = volume.cells.iter().filter(|&&c| c != 0).count();
+        assert!(filled > 4, "a third-of-a-tile clump should hold several voxels, got {filled}");
+        assert_eq!(volume.get(48, 3, 48), shade);
+    }
+
+    #[test]
+    fn a_rod_stays_connected_along_its_length() {
+        let mut volume = Volume::new(&chunk(), 6);
+        let shade = volume.shade(1, [0.4, 0.3, 0.2]);
+        volume.rod([8.0, 0.5, 8.0], [9.0, 0.5, 8.0], 0.05, shade);
+        // Every voxel column the rod passes through must hold something.
+        for i in 48..54 {
+            let any = (0..6).any(|j| (0..6).any(|k| volume.get(i, j, 45 + k) != 0));
+            assert!(any, "the rod broke at voxel column {i}");
+        }
+    }
+
+    #[test]
+    fn merging_a_flat_slab_costs_two_triangles_a_face() {
+        let mut volume = Volume::new(&chunk(), 6);
+        let shade = volume.shade(1, [0.3, 0.3, 0.3]);
+        // A 4x1x4 block of voxels: six flat faces, each one merged rectangle.
+        for i in 10..14 {
+            for k in 10..14 {
+                let at = volume.index(i, 3, k);
+                volume.cells[at] = shade;
+            }
+        }
+        let mut mesh = MeshData::default();
+        let mut budget = CanopyBudget::default();
+        emit(&volume, &mut mesh, &mut budget);
+        assert_eq!(budget.triangles, 12, "six merged rectangles");
+        assert_eq!(budget.unmerged, 96, "before merging: 48 faces, two triangles each");
     }
 }

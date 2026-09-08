@@ -105,6 +105,12 @@ building contents.
   One letter is the direction a branch is *heading*, so connectivity is the
   opposite; two or more letters is connectivity directly
   (`tree.rs:407`). `"--------"` is matched literally as a sentinel.
+- **The graphics raws and DFHack disagree on what a heavy limb is called.**
+  DFHack names the tiletype `TreeTrunkBranch`, which `family_from_tiletype`
+  turns into `TREE_TRUNK_BRANCH`; the raws only ship `TREE_HEAVY_BRANCH`. So
+  those tiles resolve to no sprite at all and fall back to a plain block. The
+  canopy mesher folds them into the crown instead, but a sprite path for them
+  still wants the alias.
 - **Tree origin flips sign on z.** `tree_origin()` is
   `(x - tree_x, y - tree_y, z + tree_z)` — subtract on x and y, add on z.
 - **Flow coordinates are global** even though flows live inside a block;

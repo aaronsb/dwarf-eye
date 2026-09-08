@@ -97,6 +97,9 @@ const PATTERN_SATURATION: f32 = 0.22;
 /// Foliage colour for a species whose sheets carry no twigs.
 const DEFAULT_FOLIAGE: [u8; 3] = [82, 138, 58];
 
+/// Wood colour for a species whose sheets carry no trunk.
+const DEFAULT_BARK: [u8; 3] = [96, 72, 48];
+
 /// Height of a ground slab, as a fraction of a z-level.
 const FLOOR_HEIGHT: f32 = 0.12;
 
@@ -221,6 +224,8 @@ pub struct TileLibrary {
     under_model: HashMap<&'static str, Option<Model>>,
     /// Species index -> the colour its crown is painted, cached on first use.
     canopy_color: HashMap<i32, [u8; 3]>,
+    /// Species index -> the colour of its wood.
+    bark: HashMap<i32, [u8; 3]>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
@@ -297,6 +302,7 @@ impl TileLibrary {
             under_uv: HashMap::new(),
             under_model: HashMap::new(),
             canopy_color: HashMap::new(),
+            bark: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
         };
@@ -578,6 +584,42 @@ impl TileLibrary {
         self.tiles.get(&tile).map(|t| t.links).unwrap_or(0)
     }
 
+    /// The colour of a species' wood, from the mean of its trunk sprite.
+    pub fn bark_color(&mut self, mat_index: i32) -> [u8; 3] {
+        if let Some(&found) = self.bark.get(&mat_index) {
+            return found;
+        }
+        let plant_id = self.plant_id(mat_index);
+        // Most trunk sprites are near-grey patterns that DF tints with the
+        // tile's material, so a grey mean says nothing about the wood. Only a
+        // sprite with real colour in it is worth reading.
+        let color = ["TREE_TRUNK_PILLAR", "TREE_TRUNK", "TREE_BRANCH"]
+            .into_iter()
+            .find_map(|family| {
+                let sprite = self.art.tree_sprite(&plant_id, family, 0)?;
+                (sprite.saturation() >= PATTERN_SATURATION)
+                    .then(|| sprite_mean(sprite))
+                    .flatten()
+            })
+            .unwrap_or(DEFAULT_BARK);
+        self.bark.insert(mat_index, color);
+        color
+    }
+
+    /// How a species grows, from the plant object raws. All zero when the
+    /// species is not a tree or its raws were not found.
+    pub fn growth(&self, mat_index: i32) -> raws::TreeGrowth {
+        self.plants
+            .get(mat_index.max(0) as usize)
+            .and_then(|id| self.art.growth.get(id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn plant_id(&self, mat_index: i32) -> String {
+        self.plants.get(mat_index.max(0) as usize).cloned().unwrap_or_default()
+    }
+
     /// Whether this tiletype is a tree's woody column.
     pub fn is_trunk(&self, tile: i32) -> bool {
         self.tiles.get(&tile).is_some_and(|t| t.trunk)
@@ -594,11 +636,7 @@ impl TileLibrary {
         if let Some(&found) = self.canopy_color.get(&mat_index) {
             return found;
         }
-        let plant_id = self
-            .plants
-            .get(mat_index.max(0) as usize)
-            .cloned()
-            .unwrap_or_default();
+        let plant_id = self.plant_id(mat_index);
         let color = ["TREE_TWIGS", "TREE_BRANCH"]
             .into_iter()
             .find_map(|family| {
