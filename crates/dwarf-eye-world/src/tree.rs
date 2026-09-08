@@ -448,8 +448,14 @@ pub fn grow(
     library: &mut TileLibrary,
     world_origin: (i32, i32, i32),
 ) -> trees::VoxelTree {
+    use crate::canopy::timing::PHASES;
     let params = params(env, growth, habit, library);
     let bounds = envelope(env);
+    let started = std::time::Instant::now();
     let skeleton = trees::grow(&params, seed(env, world_origin), Some(&bounds));
-    trees::rasterise(&skeleton, DETAIL as u32)
+    PHASES.skeleton.since(started);
+    let started = std::time::Instant::now();
+    let voxels = trees::rasterise(&skeleton, DETAIL as u32);
+    PHASES.rasterise.since(started);
+    voxels
 }

@@ -166,6 +166,7 @@ fn run(
     }
 
     bevy::log::info!("startup: restored chunks meshed at {:.1}s", started.elapsed().as_secs_f32());
+    bevy::log::info!("startup: {}", dwarf_eye_world::canopy::timing::report());
     let mut first_pass = true;
 
     let mut horizon_sent = false;
@@ -235,6 +236,10 @@ fn run(
                         "startup: first window pass took {:.1}s, done at {:.1}s",
                         pass_started.elapsed().as_secs_f32(),
                         started.elapsed().as_secs_f32()
+                    );
+                    bevy::log::info!(
+                        "startup: {}",
+                        dwarf_eye_world::canopy::timing::report()
                     );
                 }
             }

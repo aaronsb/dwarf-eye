@@ -25,6 +25,8 @@ use dwarf_eye_trees::{Kind, TreeMesh};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod timing;
+
 /// Which part of a crown a tile is. DF's own classification, still used to
 /// decide which tiles make up a tree's envelope.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -145,6 +147,7 @@ fn voxelise(
     world_origin: (i32, i32, i32),
 ) -> TreeVoxels {
     let grown = crate::tree::grow(env, growth, habit, library, world_origin);
+    let started = std::time::Instant::now();
     let leaf_surface =
         if habit == Habit::Conifer { Surface::Needle } else { Surface::Broadleaf };
 
@@ -157,6 +160,7 @@ fn voxelise(
     let world = crate::tree::anchor(env);
 
     let Some((lo, hi)) = grown.bounds() else {
+        timing::PHASES.voxelise.since(started);
         return TreeVoxels {
             gx: anchor[0],
             gy: anchor[1],
@@ -205,6 +209,7 @@ fn voxelise(
         };
         volume.set(at.x - lo.x, at.y - lo.y, at.z - lo.z, tone);
     }
+    timing::PHASES.voxelise.since(started);
     volume
 }
 
@@ -332,12 +337,15 @@ impl Forest {
         if chunk.z > opts.z_ceiling {
             return meshes;
         }
+        timing::PHASES.chunks.tick();
+        let started = std::time::Instant::now();
         let mut origins = self.nearby(world, chunk, opts, library);
+        origins.sort_unstable();
+        origins.dedup();
+        timing::PHASES.nearby.since(started);
         if origins.is_empty() {
             return meshes;
         }
-        origins.sort_unstable();
-        origins.dedup();
 
         // Only the top of a column carries what rises above it.
         let (cx, cy) = (chunk.block_x, chunk.block_y);
@@ -347,10 +355,14 @@ impl Forest {
             let grown = self.tree(world, library, origin, species, world_origin);
             let Some(grown) = grown else { continue };
             budget.trees += 1;
+            let started = std::time::Instant::now();
             volume.absorb(&grown);
+            timing::PHASES.absorb.since(started);
             hang(&grown.streamers, chunk, &mut meshes.streamers);
         }
+        let started = std::time::Instant::now();
         emit(&volume, &mut meshes, budget);
+        timing::PHASES.emit.since(started);
         meshes
     }
 
@@ -392,7 +404,10 @@ impl Forest {
         if let Some(found) = self.trees.get(&origin) {
             return found.clone();
         }
-        let built = Envelope::read(world, library, origin, species).map(|env| {
+        let started = std::time::Instant::now();
+        let read = Envelope::read(world, library, origin, species);
+        timing::PHASES.envelope.since(started);
+        let built = read.map(|env| {
             let growth = library.growth(species);
             let habit = env.habit(growth);
             let grown = voxelise(&env, library, growth, habit, world_origin);
