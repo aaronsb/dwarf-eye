@@ -4,6 +4,7 @@
 //! The worker owns the [`World`], because face culling needs neighbouring chunks
 //! and it is cheaper to mesh next to the data than to ship the data across.
 
+use crate::clouds::Weather;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
@@ -24,10 +25,14 @@ pub enum Command {
     Clock,
     /// Run a DFHack console command, for driving the world while testing.
     Run { command: String, args: Vec<String> },
+    /// Read the world's cloud cover.
+    Weather,
     Shutdown,
 }
 
 pub enum Event {
+    /// Cloud cover over the embark.
+    Weather(Weather),
     /// Dwarf Fortress's calendar, polled while the world runs.
     Clock { year: i32, tick: i32 },
     /// The packed ground texture, sent once before any geometry.
@@ -124,6 +129,10 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                     Err(e) => events.send(Event::Status(format!("`{command}` failed: {e}")))?,
                 }
             }
+            Command::Weather => {
+                let map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP)?;
+                events.send(Event::Weather(read_weather(&map)))?;
+            }
             Command::Clock => {
                 let map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP_CENTER)?;
                 events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
@@ -161,6 +170,62 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Reads cloud cover over the embark out of the world map.
+///
+/// DF reports a cloud kind per world tile on four-step scales, so each becomes a
+/// coverage fraction. The neighbourhood is averaged because a single world tile
+/// flips between states more abruptly than a sky should.
+fn read_weather(map: &rfr::WorldMap) -> Weather {
+    use dfhack_remote::rfr::{CumulusType, FogType, StratusType};
+
+    let width = map.world_width.max(1);
+    let height = map.world_height.max(1);
+    let (cx, cy) = (map.map_x(), map.map_y());
+
+    let mut totals = [0.0f32; 4];
+    let mut samples = 0.0f32;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let (x, y) = (cx + dx, cy + dy);
+            if x < 0 || y < 0 || x >= width || y >= height {
+                continue;
+            }
+            let Some(cloud) = map.clouds.get((y * width + x) as usize) else { continue };
+            totals[0] += match cloud.cumulus() {
+                CumulusType::CumulusNone => 0.0,
+                CumulusType::CumulusMedium => 0.35,
+                CumulusType::CumulusMulti => 0.62,
+                CumulusType::CumulusNimbus => 0.88,
+            };
+            totals[1] += match cloud.stratus() {
+                StratusType::StratusNone => 0.0,
+                StratusType::StratusAlto => 0.40,
+                StratusType::StratusProper => 0.75,
+                StratusType::StratusNimbus => 0.95,
+            };
+            totals[2] += if cloud.cirrus() { 0.5 } else { 0.0 };
+            totals[3] += match cloud.fog() {
+                FogType::FogNone => 0.0,
+                FogType::FogMist => 0.25,
+                FogType::FogNormal => 0.55,
+                // DFHack's proto spells this one `F0G_THICK`, with a zero.
+                FogType::F0gThick => 0.85,
+            };
+            samples += 1.0;
+        }
+    }
+
+    if samples == 0.0 {
+        return Weather::default();
+    }
+    Weather {
+        cumulus: totals[0] / samples,
+        stratus: totals[1] / samples,
+        cirrus: totals[2] / samples,
+        fog: totals[3] / samples,
     }
 }
 

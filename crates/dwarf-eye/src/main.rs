@@ -4,6 +4,7 @@
 //! Start Dwarf Fortress with DFHack, load a fort or an adventurer, then run this.
 
 mod camera;
+mod clouds;
 mod sky;
 mod stars;
 mod worker;
@@ -23,6 +24,7 @@ use bevy::light::{
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
+use clouds::Weather;
 use sky::Clock;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
@@ -55,8 +57,11 @@ fn main() {
         .init_resource::<Status>()
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
+        .insert_resource(Weather::from_env().unwrap_or_default())
+        .init_resource::<clouds::BuiltFor>()
+        .init_resource::<clouds::GroundLevel>()
         .insert_non_send(Bridge::spawn())
-        .add_systems(Startup, (setup, stars::setup))
+        .add_systems(Startup, (setup, stars::setup, clouds::setup))
         .add_systems(
             Update,
             (
@@ -65,6 +70,8 @@ fn main() {
                 camera::fly,
                 sky::drive_sun,
                 stars::drive,
+                clouds::drive,
+                poll_weather,
                 follow_camera_with_fog,
                 poll_clock,
                 request_blocks,
@@ -212,10 +219,15 @@ fn drain_worker(
     mut status: ResMut<Status>,
     mut settings: ResMut<ViewSettings>,
     mut clock: ResMut<Clock>,
+    mut weather: ResMut<Weather>,
+    mut ground: ResMut<clouds::GroundLevel>,
     mut camera: Query<&mut Transform, With<FlyCamera>>,
 ) {
     for event in bridge.rx.try_iter() {
         match event {
+            Event::Weather(reported) => {
+                *weather = Weather::from_env().unwrap_or(reported);
+            }
             Event::Clock { year, tick } => {
                 *clock = Clock { year, tick };
             }
@@ -262,6 +274,7 @@ fn drain_worker(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(CEILING_ABOVE_PLAYER);
                 settings.z_ceiling = center.2 + offset;
+                ground.0 = center.2 as f32 * Z_SCALE;
                 settings.placed = true;
             }
             Event::Chunks(batch) => {
@@ -414,6 +427,17 @@ fn request_blocks(
     });
 }
 
+/// Asks for the world's cloud cover now and then. The map message is large and
+/// the sky changes slowly, so this is deliberately infrequent.
+fn poll_weather(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
+    *next -= time.delta_secs();
+    if *next > 0.0 {
+        return;
+    }
+    *next = 12.0;
+    let _ = bridge.tx.send(Command::Weather);
+}
+
 /// Recentres the fog volume on the camera.
 fn follow_camera_with_fog(
     camera: Query<&Transform, (With<FlyCamera>, Without<FogFollowsCamera>)>,
@@ -436,6 +460,7 @@ fn poll_clock(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     clock: Res<Clock>,
+    weather: Res<Weather>,
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
@@ -455,7 +480,7 @@ fn update_hud(
         "{}\n{}\n{}  {}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          chunks  {}   triangles {}   {:.0} fps\n\
-         z-ceiling {ceiling}   hidden tiles {}\n\
+         z-ceiling {ceiling}   hidden tiles {}   sky {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
          [ ]  cut plane    H  undiscovered tiles\n\
@@ -475,5 +500,6 @@ fn update_hud(
             .and_then(|d| d.smoothed())
             .unwrap_or(0.0),
         if settings.show_hidden { "shown" } else { "hidden" },
+        weather.describe(),
     );
 }

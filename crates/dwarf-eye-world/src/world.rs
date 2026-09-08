@@ -138,14 +138,24 @@ impl World {
     }
 
     /// Folds a block list into the world, replacing any chunks it covers.
+    ///
+    /// An incremental reply carries blocks whose hash changed for any reason —
+    /// a unit moved, a liquid shifted — and those can arrive with no tile array
+    /// at all. Absorbing one of those would replace a decoded chunk with an
+    /// empty one, so a block with no tiles is left to stand on what is already
+    /// known.
     pub fn absorb(&mut self, list: BlockList) -> usize {
-        let count = list.map_blocks.len();
+        let mut absorbed = 0;
         for block in list.map_blocks {
+            if block.tiles.is_empty() {
+                continue;
+            }
             let chunk = self.decode(&block);
             self.chunks
                 .insert((chunk.block_x, chunk.block_y, chunk.z), chunk);
+            absorbed += 1;
         }
-        count
+        absorbed
     }
 
     fn decode(&self, block: &MapBlock) -> Chunk {
