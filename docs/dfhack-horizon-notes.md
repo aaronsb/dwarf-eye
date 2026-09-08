@@ -48,3 +48,49 @@ region under the live window is not cut away; the fort draws over it.
 
 dwarf-eye does the same two tiers, and additionally masks the coarse mesh per
 block wherever fine chunks reach the ground (`shadow.rs`, `cloud_shadow*.wgsl`).
+
+## Clock in adventure mode
+
+`cur_year_tick` is a fortress-mode counter. Adventure mode leaves it behind and
+keeps `cur_season_tick`, which counts one unit per 10 fortress ticks and wraps
+at 10080 each season. `autofarm.cpp` carries a harvest date across seasons with
+that constant:
+
+```cpp
+int harvest = (*df::global::cur_season_tick) + plant->growdur * 10;
+while (can_plant && harvest >= 10080) { season = (season + 1) % 4; harvest -= 10080; }
+```
+
+So the year tick DF is really running on is
+
+    cur_season * 100800 + cur_season_tick * 10
+
+with 1200 ticks a day, 28 days a month, 12 months a year (403200 a year, 100800
+a season). `World.cpp` and `scripts/position.lua` carry the day and month
+divisors.
+
+`cur_year_tick_advmode` (`precise_phase` in `df.game_v.xml`) is not a usable
+time of day. Timestream advances it 144 per fortress tick:
+
+```cpp
+*cur_year_tick += timeskip;
+*cur_year_tick_advmode += timeskip * 144;
+```
+
+but no divisor of a live reading lands on the hour the game shows, and its
+value survived a write to `cur_year_tick` that the game's own clock did not.
+`position.lua` reads the hour out of it as `advmode // 336`, which does not
+agree with the 144 relation either. Treat it as a phase to carry along, not to
+read from.
+
+Writing `cur_year_tick` alone moves the renderer and nothing else, because DF
+reads the season pair. `df.global.world.status.reports` records the discovery:
+report timestamps ran 17250 to 17368, then dropped to 353, 100, 50, 4 as the
+viewer's `.`/`,` keys wrote the fortress counter. The season pair kept the real
+time throughout. Setting time now writes `cur_year_tick`, `cur_season`,
+`cur_season_tick` together and moves `cur_year_tick_advmode` by the same delta
+timestream would.
+
+Resolution: the season counter steps 10 fortress ticks, so the derived time of
+day is quantised to 12 game minutes. DF exposes nothing finer that stays
+correct.

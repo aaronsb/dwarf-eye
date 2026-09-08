@@ -10,6 +10,7 @@ use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::canopy::{CanopyMeshes, Forest};
+use dwarf_eye_world::clock;
 use dwarf_eye_world::{BLOCK, BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, OnceLock};
@@ -196,8 +197,26 @@ fn run(
                 }
             }
             Command::Clock => {
-                if let Ok(map) = df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP_CENTER) {
-                    events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
+                // Adventure mode abandons cur_year_tick, so read every clock
+                // global and let the reading pick the one its mode keeps.
+                let probed = df.client.run_command("lua", &[clock::PROBE]).is_ok();
+                let reading = probed
+                    .then(|| clock::parse(&df.client.last_notices.concat()))
+                    .flatten();
+                match reading {
+                    Some(r) => events.send(Event::Clock { year: r.year, tick: r.year_tick() })?,
+                    // The Lua path needs a script interpreter; the map center
+                    // is always there.
+                    None => {
+                        if let Ok(map) =
+                            df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP_CENTER)
+                        {
+                            events.send(Event::Clock {
+                                year: map.cur_year(),
+                                tick: map.cur_year_tick(),
+                            })?;
+                        }
+                    }
                 }
             }
             Command::Fetch { center, opts, force } => {

@@ -580,7 +580,7 @@ fn handle_input(
         let target = clock.tick + nudge * step;
         let _ = bridge.tx.send(Command::Run {
             command: "lua".into(),
-            args: vec![format!("df.global.cur_year_tick = {}", target.max(0))],
+            args: vec![dwarf_eye_world::clock::set_time(target)],
         });
     }
 
