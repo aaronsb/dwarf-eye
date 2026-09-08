@@ -43,6 +43,10 @@ const FACE_SHADE: [f32; 6] = [0.70, 0.70, 0.50, 1.0, 0.82, 0.82];
 /// Tiles of world beyond a chunk whose trees can still reach into it.
 const REACH: i32 = 2;
 
+/// Z-levels above the top of a loaded column that its chunk still draws, so a
+/// crown is never shorn off at the ceiling of what has been sent.
+const OVERHEAD: i32 = 24;
+
 /// Which of the canopy materials a face wants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Surface {
@@ -335,7 +339,10 @@ impl Forest {
         origins.sort_unstable();
         origins.dedup();
 
-        let mut volume = Volume::new(chunk);
+        // Only the top of a column carries what rises above it.
+        let (cx, cy) = (chunk.block_x, chunk.block_y);
+        let above = if world.chunk(cx, cy, chunk.z + 1).is_some() { 0 } else { OVERHEAD };
+        let mut volume = Volume::new(chunk, above);
         for (origin, species) in origins {
             let grown = self.tree(world, library, origin, species, world_origin);
             let Some(grown) = grown else { continue };
@@ -466,8 +473,12 @@ struct Volume {
 }
 
 impl Volume {
-    fn new(chunk: &Chunk) -> Self {
-        let (nx, ny) = (BLOCK * DETAIL, DETAIL);
+    /// `above` is how many further z-levels this chunk has to carry because
+    /// nothing is loaded over it. A crown reaching past the top of its column
+    /// would otherwise have no chunk to be drawn in and would end flat at the
+    /// loaded ceiling.
+    fn new(chunk: &Chunk, above: i32) -> Self {
+        let (nx, ny) = (BLOCK * DETAIL, DETAIL * (1 + above.max(0)));
         Self {
             nx,
             ny,
@@ -713,7 +724,7 @@ mod tests {
 
     #[test]
     fn a_shade_is_interned_once_per_surface() {
-        let mut volume = Volume::new(&test_chunk(0, 0, 0));
+        let mut volume = Volume::new(&test_chunk(0, 0, 0), 0);
         let bark = Tone { color: [0.4, 0.3, 0.2], surface: Surface::Bark };
         let leaf = Tone { surface: Surface::Broadleaf, ..bark };
         assert_eq!(volume.intern(bark), volume.intern(bark));
