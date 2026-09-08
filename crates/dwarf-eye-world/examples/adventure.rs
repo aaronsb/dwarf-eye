@@ -67,6 +67,57 @@ fn main() -> Result<()> {
         units.creature_list.len()
     );
 
+    // `--ground` prints the ground around the character exactly as walk mode
+    // reads it, which is what decides whether a step is even offered. Purely a
+    // read: nothing moves.
+    if std::env::args().any(|a| a == "--ground") {
+        use dwarf_eye_world::{BLOCK, BlockBounds, Solid};
+        df.refresh_window()?;
+        let here = df.view_center()?;
+        let block = (here.0.div_euclid(BLOCK), here.1.div_euclid(BLOCK));
+        df.fetch(
+            BlockBounds {
+                min_x: block.0 - 1,
+                max_x: block.0 + 2,
+                min_y: block.1 - 1,
+                max_y: block.1 + 2,
+                min_z: here.2 - 2,
+                max_z: here.2 + 3,
+            },
+            true,
+        )?;
+        println!("\n== the ground around the character, as walk mode reads it ==");
+        println!("   . empty   # wall   _ floor   / ramp   > stair   * foliage   ? not loaded");
+        for dz in [1, 0, -1] {
+            let which = match dz {
+                1 => "above",
+                0 => "the character's own",
+                _ => "below",
+            };
+            println!("\n  level {} ({which}):", here.2 + dz);
+            for dy in -4..=4 {
+                let row: String = (-4..=4)
+                    .map(|dx| {
+                        match df.world.voxel(here.0 + dx, here.1 + dy, here.2 + dz).map(|v| v.solid)
+                        {
+                            None => '?',
+                            Some(Solid::Empty) => '.',
+                            Some(Solid::Cube | Solid::Fortification) => '#',
+                            Some(Solid::Floor) => '_',
+                            Some(Solid::Ramp) => '/',
+                            Some(Solid::Stair) => '>',
+                            Some(Solid::Foliage) => '*',
+                        }
+                    })
+                    .collect();
+                let mark = if dy == 0 { "   <- the character stands in the middle of this row" } else { "" };
+                println!("    {row}{mark}");
+            }
+        }
+        println!("\n  north is up, east is right.");
+        return Ok(());
+    }
+
     // `--trail <seconds>` just watches, printing every tile the character
     // moves to. Run it beside the viewer to see walk mode drive the game.
     if let Some(i) = std::env::args().position(|a| a == "--trail") {
