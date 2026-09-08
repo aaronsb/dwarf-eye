@@ -106,14 +106,22 @@ impl ViewSettings {
 }
 
 #[derive(Resource, Default)]
-struct ChunkEntities(HashMap<ChunkKey, (Entity, usize)>);
+struct ChunkEntities(HashMap<ChunkKey, Spawned>);
+
+/// What one chunk put on the GPU: its terrain, its crown if it has one, and
+/// what the pair cost.
+struct Spawned {
+    terrain: Option<Entity>,
+    canopy: Option<Entity>,
+    triangles: usize,
+}
 
 /// Meshes that have arrived from the worker and not yet reached the GPU.
 /// Uploads are budgeted per frame, nearest to the camera first, so a burst of
 /// chunks never stalls a frame. A later mesh for the same chunk replaces an
 /// earlier one still waiting.
 #[derive(Resource, Default)]
-struct PendingChunks(HashMap<ChunkKey, MeshData>);
+struct PendingChunks(HashMap<ChunkKey, (MeshData, MeshData)>);
 
 /// Chunk meshes uploaded per frame.
 const UPLOAD_BUDGET: usize = 24;
@@ -147,6 +155,12 @@ pub struct TerrainMaterial(pub Handle<TerrainMat>);
 /// yield wherever a fine chunk is loaded.
 #[derive(Resource)]
 pub struct HorizonMaterial(pub Handle<TerrainMat>);
+
+/// Tree crowns. Their own material so they can be shaded as leaves rather than
+/// as stone, and so cloud shadows still reach them: `clouds::bake_shadow`
+/// updates every terrain material asset, and this is one of them.
+#[derive(Resource)]
+pub struct CanopyMaterial(pub Handle<TerrainMat>);
 
 /// One texel per block, marking where fine chunks reach the ground. The worker
 /// decides which blocks qualify; this only paints them.
@@ -234,6 +248,15 @@ fn setup(
     };
     commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
     commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
+
+    // Leaves are rough and scatter light through themselves, and the geometry
+    // is already full of holes, so no alpha mask and no double-sided draw.
+    let mut leaves = terrain(0.0);
+    leaves.base.alpha_mode = AlphaMode::Opaque;
+    leaves.base.perceptual_roughness = 0.95;
+    leaves.base.diffuse_transmission = 0.45;
+    leaves.base.thickness = 0.25;
+    commands.insert_resource(CanopyMaterial(materials.add(leaves)));
     commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });
 
     commands.spawn((
@@ -327,8 +350,8 @@ fn drain_worker(
                 mask.dirty = true;
             }
             Event::Chunks(batch) => {
-                for (key, data) in batch {
-                    pending.0.insert(key, data);
+                for (key, terrain, crown) in batch {
+                    pending.0.insert(key, (terrain, crown));
                 }
             }
             Event::Status(text) => status.detail = text,
@@ -346,6 +369,7 @@ fn upload_chunks(
     mut pending: ResMut<PendingChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Res<TerrainMaterial>,
+    canopy_material: Res<CanopyMaterial>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
     camera: Query<&Transform, With<FlyCamera>>,
@@ -366,26 +390,33 @@ fn upload_chunks(
     keys.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
 
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
-        let Some(data) = pending.0.remove(&key) else { continue };
-        if let Some((entity, _)) = entities.0.remove(&key) {
-            commands.entity(entity).despawn();
+        let Some((data, crown)) = pending.0.remove(&key) else { continue };
+        if let Some(old) = entities.0.remove(&key) {
+            for entity in [old.terrain, old.canopy].into_iter().flatten() {
+                commands.entity(entity).despawn();
+            }
         }
-        if data.is_empty() {
+        if data.is_empty() && crown.is_empty() {
             continue;
         }
-        let triangles = data.triangle_count();
-        let handle = meshes.add(to_bevy_mesh(data));
-        let entity = commands
-            .spawn((
-                Mesh3d(handle),
-                MeshMaterial3d(material.0.clone()),
-                Transform::IDENTITY,
-                ChunkTag(key),
-            ))
-            .id();
-        entities.0.insert(key, (entity, triangles));
+        let triangles = data.triangle_count() + crown.triangle_count();
+        let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>| {
+            (!mesh.is_empty()).then(|| {
+                commands
+                    .spawn((
+                        Mesh3d(meshes.add(to_bevy_mesh(mesh))),
+                        MeshMaterial3d(material),
+                        Transform::IDENTITY,
+                        ChunkTag(key),
+                    ))
+                    .id()
+            })
+        };
+        let terrain = spawn(data, material.0.clone());
+        let canopy = spawn(crown, canopy_material.0.clone());
+        entities.0.insert(key, Spawned { terrain, canopy, triangles });
     }
-    status.triangles = entities.0.values().map(|(_, t)| t).sum();
+    status.triangles = entities.0.values().map(|s| s.triangles).sum();
 }
 
 /// A mask with nothing loaded.

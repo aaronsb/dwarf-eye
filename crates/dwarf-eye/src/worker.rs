@@ -8,7 +8,7 @@ use crate::clouds::Weather;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
-use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk};
+use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk, canopy};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -40,8 +40,10 @@ pub enum Event {
     /// The packed ground texture, sent once before any geometry.
     Atlas { width: u32, height: u32, pixels: Vec<u8> },
     Connected { world_name: String, save: String, center: (i32, i32, i32), size: (i32, i32, i32) },
-    /// Geometry for chunks that changed; an empty `data` means "despawn this one".
-    Chunks(Vec<(ChunkKey, MeshData)>),
+    /// Geometry for chunks that changed, terrain then crown. Crowns ride their
+    /// own material, so they arrive as their own mesh. Two empty meshes mean
+    /// "despawn this one".
+    Chunks(Vec<(ChunkKey, MeshData, MeshData)>),
     /// Coarse terrain beyond the loaded map, sent once the map's surface is known.
     Horizon(MeshData),
     /// Blocks whose fine chunks reach the ground, where the horizon must yield.
@@ -287,7 +289,10 @@ fn collect(
     let dropped = df.world.retain_within(keep);
     if !dropped.is_empty() {
         events.send(Event::Chunks(
-            dropped.iter().map(|&k| (k, MeshData::default())).collect(),
+            dropped
+                .iter()
+                .map(|&k| (k, MeshData::default(), MeshData::default()))
+                .collect(),
         ))?;
     }
 
@@ -365,7 +370,11 @@ fn remesh_touched(
     for key in keys {
         let Some(chunk) = df.world.chunk(key.0, key.1, key.2) else { continue };
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
-        batch.push((key, mesh));
+        let crown = match library.as_deref_mut() {
+            Some(lib) => canopy::build(&df.world, chunk, opts, lib),
+            None => MeshData::default(),
+        };
+        batch.push((key, mesh, crown));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
             batch.reserve(BATCH);
@@ -389,7 +398,11 @@ fn remesh_all(
     for chunk in df.world.chunks() {
         let key = (chunk.block_x, chunk.block_y, chunk.z);
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
-        batch.push((key, mesh));
+        let crown = match library.as_deref_mut() {
+            Some(lib) => canopy::build(&df.world, chunk, opts, lib),
+            None => MeshData::default(),
+        };
+        batch.push((key, mesh, crown));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
             batch.reserve(BATCH);
