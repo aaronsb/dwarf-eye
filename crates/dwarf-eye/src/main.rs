@@ -48,6 +48,32 @@ use worker::{Bridge, ChunkKey, Command, Event};
 /// overhead would shear the canopy off.
 const CEILING_ABOVE_PLAYER: i32 = 16;
 
+/// A sky held against what the game reports, from the environment.
+///
+/// `DWARF_EYE_CLOUDS=cumulus=0.5,fog=0.4` names the kinds; `DWARF_EYE_WEATHER=`
+/// `clear|rain|snow` is the same three skies the `1` `2` `3` keys ask the game
+/// for, without asking the game — the keys change the player's weather, this
+/// only changes the picture.
+fn forced_weather() -> Option<Weather> {
+    let preset = match std::env::var("DWARF_EYE_WEATHER").as_deref() {
+        Ok("clear") => Weather::default(),
+        Ok("rain") => Weather { cumulus: 0.35, stratus: 0.95, cirrus: 0.0, fog: 0.15 },
+        Ok("snow") => Weather { cumulus: 0.2, stratus: 0.8, cirrus: 0.0, fog: 0.45 },
+        _ => return Weather::from_env(),
+    };
+    Some(preset)
+}
+
+/// One line naming the world and the game's date, printed once both are known,
+/// so an unattended shot can be labelled with what it caught.
+fn log_scene(clock: Res<Clock>, status: Res<Status>, mut said: Local<bool>) {
+    if *said || status.world.is_empty() || clock.year == 0 {
+        return;
+    }
+    *said = true;
+    info!("scene: world {} date {}", status.world, clock.describe());
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -70,7 +96,7 @@ fn main() {
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
         .init_resource::<walk::WalkMode>()
-        .insert_resource(Weather::from_env().unwrap_or_default())
+        .insert_resource(forced_weather().unwrap_or_default())
         .insert_non_send(Bridge::spawn())
         .add_systems(Startup, (setup, stars::setup))
         .add_systems(
@@ -85,6 +111,7 @@ fn main() {
                 stars::drive,
                 poll_weather,
                 poll_clock,
+                log_scene,
                 request_blocks,
                 refresh_mask,
                 update_hud,
@@ -351,6 +378,12 @@ fn setup(
         Text::new("connecting to DFHack…"),
         TextFont { font_size: FontSize::Px(13.0), ..default() },
         Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
+        // DWARF_EYE_HUD=off leaves the overlay out of the picture, for a shot
+        // that is meant to show the world rather than the instrument.
+        match std::env::var("DWARF_EYE_HUD").as_deref() {
+            Ok("off") | Ok("0") | Ok("hidden") => Visibility::Hidden,
+            _ => Visibility::Inherited,
+        },
         Hud,
     ));
 }
@@ -377,7 +410,7 @@ fn drain_worker(
     for event in bridge.rx.try_iter() {
         match event {
             Event::Weather(reported) => {
-                *weather = Weather::from_env().unwrap_or(reported);
+                *weather = forced_weather().unwrap_or(reported);
             }
             Event::Clock { year, tick } => {
                 // DWARF_EYE_HOUR pins the hour the view is lit at without

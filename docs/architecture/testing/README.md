@@ -1,7 +1,8 @@
 # Testing and validation
 
 Status: landed (`Makefile`, `crates/*/src` unit tests,
-`crates/dwarf-eye-world/examples/`, `crates/dwarf-eye/tests/walk_sync.rs`).
+`crates/dwarf-eye-world/examples/`, `crates/dwarf-eye/tests/walk_sync.rs`,
+`tools/showcase/`).
 
 ## Four layers
 
@@ -60,11 +61,42 @@ conveniences. `make lab` and `make lab-shot` run the tree bench with no game;
 `TREE_LAB_SUN` aims its light, and a viewer-side `DWARF_EYE_HOUR` joins them
 once issue #14 lands.
 
+### The showcase, and visual regression
+
+`make showcase` shoots every scene in `tools/showcase/scenes.toml` and writes
+[the gallery](../../gallery/README.md): the images, a caption each, the exact
+env command that reproduces each one, and a header naming the world, the game
+date and the commit. Adding a scene is one entry in that file and no code: id,
+title, caption, group, an env map, and `baseline = true` if it should be
+watched. Every shot runs its own viewer with a private `XDG_CACHE_HOME`, so the
+cache the user's own instance shares is untouched, and with `DWARF_EYE_HUD=off`.
+Nothing in a scene may touch the game: the hour is pinned with `DWARF_EYE_HOUR`
+and the sky with `DWARF_EYE_CLOUDS` or `DWARF_EYE_WEATHER`. A shot that comes
+back as bare sky means the game was between maps rather than the scene being
+wrong, so the runner takes that frame again, up to three times.
+
+`make showcase-check` re-shoots only the scenes marked `baseline`, into a
+temporary directory, and prints the mean absolute pixel difference against what
+is committed under `docs/gallery/`, failing over `DRIFT` (6 by default, in
+levels out of 255). That is the visual regression layer: a shader or mesher
+change that alters the look shows up as a number.
+
+Its one condition is the game. Every framing is anchored on the character —
+`DWARF_EYE_CAM` and `DWARF_EYE_VIEW` place the camera relative to where the
+adventurer stands — and DF holds only 144 tiles around them, so a character who
+has walked since the gallery was shot puts a different world in front of the
+lens. Two shots taken half a minute apart while the player walks differ by 20
+levels and more, which is the world moving, not the renderer. Run it with the
+game standing where the gallery was shot; if the character has moved, re-shoot
+the gallery with `make showcase` instead of reading a regression into the
+numbers.
+
 ## What a change must include
 
 - Name which layers it touched.
 - New pure logic gets a unit test.
-- A look change gets a screenshot pair in the report.
+- A look change gets a screenshot pair in the report, and, if it touches
+  anything a baseline scene shows, a `make showcase-check` line.
 - Never `pkill dwarf-eye`: the user is usually in their own viewer. Verify with
   your own instance and a shot that exits.
 - The game clock belongs to the player. Use a viewer-side override where one
