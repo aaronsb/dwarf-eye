@@ -53,6 +53,12 @@ pub struct Pass {
     /// Columns whose floor was dropped this pass, with the level of the ground
     /// that dropped it. Absolute block columns.
     pub reopened: Vec<((i32, i32), i32)>,
+    /// Chunks a forced pass asked about and the game did not answer with, in
+    /// render keys. They have been dropped from the world and the cache.
+    pub stale: Vec<(i32, i32, i32)>,
+    /// The window moved while the pass was in flight, so it neither trusted its
+    /// own frame nor dropped anything.
+    pub window_moved: bool,
 }
 
 /// Which levels of a column a descent asks about.
@@ -240,6 +246,52 @@ struct Descent {
     asked: i32,
     requests: i32,
     news: Vec<Sighting>,
+    /// Every chunk the descent asked about, in render keys. Only a forced
+    /// descent fills this: what an unforced one leaves out means unchanged.
+    asked_keys: Vec<(i32, i32, i32)>,
+    /// A reply came back in a different window frame from the one the descent
+    /// began in, so its box says nothing about what is or is not there.
+    moved: bool,
+}
+
+/// The keys a forced pass asked about that nothing came back for.
+///
+/// The live window is the game's own answer about the land it covers, so a
+/// block it does not hand over on a forced request is not there: DFHack drops a
+/// block whose 256 tiles are all air or nothing. Anything the cache still shows
+/// at that key is land the game has moved on from, and it stays on screen for
+/// as long as it is never contradicted, because absence is what a hash-gated
+/// reply is made of.
+fn unanswered(
+    asked: &[(i32, i32, i32)],
+    arrived: &[(i32, i32, i32)],
+) -> Vec<(i32, i32, i32)> {
+    let came: HashSet<(i32, i32, i32)> = arrived.iter().copied().collect();
+    let mut out: Vec<_> = asked.iter().copied().filter(|k| !came.contains(k)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Where a reply's own local coordinates sit, in render blocks and levels.
+///
+/// Every `BlockList` carries the window's position at the moment the server
+/// built it. The window follows the character, so a pass that spans a
+/// re-centring gets its replies in two frames a region tile apart; placing the
+/// later ones by the frame the pass began in wrote land 48 tiles from where it
+/// belonged, and the cache kept it there. `None` when the reply does not say,
+/// which leaves the pass's own frame standing.
+fn reply_frame(
+    list: &rfr::BlockList,
+    origin: (i32, i32, i32),
+    z: i32,
+) -> Option<(i32, i32, i32)> {
+    let (x, y) = (list.map_x?, list.map_y?);
+    Some((
+        (x * REGION_TILE - origin.0).div_euclid(BLOCK),
+        (y * REGION_TILE - origin.1).div_euclid(BLOCK),
+        z,
+    ))
 }
 
 pub struct Session {
@@ -513,6 +565,23 @@ impl Session {
         let mut arrived = surface.arrived;
         let mut news = surface.news;
 
+        // While the live window covers a block, the game is the authority on
+        // it. A forced request is the whole truth about the box it asked for,
+        // so a chunk still standing where nothing came back is land the game
+        // has moved on from: a felled tree, a block that is now air, or a chunk
+        // written 48 tiles off by a pass that spanned a re-centring.
+        pass.window_moved = surface.moved;
+        if force && !surface.moved {
+            for key in unanswered(&surface.asked_keys, &arrived) {
+                if self.world.remove(key) {
+                    pass.stale.push(key);
+                }
+                if let Some(cache) = &self.cache {
+                    cache.remove(self.absolute(key));
+                }
+            }
+        }
+
         // Under the floors, now and then. A forced pass is left alone: it is
         // the character stepping into new ground or the first pass of a
         // session, and both are expensive enough already.
@@ -595,6 +664,22 @@ impl Session {
             out.asked += footprint * (top - bottom);
             out.requests += 1;
             let mut list: rfr::BlockList = self.client.call(methods::GET_BLOCK_LIST, &request)?;
+            // The reply says which window it was built in. A pass that spans a
+            // re-centring places its later blocks by that frame rather than by
+            // the one it started in.
+            let frame = reply_frame(&list, self.origin, shift.2).unwrap_or(shift);
+            if frame != shift {
+                out.moved = true;
+            } else if force {
+                for z in bottom..top {
+                    for bx in wide.min_x..wide.max_x {
+                        for by in wide.min_y..wide.max_y {
+                            out.asked_keys.push((bx + shift.0, by + shift.1, z + shift.2));
+                        }
+                    }
+                }
+            }
+            let shift = frame;
             // Read the levels off the reply rather than off the world, so a
             // probe can weigh a block it is not going to keep.
             let batch = self.read_levels(&list, shift);
@@ -940,6 +1025,35 @@ mod tests {
         let news = floors.settle(&reply((0, 0), &[(100, false)]));
         assert!(news.is_empty());
         assert!(floors.spread(&news).is_empty());
+    }
+
+    #[test]
+    fn a_forced_pass_keeps_only_what_the_game_answered_with() {
+        let asked =
+            vec![(0, 0, 10), (0, 0, 9), (1, 0, 10), (1, 0, 9), (0, 0, 10)];
+        let arrived = vec![(0, 0, 10), (1, 0, 9), (7, 7, 7)];
+        assert_eq!(
+            unanswered(&asked, &arrived),
+            vec![(0, 0, 9), (1, 0, 10)],
+            "asked and unanswered, each once, and nothing it never asked about"
+        );
+        assert!(unanswered(&[], &arrived).is_empty(), "an unforced pass asks nothing of the cache");
+    }
+
+    #[test]
+    fn a_reply_is_placed_by_the_window_it_was_built_in() {
+        // Origin pinned one region tile east of the world's corner.
+        let origin = (48, 96, -29);
+        let mut list = rfr::BlockList::default();
+        assert_eq!(reply_frame(&list, origin, 3), None, "a reply that says nothing moves nothing");
+        // The window where the pass began: the frame is zero.
+        list.map_x = Some(1);
+        list.map_y = Some(2);
+        assert_eq!(reply_frame(&list, origin, 3), Some((0, 0, 3)));
+        // The character crossed east mid-pass and the game re-centred: 48 tiles
+        // on, which is three blocks.
+        list.map_x = Some(2);
+        assert_eq!(reply_frame(&list, origin, 3), Some((3, 0, 3)));
     }
 
     #[test]

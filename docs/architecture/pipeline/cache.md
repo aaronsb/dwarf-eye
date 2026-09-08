@@ -22,6 +22,29 @@ Alongside the chunks sits `floors`, one line per block column giving the level
 at which that column turned to unrevealed rock, versioned by its first line
 `def1` (`cache.rs:load_floors`, `cache.rs:store_floors`).
 
+## The game wins where the window reaches
+
+The cache is only for land the game no longer holds. Inside the live window the
+game is the authority, so a forced request is the whole truth about the box it
+asked for: `Session::fetch` records every key a forced descent asked about, and
+`session.rs:unanswered` names the ones nothing came back for. Those chunks are
+dropped from the world and their files deleted, and `worker.rs:collect`
+despawns their meshes and remeshes their neighbours. An unforced pass records
+nothing, because there absence means unchanged.
+
+DFHack never sends a block whose 256 tiles are all air or nothing, forced or
+not, so "asked for and not answered" reads as "there is no land there". That is
+what carried a felled tree, or a crown written under the wrong key, from one
+session to the next: nothing in a hash-gated reply ever contradicts a chunk the
+cache already holds.
+
+Every reply also says which window it was built in (`BlockList::map_x/map_y`,
+DFHack's own `Maps::getPosition`). A pass takes seconds and the window follows
+the character, so a reply can arrive in a frame one region tile — 48 tiles, 3
+blocks — from the one the pass began in. `session.rs:reply_frame` places each
+reply by its own frame; a pass that saw the window move places its blocks but
+drops nothing, since its box no longer describes where it looked.
+
 Column floors are the fetch depth. `Session::fetch` descends in slabs and
 `Session::open_box` narrows the request box to the columns still open. The
 bookkeeping lives in `session.rs:Floors`, one stop and one deepest-seen level
@@ -60,6 +83,11 @@ per column, with these rules:
   blocks are re-asked forced, one small request per level.
 - The change hashes belong to the plugin, not the connection: a second viewer on
   the same game consumes changes the first would have been sent.
+- Only what a forced pass asked about is dropped. Land under a column floor is
+  never asked and so is never dropped; the probe is what looks there.
+- `crates/dwarf-eye-world/examples/stale.rs` weighs the cache against a forced
+  fetch of the whole window. A wrong chunk shows as a perfect match a few blocks
+  away; an old one as a handful of tiles.
 - The cache is shared with the user's own running instance. Bump `MAGIC` or
   `FLOORS_VERSION` rather than deleting files; `make clean-cache` is the
   deliberate reset.

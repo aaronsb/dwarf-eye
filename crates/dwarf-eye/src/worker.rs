@@ -383,6 +383,30 @@ fn collect(
 
     let arrived = df.fetch(bounds, force || moved)?;
 
+    // Land the forced pass proved is no longer there. The chunks are already
+    // out of the world and the cache; the meshes and any tree grown off those
+    // tiles go with them.
+    if df.last_pass.window_moved {
+        bevy::log::info!(
+            "window moved while the pass was in flight; its replies were placed by their own frame"
+        );
+    }
+    let stale = std::mem::take(&mut df.last_pass.stale);
+    if !stale.is_empty() {
+        bevy::log::info!(
+            "cache: {} chunks dropped, the game answered nothing for them: {:?}",
+            stale.len(),
+            &stale[..stale.len().min(8)],
+        );
+        forest.retire_near(&stale);
+        events.send(Event::Chunks(
+            stale
+                .iter()
+                .map(|&k| (k, MeshData::default(), CanopyMeshes::default()))
+                .collect(),
+        ))?;
+    }
+
     // Chunks stay as the character travels, so the map paints in. Only what
     // is far behind the camera is retired.
     // Retire only what is far away horizontally. Never clip vertically: the
@@ -423,11 +447,11 @@ fn collect(
         );
     }
 
-    if !arrived.is_empty() || !dropped.is_empty() {
+    if !arrived.is_empty() || !dropped.is_empty() || !stale.is_empty() {
         events.send(Event::Coverage(grounded_blocks(&df.world)))?;
     }
     let mut cost = std::collections::HashMap::new();
-    if !arrived.is_empty() {
+    if !arrived.is_empty() || !stale.is_empty() {
         df.persist(&arrived);
         events.send(Event::Status(format!(
             "{} blocks fetched, {} chunks held",
@@ -435,11 +459,12 @@ fn collect(
             df.world.chunk_count()
         )))?;
         // A new block changes its neighbours' culling, so those remesh along
-        // with it.
+        // with it, and so do the neighbours of one that has just gone away.
         // A block that has just arrived can lengthen a tree whose top we could
         // not see, so those trees are grown again rather than reused.
         forest.retire_near(&arrived);
-        cost = remesh_touched(df, library.as_deref_mut(), forest, opts, events, &arrived)?;
+        let touched: Vec<_> = arrived.iter().chain(stale.iter()).copied().collect();
+        cost = remesh_touched(df, library.as_deref_mut(), forest, opts, events, &touched)?;
     }
 
     // The outer terrain needs the map's own surface to meet it, so it waits
