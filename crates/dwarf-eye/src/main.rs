@@ -181,7 +181,8 @@ impl ViewSettings {
     }
 }
 
-/// Where the near canopy band gives way to the mid one, in tiles.
+/// Where the near canopy band ends, in tiles. Every later hand-off follows from
+/// it (`canopy::Band::edge`).
 ///
 /// Recomputed from the camera's lens and the window's height, since both
 /// decide how many pixels a leaf voxel covers.
@@ -200,10 +201,12 @@ const BAND_FAR: f32 = 40000.0;
 
 /// Where one band hands over to the next, in tiles, nearest first.
 ///
-/// One edge per handover, so `canopy::BANDS` and this list grow together: a
-/// coarser stage is one more edge and one more mesh, never a new shape.
+/// One edge per handover, each from the band's own leaf voxel
+/// (`canopy::Band::edge`), so `canopy::BANDS` and this list grow together: a
+/// coarser stage is one more entry there and nothing here. The last band runs
+/// to the far plane and has no edge.
 fn band_edges(near: f32) -> Vec<f32> {
-    vec![near]
+    BANDS[..BANDS.len() - 1].iter().map(|band| band.edge(near)).collect()
 }
 
 /// One range per band, nearest first. Each band's end margin is the next one's
@@ -242,7 +245,7 @@ struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 /// What one chunk put on the GPU: its terrain, one entity per canopy material
 /// per band, and what each band costs.
 ///
-/// Only one band draws at a time — `VisibilityRange` swaps them — so the two
+/// Only one band draws at a time — `VisibilityRange` swaps them — so the band
 /// triangle counts are alternatives, not a sum.
 struct Spawned {
     terrain: Option<Entity>,
@@ -349,7 +352,7 @@ pub struct CanopyMaterials {
     pub broadleaf: Handle<TerrainMat>,
     pub needle: Handle<TerrainMat>,
     pub streamers: Handle<TerrainMat>,
-    /// The mid band's whole crown, bark and all: the leaf shading with no
+    /// The far band's whole crown, bark and all: the leaf shading with no
     /// cutout, so it draws opaque, writes depth in the prepass and never
     /// discards.
     pub leaf: Handle<TerrainMat>,
@@ -665,10 +668,10 @@ fn drain_worker(
 /// Sizes the canopy bands from the lens and the window, and rewrites the
 /// ranges already on the GPU when either changes.
 ///
-/// The rule is projected size, not distance: the near band ends where a
-/// near-detail leaf voxel stops covering two pixels
-/// (`dwarf_eye_world::canopy::near_band`), so a taller window or a longer lens
-/// pushes it out. `DWARF_EYE_LOD_NEAR` overrides it, in blocks.
+/// The rule is projected size, not distance: each band ends where its own leaf
+/// voxel stops covering two pixels (`dwarf_eye_world::canopy::near_band` and
+/// `Band::edge`), so a taller window or a longer lens pushes them all out.
+/// `DWARF_EYE_LOD_NEAR` overrides the near edge, in blocks.
 fn size_bands(
     mut bands: ResMut<Bands>,
     windows: Query<&Window>,
@@ -692,8 +695,9 @@ fn size_bands(
         }
     }
     info!(
-        "canopy bands: near out to {near:.0} tiles ({:.1} blocks), mid beyond",
-        near / BLOCK as f32
+        "canopy bands: near out to {near:.0} tiles ({:.1} blocks), mid to {:.0}, far beyond",
+        near / BLOCK as f32,
+        Band::Mid.edge(near)
     );
 }
 

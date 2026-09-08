@@ -24,10 +24,11 @@
 //! resolution is a blob; they are meshed by the growth crate at its own
 //! resolution and stamped in.
 //!
-//! Every chunk is built twice, once per [`Band`]: the near band is all of the
-//! above, the mid band is the same trees rasterised at a quarter of the voxel
-//! resolution, with no plants, no tufts and no strands. The two rise as far
-//! apart on screen as [`near_band`] says, and Bevy swaps between them.
+//! Every chunk is built once per [`Band`]: the near band is all of the above,
+//! the mid band the same trees at half the voxel resolution and still under the
+//! leaf cutout, the far band a quarter of it and opaque. They hand over at the
+//! projected sizes [`near_band`] and [`Band::edge`] say, and Bevy swaps between
+//! them.
 
 use crate::factory::{self, Class, Extent, Style, Treatment};
 use crate::library::TileLibrary;
@@ -63,21 +64,28 @@ const REACH: i32 = 2;
 /// crown is never shorn off at the ceiling of what has been sent.
 const OVERHEAD: i32 = 24;
 
-/// Sub-voxels per tile the mid band cuts a tree into: a quarter of [`DETAIL`],
+/// Sub-voxels per tile the mid band cuts a tree into: half of [`DETAIL`], so a
+/// crown holds an eighth of the near band's cells and its leaves still wear the
+/// cutout.
+pub const MID_DETAIL: i32 = DETAIL / 2;
+
+/// Sub-voxels per tile the far band cuts a tree into: a quarter of [`DETAIL`],
 /// so a crown holds a sixty-fourth of the near band's cells and its merged
 /// faces are whole tiles across.
-pub const MID_DETAIL: i32 = DETAIL / 4;
+pub const FAR_DETAIL: i32 = DETAIL / 4;
 
 /// How finely one chunk's crowns are cut, and what rides along with them.
 ///
 /// The near band is the full tree, its plants and its hanging strands. The mid
-/// band is the same tree at [`MID_DETAIL`] and nothing else: at that distance a
-/// tuft is under a pixel, and the strands and cutout leaves cost a masked pass
-/// to draw air.
+/// band is the same tree at [`MID_DETAIL`], without the ground cover but still
+/// under the leaf cutout, so light keeps coming through a crown well past the
+/// first hand-off. The far band is [`FAR_DETAIL`] and opaque: a tuft is under a
+/// pixel there and a hole in the cutout costs a masked pass to draw air.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Band {
     Near,
     Mid,
+    Far,
 }
 
 /// The bands a chunk is built in, nearest first.
@@ -85,14 +93,26 @@ pub enum Band {
 /// The list is the whole of the ordering: a coarser stage — a canonical crown
 /// per species, a green box — is one more entry here, one more mesh per chunk
 /// and one more handover distance, with nothing else to restructure.
-pub const BANDS: [Band; 2] = [Band::Near, Band::Mid];
+pub const BANDS: [Band; 3] = [Band::Near, Band::Mid, Band::Far];
 
 impl Band {
     pub fn detail(self) -> i32 {
         match self {
             Band::Near => DETAIL,
             Band::Mid => MID_DETAIL,
+            Band::Far => FAR_DETAIL,
         }
+    }
+
+    /// Where this band hands over to the next, in tiles, given where the near
+    /// band ends.
+    ///
+    /// [`near_band`]'s rule applied to this band's own leaf voxel: a voxel
+    /// `DETAIL / detail` times as wide still covers [`MIN_LEAF_PIXELS`] that
+    /// many times further out. The last band hands over to nothing and its edge
+    /// is never asked for.
+    pub fn edge(self, near: f32) -> f32 {
+        near * DETAIL as f32 / self.detail() as f32
     }
 
     /// Whether this band carries the ground cover: standing plants, tufts and
@@ -101,34 +121,41 @@ impl Band {
         self == Band::Near
     }
 
+    /// Whether a weeping crown's strands come with this band. They are quads
+    /// the growth crate has already meshed, so carrying them one band further
+    /// out costs a copy rather than a rasterisation.
+    fn strands(self) -> bool {
+        self != Band::Far
+    }
+
     /// Which of [`CanopyMeshes`]'s four meshes a surface goes into.
     ///
-    /// The near band splits by material, since each wants its own cutout. The
-    /// mid band puts everything in the first, because one mesh on one material
-    /// is one entity and one draw call per chunk, and a chunk that far off has
-    /// no bark grain or leaf holes left to tell apart.
+    /// The cutout bands split by material, since each wants its own cutout.
+    /// The far band puts everything in the first, because one mesh on one
+    /// material is one entity and one draw call per chunk, and a chunk that far
+    /// off has no bark grain or leaf holes left to tell apart.
     fn slot(self, surface: Surface) -> usize {
         match self {
-            Band::Near => surface.slot(),
-            Band::Mid => 0,
+            Band::Far => 0,
+            _ => surface.slot(),
         }
     }
 
     /// What each of [`CanopyMeshes`]'s four meshes is drawn with.
     ///
-    /// The mid band's leaves are opaque: a cutout costs a masked pass, a
-    /// discard in the depth prepass and the overdraw behind every hole, and at
-    /// that distance the holes are under a pixel. Only its first slot is ever
-    /// filled.
+    /// Only the far band's leaves are opaque: a cutout costs a masked pass, a
+    /// discard in the depth prepass and the overdraw behind every hole, which is
+    /// worth paying while a hole is still a pixel wide and not after. Only the
+    /// far band's first slot is ever filled.
     pub fn coats(self) -> [Coat; 4] {
         match self {
-            Band::Near => [
+            Band::Near | Band::Mid => [
                 Coat::Bark,
                 Coat::Cutout(Surface::Broadleaf),
                 Coat::Cutout(Surface::Needle),
                 Coat::Strip,
             ],
-            Band::Mid => [Coat::Leaf; 4],
+            Band::Far => [Coat::Leaf; 4],
         }
     }
 }
@@ -317,7 +344,7 @@ fn voxelise(
         nz,
         cells: vec![0u8; (nx * ny * nz) as usize],
         tones: Vec::new(),
-        streamers: if band.undergrowth() { strands(grown, world) } else { TreeMesh::default() },
+        streamers: if band.strands() { strands(grown, world) } else { TreeMesh::default() },
         leaf_voxels: 0,
         bark_voxels: 0,
     };
@@ -524,8 +551,9 @@ type TreeKey = ((i32, i32, i32), i32);
 
 /// Trees that have been grown, kept so a chunk never regrows one.
 ///
-/// Keyed by origin and by the detail the copy was cut at: the two bands are the
-/// same tree sampled twice, and both are wanted for as long as the chunk is.
+/// Keyed by origin and by the detail the copy was cut at: the bands are the
+/// same tree sampled once each, and all of them are wanted for as long as the
+/// chunk is.
 #[derive(Default)]
 pub struct Forest {
     trees: HashMap<TreeKey, Option<Arc<TreeVoxels>>>,
@@ -789,9 +817,9 @@ impl Forest {
 
     /// One tree at one band's detail, grown on first sight and kept.
     ///
-    /// Both bands are cut from a single growth: the skeleton is the expensive
-    /// half and the mid band is the same tree, only sampled coarsely, so
-    /// rasterising twice costs a fraction of growing twice.
+    /// Every band is cut from a single growth: the skeleton is the expensive
+    /// half and a coarser band is the same tree, only sampled coarsely, so
+    /// rasterising three times costs a fraction of growing three times.
     fn tree(
         &mut self,
         world: &World,
@@ -808,7 +836,7 @@ impl Forest {
         let read = Envelope::read(world, library, origin, species);
         timing::PHASES.envelope.since(started);
         let Some(env) = read else {
-            for band in [Band::Near, Band::Mid] {
+            for band in BANDS {
                 self.trees.insert((origin, band.detail()), None);
             }
             return None;
@@ -818,7 +846,7 @@ impl Forest {
         let habit = env.habit(growth);
         let skeleton = crate::tree::skeleton(&env, growth, habit, library, world_origin);
         let mut wanted = None;
-        for cut in [Band::Near, Band::Mid] {
+        for cut in BANDS {
             let rastered = crate::tree::rasterise(&skeleton, cut.detail());
             let grown = Arc::new(voxelise(&rastered, &env, habit, cut));
             if cut == band {
@@ -1236,27 +1264,64 @@ mod tests {
     }
 
     #[test]
-    fn the_mid_band_is_a_quarter_of_the_near_one_and_wears_no_cutout() {
-        assert_eq!(Band::Mid.detail() * 4, Band::Near.detail());
-        assert!(!Band::Mid.undergrowth(), "the mid band drops plants, tufts and strands");
-        assert!(
-            !Band::Mid.coats().iter().any(|c| c.masked()),
-            "a mid mesh asked for a masked material"
-        );
-        // One mesh, so one entity and one draw call for a chunk's whole crown.
-        for surface in [Surface::Bark, Surface::Broadleaf, Surface::Needle] {
-            assert_eq!(Band::Mid.slot(surface), 0);
-        }
-        assert_eq!(Band::Near.coats().iter().filter(|c| c.masked()).count(), 3);
+    fn each_band_is_coarser_than_the_one_before_it() {
+        assert_eq!(BANDS.len(), 3);
+        assert_eq!(Band::Near.detail(), DETAIL);
+        assert_eq!(Band::Mid.detail() * 2, Band::Near.detail());
+        assert_eq!(Band::Far.detail() * 4, Band::Near.detail());
+        // Ground cover is the near band's alone; strands ride one band further,
+        // since they are already meshed.
+        assert!(!Band::Mid.undergrowth(), "the mid band drops plants and tufts");
+        assert!(Band::Mid.strands(), "the mid band keeps the strands it is handed");
+        assert!(!Band::Far.strands());
     }
 
     #[test]
-    fn the_mid_cut_holds_a_fraction_of_the_voxels() {
+    fn only_the_last_voxel_band_wears_no_cutout() {
+        for band in [Band::Near, Band::Mid] {
+            assert_eq!(
+                band.coats().iter().filter(|c| c.masked()).count(),
+                3,
+                "{band:?} lost the cutout that lets light through a crown"
+            );
+            for (n, surface) in [Surface::Bark, Surface::Broadleaf, Surface::Needle]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(band.slot(surface), n, "{band:?} merged two materials");
+            }
+        }
+        assert!(
+            !Band::Far.coats().iter().any(|c| c.masked()),
+            "a far mesh asked for a masked material"
+        );
+        // One mesh, so one entity and one draw call for a chunk's whole crown.
+        for surface in [Surface::Bark, Surface::Broadleaf, Surface::Needle] {
+            assert_eq!(Band::Far.slot(surface), 0);
+        }
+    }
+
+    #[test]
+    fn the_bands_hand_over_in_order() {
+        // Each band ends where its own leaf voxel falls to two pixels, so a
+        // coarser cut reaches further: near, then half, then quarter.
+        let near = near_band(std::f32::consts::FRAC_PI_4, 720.0);
+        assert!((Band::Near.edge(near) - near).abs() < 1e-3);
+        assert!((Band::Mid.edge(near) - near * 2.0).abs() < 1e-3);
+        assert!((Band::Far.edge(near) - near * 4.0).abs() < 1e-3);
+        let edges: Vec<f32> = BANDS.iter().map(|b| b.edge(near)).collect();
+        assert!(edges.windows(2).all(|w| w[0] < w[1]), "{edges:?} is not nearest first");
+    }
+
+    #[test]
+    fn a_coarser_cut_holds_a_fraction_of_the_voxels() {
         let skeleton = trees::grow(&trees::oak(), 11, None);
         let near = trees::rasterise(&skeleton, DETAIL as u32).counts();
         let mid = trees::rasterise(&skeleton, MID_DETAIL as u32).counts();
-        assert!(mid.leaf > 0, "the coarse cut lost the crown");
-        assert!(mid.leaf * 8 < near.leaf, "near {} mid {}", near.leaf, mid.leaf);
+        let far = trees::rasterise(&skeleton, FAR_DETAIL as u32).counts();
+        assert!(far.leaf > 0, "the coarse cut lost the crown");
+        assert!(mid.leaf * 2 < near.leaf, "near {} mid {}", near.leaf, mid.leaf);
+        assert!(far.leaf * 8 < near.leaf, "near {} far {}", near.leaf, far.leaf);
     }
 
     #[test]
@@ -1265,12 +1330,12 @@ mod tests {
         // stands in for the fine one at the origin they share.
         let mut forest = Forest::default();
         let origin = (4, 5, 6);
-        for band in [Band::Near, Band::Mid] {
+        for band in BANDS {
             forest.trees.insert((origin, band.detail()), None);
         }
-        assert_eq!(forest.trees.len(), 2);
+        assert_eq!(forest.trees.len(), BANDS.len(), "two bands shared a cache key");
         forest.retire_near(&[(0, 0, 6)]);
-        assert!(forest.trees.is_empty(), "retiring a tree has to take both its cuts");
+        assert!(forest.trees.is_empty(), "retiring a tree has to take every cut of it");
     }
 
     #[test]
