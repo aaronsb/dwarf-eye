@@ -37,6 +37,7 @@ Examples under `crates/dwarf-eye-world/examples/`, run with
 | `luaq` | evaluates a Lua snippet and prints what it wrote |
 | `settime` | sets the time of day for a lighting check |
 | `slice` | z-level slices around the player as ASCII, to check decoding |
+| `stale` | the disk cache against a forced fetch of the same blocks |
 
 Others in the same directory cover single questions: `atlas`, `canopy`,
 `floors`, `leafcut`, `links`, `materials`, `trees`, `roam`, `control`,

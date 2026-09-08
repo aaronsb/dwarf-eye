@@ -145,6 +145,11 @@ impl World {
         true
     }
 
+    /// Drops one chunk. True when there was one to drop.
+    pub fn remove(&mut self, key: (i32, i32, i32)) -> bool {
+        self.chunks.remove(&key).is_some()
+    }
+
     /// Looks up a single tile by absolute tile coordinates.
     pub fn voxel(&self, x: i32, y: i32, z: i32) -> Option<Voxel> {
         let chunk = self.chunk(x.div_euclid(BLOCK), y.div_euclid(BLOCK), z)?;
