@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 dfhack-remote = { path = "../dfhack-remote" }
 dwarf-eye-art = { path = "../dwarf-eye-art" }
+dwarf-eye-trees = { path = "../dwarf-eye-trees" }
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }

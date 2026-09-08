@@ -10,13 +10,21 @@
 //!
 //! A tree is grown and voxelised once, keyed by its origin, and sliced per
 //! chunk when it is meshed. Chunk boundaries therefore cannot change its shape.
-//! Everything is seeded from the tree's origin, so a tree is the same tree
-//! across a reload.
+//! Everything is seeded from the tree's absolute position, so a tree is the
+//! same tree across a reload and wherever the render origin happens to sit.
+//!
+//! The grammar itself lives in `dwarf-eye-trees`, which knows nothing about
+//! Dwarf Fortress. This module is the translation: DF tiles become that crate's
+//! envelope, plant raws and sprite palettes become its parameters, and the
+//! result comes back as voxels for `canopy.rs` to slice.
 
+use crate::canopy::CanopyPart;
 use crate::library::TileLibrary;
 use crate::mesh::Z_SCALE;
 use crate::world::World;
 use dwarf_eye_art::raws::TreeGrowth;
+use dwarf_eye_trees as trees;
+use dwarf_eye_trees::rng;
 
 /// Sub-voxels per tile edge.
 pub const DETAIL: i32 = 4;
@@ -66,6 +74,8 @@ pub struct Envelope {
     /// The tree ran off the top of what the game has sent us, so its height
     /// came from the raws instead of from tiles.
     pub truncated: bool,
+    /// The game reports this tree's crown as cap, not as branches and twigs.
+    pub cap: bool,
 }
 
 /// How far from its origin a tree's tiles can reach.
@@ -84,16 +94,18 @@ impl Envelope {
     ) -> Option<Self> {
         let (ox, oy, oz) = origin;
         let mut tiles: Vec<(i32, i32, i32, bool)> = Vec::new();
+        let mut cap = false;
         for z in (oz - 4)..=(oz + SPAN + 8) {
             for x in ox..=(ox + SPAN) {
                 for y in oy..=(oy + SPAN) {
                     let Some(v) = world.voxel(x, y, z) else { continue };
                     let trunk = library.is_trunk(v.tile_id);
-                    let crown = library.canopy_part(v.tile_id).is_some();
-                    if (!trunk && !crown) || v.tree_origin(x, y, z) != origin {
+                    let part = library.canopy_part(v.tile_id);
+                    if (!trunk && part.is_none()) || v.tree_origin(x, y, z) != origin {
                         continue;
                     }
-                    tiles.push((x, y, z, crown));
+                    cap |= part == Some(CanopyPart::Cap);
+                    tiles.push((x, y, z, part.is_some()));
                 }
             }
         }
@@ -184,6 +196,7 @@ impl Envelope {
             centre,
             radius,
             truncated,
+            cap,
         })
     }
 
@@ -191,7 +204,7 @@ impl Envelope {
         self.z1 - self.z0 + 1
     }
 
-    fn occupied(&self, x: i32, y: i32, z: i32) -> bool {
+    pub fn occupied(&self, x: i32, y: i32, z: i32) -> bool {
         if z < self.z0 || z > self.z1 {
             return false;
         }
@@ -258,210 +271,121 @@ impl Envelope {
     }
 }
 
-/// One length of wood, tapering from `r0` to `r1`.
-pub struct Segment {
-    pub a: [f32; 3],
-    pub b: [f32; 3],
-    pub r0: f32,
-    pub r1: f32,
+/// Where the growth crate's tile space sits in render space: the centre of the
+/// tile the trunk stands on, at that level's floor.
+pub fn anchor(env: &Envelope) -> [f32; 3] {
+    [env.base.0 as f32 + 0.5, env.base.2 as f32 * Z_SCALE, env.base.1 as f32 + 0.5]
 }
 
-/// A grown tree, before it is voxelised.
-pub struct Grown {
-    pub wood: Vec<Segment>,
-    /// Where leaves gather: the ends of the outermost limbs.
-    pub leaves: Vec<[f32; 3]>,
-}
-
-/// Sub-steps a limb is walked in, so it can curve and be clipped part way.
-const STEPS: i32 = 3;
-
-/// Grows a tree inside its envelope.
-pub fn grow(env: &Envelope, growth: TreeGrowth, habit: Habit) -> Grown {
-    let (ox, oy, oz) = env.origin;
-    let seed = |n: i32| hash01(ox, oy, oz, n);
-    let mut out = Grown { wood: Vec::new(), leaves: Vec::new() };
-
-    // A tall tree carries a thicker trunk. Half a tile across at the tallest,
-    // a third at the shortest, so it stays slimmer than a tile either way.
-    let tall = ((env.height() - 2) as f32 / 12.0).clamp(0.0, 1.0);
-    let trunk_r = 0.16 + 0.19 * tall;
-
-    let crown_top = env.z1 as f32 + 1.0;
-    let crown_base = env.crown_z0 as f32;
-    let trunk_top = match habit {
-        Habit::Conifer => crown_top - 0.6,
-        Habit::Spreading => crown_base + (0.55 + 0.15 * seed(1)) * (crown_top - crown_base),
-    };
-
-    // The trunk follows the middle of each level, so a leaning tree leans.
-    let foot = [env.base.0 as f32 + 0.5, env.z0 as f32 * Z_SCALE, env.base.1 as f32 + 0.5];
-    let at = |y: f32| -> [f32; 3] {
-        let c = env.centre_at(y);
-        let blend = ((y - env.z0 as f32) / (trunk_top - env.z0 as f32)).clamp(0.0, 1.0);
-        [
-            foot[0] + (c[0] - foot[0]) * blend,
-            y * Z_SCALE,
-            foot[2] + (c[1] - foot[2]) * blend,
-        ]
-    };
-    let mut y = env.z0 as f32;
-    while y < trunk_top {
-        let next = (y + 0.5).min(trunk_top);
-        let taper = |v: f32| {
-            let t = ((v - env.z0 as f32) / (trunk_top - env.z0 as f32)).clamp(0.0, 1.0);
-            trunk_r * (1.0 - 0.45 * t)
-        };
-        out.wood.push(Segment { a: at(y), b: at(next), r0: taper(y), r1: taper(next) });
-        y = next;
-    }
-
-    // A few roots flaring at the foot.
-    for n in 0..5 {
-        let angle = std::f32::consts::TAU * (n as f32 + seed(20 + n)) / 5.0;
-        let reach = 0.30 + 0.25 * seed(30 + n);
-        out.wood.push(Segment {
-            a: foot,
-            b: [foot[0] + angle.cos() * reach, foot[1], foot[2] + angle.sin() * reach],
-            r0: trunk_r * 0.8,
-            r1: trunk_r * 0.35,
-        });
-    }
-
-    let density = if growth.branch_density == 0 {
-        1.0
-    } else {
-        0.7 + 0.6 * growth.branch_density as f32 / 100.0
-    };
-
-    match habit {
-        // Whorls: several near-horizontal limbs at each level, drooping a
-        // little, from the crown's base to the spike at the top.
-        Habit::Conifer => {
-            let mut level = crown_base;
-            let mut n = 0;
-            while level < crown_top - 0.5 {
-                let t = (level - crown_base) / (crown_top - crown_base).max(1.0);
-                let arms = (4.0 + 4.0 * (1.0 - t) * density).round() as i32;
-                let reach = env.radius_at(level).max(0.6) * (0.55 + 0.45 * (1.0 - t));
-                for a in 0..arms {
-                    let spin = std::f32::consts::TAU
-                        * (a as f32 + seed(100 + n * 8 + a)) / arms as f32;
-                    let dir = [spin.cos(), -0.12 - 0.2 * seed(200 + n * 8 + a), spin.sin()];
-                    limb(&mut out, env, at(level), dir, reach, trunk_r * 0.45, 1, n * 16 + a);
-                }
-                level += 1.0;
-                n += 1;
-            }
-        }
-        // Forks: limbs leave the trunk at a rising angle and branch again.
-        Habit::Spreading => {
-            let start = crown_base - 0.4;
-            let mut level = start;
-            let mut n = 0;
-            while level < trunk_top {
-                let arms = (2.0 + 2.0 * seed(300 + n) * density).round().clamp(2.0, 4.0) as i32;
-                let reach = env.radius_at(level).max(0.8) * (0.55 + 0.25 * seed(400 + n));
-                for a in 0..arms {
-                    let spin = std::f32::consts::TAU
-                        * (a as f32 + seed(500 + n * 8 + a)) / arms as f32;
-                    // Thirty to sixty degrees off the trunk, rising.
-                    let lift = 0.58 + 0.55 * seed(600 + n * 8 + a);
-                    let dir = [spin.cos(), lift, spin.sin()];
-                    limb(&mut out, env, at(level), dir, reach, trunk_r * 0.6, 2, n * 16 + a);
-                }
-                level += 1.1;
-                n += 1;
-            }
-        }
-    }
-    out
-}
-
-fn normalise(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len < 1e-6 { [0.0, 1.0, 0.0] } else { [v[0] / len, v[1] / len, v[2] / len] }
-}
-
-/// Walks one limb outward, curving as it goes, and forks at its end.
+/// The tree's seed: where it stands in the world, and what it is.
 ///
-/// A step that would leave the envelope is bent back toward the middle of the
-/// footprint at that height; if it still leaves, the limb stops there. That is
-/// what keeps the tree inside what the game calls tree.
-fn limb(
-    out: &mut Grown,
-    env: &Envelope,
-    from: [f32; 3],
-    dir: [f32; 3],
-    len: f32,
-    radius: f32,
-    depth: i32,
-    seed: i32,
-) {
+/// Absolute tiles, not render coordinates, so a tree keeps its shape when the
+/// render origin moves; and not the tile configuration, so a tree does not
+/// change shape as neighbouring tiles arrive.
+pub fn seed(env: &Envelope, world_origin: (i32, i32, i32)) -> u64 {
     let (ox, oy, oz) = env.origin;
-    let wob = |n: i32| hash01(ox ^ seed, oy, oz, 700 + n) - 0.5;
-    let mut p = from;
-    let mut d = normalise(dir);
-    let step = len / STEPS as f32;
-    let mut reached = p;
+    rng::hash3(ox + world_origin.0, oy + world_origin.1, oz + world_origin.2, env.species as u64)
+}
 
-    for s in 0..STEPS {
-        let mut next = [p[0] + d[0] * step, p[1] + d[1] * step * Z_SCALE, p[2] + d[2] * step];
-        if !env.contains(next) {
-            let c = env.centre_at(next[1]);
-            let pull = normalise([c[0] - p[0], d[1] * 0.4, c[1] - p[2]]);
-            d = normalise([d[0] + pull[0] * 1.4, d[1] + pull[1], d[2] + pull[2] * 1.4]);
-            next = [p[0] + d[0] * step, p[1] + d[1] * step * Z_SCALE, p[2] + d[2] * step];
-            if !env.contains(next) {
-                break;
+/// The DF envelope as the growth crate's, centred on the trunk.
+///
+/// The crate grows from the origin outward and asks the envelope where it may
+/// go, so the grid has to be centred on the tile the trunk stands on rather
+/// than on the footprint's corner.
+pub fn envelope(env: &Envelope) -> trees::Envelope {
+    let reach = [
+        env.base.0 - env.x0,
+        env.x0 + env.w - 1 - env.base.0,
+        env.base.1 - env.y0,
+        env.y0 + env.d - 1 - env.base.1,
+    ];
+    let r = reach.into_iter().max().unwrap_or(1).max(1);
+    let side = (2 * r + 1) as u32;
+
+    let levels = (0..env.height())
+        .map(|i| {
+            let mut foot = trees::Footprint { width: side, depth: side, cells: vec![false; (side * side) as usize] };
+            for iz in 0..side as i32 {
+                for ix in 0..side as i32 {
+                    let x = env.base.0 + ix - r;
+                    let y = env.base.1 + iz - r;
+                    if env.occupied(x, y, env.z0 + i) {
+                        foot.cells[(iz * side as i32 + ix) as usize] = true;
+                    }
+                }
             }
+            foot
+        })
+        .collect();
+    trees::Envelope { levels }
+}
+
+/// What a species looks like, from its growth tokens and its own sprites.
+///
+/// The preset carries the habit's proportions; everything the game actually
+/// knows about this tree then overrides them.
+pub fn params(
+    env: &Envelope,
+    growth: TreeGrowth,
+    habit: Habit,
+    library: &mut TileLibrary,
+) -> trees::TreeParams {
+    let mut params = if env.cap {
+        trees::mushroom_tree()
+    } else {
+        match habit {
+            Habit::Conifer => trees::spruce(),
+            Habit::Spreading => trees::oak(),
         }
-        let t0 = s as f32 / STEPS as f32;
-        let t1 = (s + 1) as f32 / STEPS as f32;
-        out.wood.push(Segment {
-            a: p,
-            b: next,
-            r0: radius * (1.0 - 0.5 * t0),
-            r1: radius * (1.0 - 0.5 * t1),
-        });
-        p = next;
-        reached = next;
-        if depth <= 0 {
-            out.leaves.push(next);
-        }
-        // Gentle curvature, plus a small tilt that holds still across reloads.
-        d = normalise([
-            d[0] + wob(s * 3) * 0.22,
-            d[1] + 0.06 + wob(s * 3 + 1) * 0.12,
-            d[2] + wob(s * 3 + 2) * 0.22,
-        ]);
+    };
+
+    params.height = env.height() as f32;
+    // A tall tree carries a thicker trunk, kept under a tile across either way.
+    let tall = ((env.height() - 2) as f32 / 12.0).clamp(0.0, 1.0);
+    params.trunk_width = 0.32 + 0.38 * tall;
+
+    // Where the crown starts is the game's own answer, not the preset's.
+    let clear = (env.crown_z0 - env.z0) as f32 / params.height.max(1.0);
+    params.clear_frac = clear.clamp(0.08, 0.7);
+
+    // DF's branch density is a percentage; it decides how full the crown is and
+    // how much light comes through a leaf face.
+    if growth.branch_density > 0 {
+        let d = (growth.branch_density as f32 / 100.0).clamp(0.0, 1.0);
+        params.leaf_density = (0.34 + 0.34 * d).clamp(0.3, 0.68);
+        params.cutout_openness = (0.52 - 0.24 * d).clamp(0.22, 0.55);
+    }
+    if growth.max_trunk_diameter > 1 {
+        params.trunk_width = params.trunk_width.max(growth.max_trunk_diameter as f32 * 0.45);
     }
 
-    if depth <= 0 {
-        out.leaves.push(reached);
-        return;
+    let leaf: Vec<trees::Rgb> =
+        library.leaf_tones(env.species, 3).into_iter().map(|c| trees::Rgb(c[0], c[1], c[2])).collect();
+    let bark: Vec<trees::Rgb> =
+        library.bark_tones(env.species, 2).into_iter().map(|c| trees::Rgb(c[0], c[1], c[2])).collect();
+    // `leaf_tones` hands back the darkest first, so the last is the lit one.
+    let tip = leaf.last().copied().unwrap_or(trees::Rgb(132, 172, 58));
+    if !leaf.is_empty() {
+        params.palette.leaf = leaf;
     }
-    let children = 2 + (hash01(ox, oy, oz ^ seed, 800) * 2.99) as i32;
-    for c in 0..children {
-        let spin = std::f32::consts::TAU * (c as f32 + hash01(ox, oy, oz, 900 + seed + c))
-            / children as f32;
-        let spread = 0.55 + 0.5 * hash01(ox, oy, oz, 950 + seed + c);
-        let child = normalise([
-            d[0] + spin.cos() * spread,
-            d[1] + 0.25,
-            d[2] + spin.sin() * spread,
-        ]);
-        limb(
-            out,
-            env,
-            p,
-            child,
-            len * (0.60 + 0.15 * hash01(ox, oy, oz, 1000 + seed + c)),
-            (radius * 0.6).max(0.5 / DETAIL as f32),
-            depth - 1,
-            seed * 7 + c + 1,
-        );
+    if !bark.is_empty() {
+        params.palette.bark = bark;
     }
-    // Leaves gather on the outermost wood, not only at its very tip.
-    out.leaves.push(p);
+    params.palette.tip = tip.lerp(trees::Rgb(255, 255, 255), 0.22);
+    params
+}
+
+/// Grows and voxelises one tree with the shared generator, so the game and the
+/// tree lab produce the same tree from the same parameters and seed.
+pub fn grow(
+    env: &Envelope,
+    growth: TreeGrowth,
+    habit: Habit,
+    library: &mut TileLibrary,
+    world_origin: (i32, i32, i32),
+) -> trees::VoxelTree {
+    let params = params(env, growth, habit, library);
+    let bounds = envelope(env);
+    let skeleton = trees::grow(&params, seed(env, world_origin), Some(&bounds));
+    trees::rasterise(&skeleton, DETAIL as u32)
 }

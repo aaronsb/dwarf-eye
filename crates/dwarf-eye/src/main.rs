@@ -14,6 +14,7 @@ mod texture;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -31,6 +32,8 @@ use camera::FlyCamera;
 use clouds::Weather;
 use shadow::{CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat};
 use sky::Clock;
+use dwarf_eye_trees as trees;
+use dwarf_eye_world::canopy::CanopyMeshes;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
@@ -110,11 +113,11 @@ impl ViewSettings {
 #[derive(Resource, Default)]
 struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 
-/// What one chunk put on the GPU: its terrain, its crown if it has one, and
-/// what the pair cost.
+/// What one chunk put on the GPU: its terrain, one entity per canopy material,
+/// and what they cost together.
 struct Spawned {
     terrain: Option<Entity>,
-    canopy: Option<Entity>,
+    canopy: [Option<Entity>; 4],
     triangles: usize,
 }
 
@@ -123,7 +126,7 @@ struct Spawned {
 /// chunks never stalls a frame. A later mesh for the same chunk replaces an
 /// earlier one still waiting.
 #[derive(Resource, Default)]
-struct PendingChunks(HashMap<ChunkKey, (MeshData, MeshData)>);
+struct PendingChunks(HashMap<ChunkKey, (MeshData, CanopyMeshes)>);
 
 /// Chunk meshes uploaded per frame.
 const UPLOAD_BUDGET: usize = 24;
@@ -161,8 +164,27 @@ pub struct HorizonMaterial(pub Handle<TerrainMat>);
 /// Tree crowns. Their own material so they can be shaded as leaves rather than
 /// as stone, and so cloud shadows still reach them: `clouds::bake_shadow`
 /// updates every terrain material asset, and this is one of them.
+/// One material per canopy surface: bark, broadleaf cutout, needle cutout, and
+/// the leaflet strip weeping strands hang from.
 #[derive(Resource)]
-pub struct CanopyMaterial(pub Handle<TerrainMat>);
+pub struct CanopyMaterials {
+    pub bark: Handle<TerrainMat>,
+    pub broadleaf: Handle<TerrainMat>,
+    pub needle: Handle<TerrainMat>,
+    pub streamers: Handle<TerrainMat>,
+}
+
+impl CanopyMaterials {
+    /// In the order [`CanopyMeshes`] hands its meshes over.
+    fn each(&self) -> [Handle<TerrainMat>; 4] {
+        [
+            self.bark.clone(),
+            self.broadleaf.clone(),
+            self.needle.clone(),
+            self.streamers.clone(),
+        ]
+    }
+}
 
 /// One texel per block, marking where fine chunks reach the ground. The worker
 /// decides which blocks qualify; this only paints them.
@@ -251,17 +273,38 @@ fn setup(
     commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
     commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
 
-    // Leaf faces carry the species' twig sprite as a cutout, so the mask is
-    // what lets sky through the crown and dapples the shadow under it. Holes
-    // mean back faces show, so the draw is double sided.
-    let mut leaves = terrain(0.0);
-    leaves.base.alpha_mode = AlphaMode::Mask(0.5);
-    leaves.base.double_sided = true;
-    leaves.base.cull_mode = None;
-    leaves.base.perceptual_roughness = 0.95;
-    leaves.base.diffuse_transmission = 0.4;
-    leaves.base.thickness = 0.25;
-    commands.insert_resource(CanopyMaterial(materials.add(leaves)));
+    // Leaf faces carry a procedural cutout at Dwarf Fortress's own texel
+    // density, which is what lets sky through the crown and dapples the shadow
+    // under it. Holes mean back faces show, so the draw is double sided.
+    let texels = tree_texels();
+    // The species' own openness is per tree; these two cutouts are the fallback
+    // the whole world shares, one leafy and one needled.
+    let broadleaf = images.add(tree_texture(trees::texture::leaf_cutout(false, 0.34, texels)));
+    let needle = images.add(tree_texture(trees::texture::leaf_cutout(true, 0.5, texels)));
+    let strip = images.add(tree_texture(trees::texture::streamer_strip(texels)));
+    let bark_texture = images.add(tree_texture(trees::texture::bark(texels)));
+
+    let cutout = |texture: Handle<Image>| {
+        let mut leaves = terrain(0.0);
+        leaves.base.base_color_texture = Some(texture);
+        leaves.base.alpha_mode = AlphaMode::Mask(0.5);
+        leaves.base.double_sided = true;
+        leaves.base.cull_mode = None;
+        leaves.base.perceptual_roughness = 0.95;
+        leaves.base.diffuse_transmission = 0.4;
+        leaves.base.thickness = 0.25;
+        leaves
+    };
+    let mut bark = terrain(0.0);
+    bark.base.base_color_texture = Some(bark_texture);
+    bark.base.alpha_mode = AlphaMode::Opaque;
+    bark.base.perceptual_roughness = 0.95;
+    commands.insert_resource(CanopyMaterials {
+        bark: materials.add(bark),
+        broadleaf: materials.add(cutout(broadleaf)),
+        needle: materials.add(cutout(needle)),
+        streamers: materials.add(cutout(strip)),
+    });
     commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });
 
     commands.spawn((
@@ -378,7 +421,7 @@ fn upload_chunks(
     mut pending: ResMut<PendingChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Res<TerrainMaterial>,
-    canopy_material: Res<CanopyMaterial>,
+    canopy_materials: Res<CanopyMaterials>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
     camera: Query<&Transform, With<FlyCamera>>,
@@ -401,7 +444,9 @@ fn upload_chunks(
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
         let Some((data, crown)) = pending.0.remove(&key) else { continue };
         if let Some(old) = entities.0.remove(&key) {
-            for entity in [old.terrain, old.canopy].into_iter().flatten() {
+            for entity in
+                std::iter::once(old.terrain).chain(old.canopy).flatten()
+            {
                 commands.entity(entity).despawn();
             }
         }
@@ -422,10 +467,46 @@ fn upload_chunks(
             })
         };
         let terrain = spawn(data, material.0.clone());
-        let canopy = spawn(crown, canopy_material.0.clone());
+        let crowns = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
+        let materials = canopy_materials.each();
+        let mut canopy = [None; 4];
+        for (slot, (mesh, material)) in crowns.into_iter().zip(materials).enumerate() {
+            canopy[slot] = spawn(mesh, material);
+        }
         entities.0.insert(key, Spawned { terrain, canopy, triangles });
     }
     status.triangles = entities.0.values().map(|s| s.triangles).sum();
+}
+
+/// Texels per world tile for the tree surfaces. Dwarf Fortress's art is 32 to
+/// a tile and the ground is drawn at that density, so trees match it by
+/// default; `DWARF_EYE_TEXELS` overrides.
+fn tree_texels() -> u32 {
+    std::env::var("DWARF_EYE_TEXELS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(trees::texture::DEFAULT_TEXELS)
+        .clamp(4, 128)
+}
+
+/// Wraps a generated surface. Canopy UVs are world-space and run well past
+/// 0..1, so these wrap; nearest magnification keeps the cutout's edge hard.
+fn tree_texture(texels: trees::texture::Texels) -> Image {
+    let mut image = Image::new(
+        Extent3d { width: texels.width, height: texels.height, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        texels.rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Nearest,
+        min_filter: ImageFilterMode::Nearest,
+        ..default()
+    });
+    image
 }
 
 /// A mask with nothing loaded.

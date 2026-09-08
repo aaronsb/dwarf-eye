@@ -5,16 +5,23 @@
 //! whichever chunks it reaches. Growing per tree rather than per chunk is what
 //! keeps a chunk boundary from changing a tree's shape.
 //!
-//! The surface is meshed with the same face emitter as the rest of the
-//! renderer, with coplanar faces of one shade merged greedily. Leaf faces carry
-//! the species' twig sprite as an alpha cutout, so light comes through the
-//! crown at texel scale and the shadow it casts is finely dappled.
+//! The surface is meshed with coplanar faces of one shade merged greedily, and
+//! split by the material it wants: bark, broadleaf cutout, needle cutout. Leaf
+//! faces carry world-space UVs, so a procedural cutout repeats at Dwarf
+//! Fortress's own texel density however finely a tile is cut into voxels, and
+//! the shadow the crown casts is dappled at that scale.
+//!
+//! Weeping species also hang streamers, which are quads rather than voxels;
+//! they are meshed by the growth crate and handed to whichever chunk holds
+//! them.
 
 use crate::library::TileLibrary;
 use crate::mesh::{MeshData, MeshOptions, Z_SCALE};
-use crate::tree::{DETAIL, Envelope, Grown, hash01};
+use crate::tree::{DETAIL, Envelope, Habit};
+use dwarf_eye_art::raws::TreeGrowth;
 use crate::world::{BLOCK, Chunk, World};
-use dwarf_eye_art::atlas::Rect;
+use dwarf_eye_trees as trees;
+use dwarf_eye_trees::{Kind, TreeMesh};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,21 +37,35 @@ pub enum CanopyPart {
     Cap,
 }
 
-/// Voxels per leaf cluster edge, so leaves gather rather than speckle.
-const CLUSTER: i32 = 2;
-
 /// How the six faces are lit, so a voxel tree reads as a lit solid.
 const FACE_SHADE: [f32; 6] = [0.70, 0.70, 0.50, 1.0, 0.82, 0.82];
 
 /// Tiles of world beyond a chunk whose trees can still reach into it.
 const REACH: i32 = 2;
 
+/// Which of the canopy materials a face wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    Bark,
+    Broadleaf,
+    Needle,
+}
+
+impl Surface {
+    fn slot(self) -> usize {
+        match self {
+            Surface::Bark => 0,
+            Surface::Broadleaf => 1,
+            Surface::Needle => 2,
+        }
+    }
+}
+
 /// One shade in a volume's palette.
 #[derive(Clone, Copy)]
 struct Tone {
     color: [f32; 3],
-    /// Where its sprite sits in the atlas, for leaves; bark carries none.
-    leaf: Option<Rect>,
+    surface: Surface,
 }
 
 fn to_linear(rgb: [u8; 3]) -> [f32; 3] {
@@ -67,6 +88,9 @@ pub struct TreeVoxels {
     /// Zero is empty; anything else is a tone plus one.
     cells: Vec<u8>,
     tones: Vec<Tone>,
+    /// The tree's weeping strands, already meshed in render space. Quads, not
+    /// voxels, so they ride alongside the volume rather than in it.
+    streamers: TreeMesh,
     pub leaf_voxels: usize,
     pub bark_voxels: usize,
 }
@@ -94,239 +118,140 @@ impl TreeVoxels {
             return;
         }
         self.cells[at] = tone;
-        if self.tones[(tone - 1) as usize].leaf.is_some() {
-            self.leaf_voxels += 1;
-        } else {
+        if self.tones[(tone - 1) as usize].surface == Surface::Bark {
             self.bark_voxels += 1;
+        } else {
+            self.leaf_voxels += 1;
         }
     }
 
-    /// Centre of a voxel, in render space.
-    fn centre(&self, i: i32, j: i32, k: i32) -> [f32; 3] {
-        let d = DETAIL as f32;
-        [
-            (self.gx + i) as f32 / d + 0.5 / d,
-            ((self.gy + j) as f32 / d + 0.5 / d) * Z_SCALE,
-            (self.gz + k) as f32 / d + 0.5 / d,
-        ]
-    }
-
-    /// Voxel index range a world-space box covers, clipped to the volume.
-    fn span(&self, lo: [f32; 3], hi: [f32; 3]) -> [(i32, i32); 3] {
-        let d = DETAIL as f32;
-        let axis = |a: f32, b: f32, base: i32, limit: i32| -> (i32, i32) {
-            let first = (a * d - 0.5).floor() as i32 - base;
-            let last = (b * d - 0.5).ceil() as i32 - base;
-            (first.max(0), last.min(limit - 1))
-        };
-        [
-            axis(lo[0], hi[0], self.gx, self.nx),
-            axis(lo[1] / Z_SCALE, hi[1] / Z_SCALE, self.gy, self.ny),
-            axis(lo[2], hi[2], self.gz, self.nz),
-        ]
-    }
-
-    /// The voxel a point falls in.
-    fn nearest(&self, p: [f32; 3]) -> (i32, i32, i32) {
-        let d = DETAIL as f32;
-        (
-            (p[0] * d - 0.5).round() as i32 - self.gx,
-            (p[1] / Z_SCALE * d - 0.5).round() as i32 - self.gy,
-            (p[2] * d - 0.5).round() as i32 - self.gz,
-        )
-    }
-
-    /// Fills the voxels within a tapering distance of the segment `a`..`b`.
-    ///
-    /// A limb thin enough to read as a twig is thinner than the gap between
-    /// voxel centres, so the radius alone would leave it as a row of dashes.
-    /// Walking the segment and claiming the voxel under each step is what keeps
-    /// it unbroken at one voxel wide.
-    fn rod(&mut self, a: [f32; 3], b: [f32; 3], r0: f32, r1: f32, tone: u8) {
-        let run = ((b[0] - a[0]).powi(2)
-            + ((b[1] - a[1]) / Z_SCALE).powi(2)
-            + (b[2] - a[2]).powi(2))
-        .sqrt();
-        let steps = (run * DETAIL as f32 * 2.0).ceil().max(1.0) as i32;
-        for n in 0..=steps {
-            let t = n as f32 / steps as f32;
-            let p = [
-                a[0] + (b[0] - a[0]) * t,
-                a[1] + (b[1] - a[1]) * t,
-                a[2] + (b[2] - a[2]) * t,
-            ];
-            let (i, j, k) = self.nearest(p);
-            self.set(i, j, k, tone);
-        }
-        let floor = 0.35 / DETAIL as f32;
-        let (r0, r1) = (r0.max(floor), r1.max(floor));
-        let wide = r0.max(r1);
-        let lo = [a[0].min(b[0]) - wide, a[1].min(b[1]) - wide, a[2].min(b[2]) - wide];
-        let hi = [a[0].max(b[0]) + wide, a[1].max(b[1]) + wide, a[2].max(b[2]) + wide];
-        let [(i0, i1), (j0, j1), (k0, k1)] = self.span(lo, hi);
-
-        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-        for i in i0..=i1 {
-            for j in j0..=j1 {
-                for k in k0..=k1 {
-                    let p = self.centre(i, j, k);
-                    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-                    let t = if len2 > 1e-9 {
-                        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let mut d2 = 0.0;
-                    for c in 0..3 {
-                        let e = ap[c] - t * ab[c];
-                        d2 += e * e;
-                    }
-                    let r = r0 + (r1 - r0) * t;
-                    if d2 <= r * r {
-                        self.set(i, j, k, tone);
-                    }
-                }
-            }
-        }
-    }
 }
 
-/// Grows and voxelises one tree.
-fn voxelise(env: &Envelope, grown: &Grown, library: &mut TileLibrary) -> TreeVoxels {
-    let leaf_uv = library.leaf_uv(env.species);
-    let leaf_tones: Vec<Tone> = library
-        .leaf_tones(env.species, 3)
-        .into_iter()
-        .map(|c| Tone { color: to_linear(c), leaf: leaf_uv })
-        .collect();
-    let bark_tones: Vec<Tone> = library
-        .bark_tones(env.species, 2)
-        .into_iter()
-        .map(|c| Tone { color: to_linear(c), leaf: None })
-        .collect();
-    let mut tones = bark_tones.clone();
-    tones.extend(leaf_tones.iter().copied());
-    let bark_n = bark_tones.len();
+/// Grows one tree with the shared generator and lays its voxels out in render
+/// space.
+///
+/// The generator works in tiles with the trunk's base at its own origin, so all
+/// that happens here is an offset onto the tile the trunk stands on, and the
+/// colours it chose interned into a small palette.
+fn voxelise(
+    env: &Envelope,
+    library: &mut TileLibrary,
+    growth: TreeGrowth,
+    habit: Habit,
+    world_origin: (i32, i32, i32),
+) -> TreeVoxels {
+    let grown = crate::tree::grow(env, growth, habit, library, world_origin);
+    let leaf_surface =
+        if habit == Habit::Conifer { Surface::Needle } else { Surface::Broadleaf };
 
-    // The volume covers the envelope's footprint and height with a tile of
-    // margin, which is all the half-tile dilation and the root flare can reach.
-    let (gx, gy, gz) = (
-        (env.x0 - 1) * DETAIL,
-        (env.z0 - 1) * DETAIL,
-        (env.y0 - 1) * DETAIL,
-    );
-    let (nx, ny, nz) = (
-        (env.w + 2) * DETAIL,
-        (env.height() + 2) * DETAIL,
-        (env.d + 2) * DETAIL,
-    );
+    // The generator's origin is the centre of the base tile, at its floor.
+    let anchor = [
+        env.base.0 * DETAIL + DETAIL / 2,
+        env.base.2 * DETAIL,
+        env.base.1 * DETAIL + DETAIL / 2,
+    ];
+    let world = crate::tree::anchor(env);
+
+    let Some((lo, hi)) = grown.bounds() else {
+        return TreeVoxels {
+            gx: anchor[0],
+            gy: anchor[1],
+            gz: anchor[2],
+            nx: 0,
+            ny: 0,
+            nz: 0,
+            cells: Vec::new(),
+            tones: Vec::new(),
+            streamers: TreeMesh::default(),
+            leaf_voxels: 0,
+            bark_voxels: 0,
+        };
+    };
+    let (nx, ny, nz) = (hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1);
     let mut volume = TreeVoxels {
-        gx,
-        gy,
-        gz,
+        gx: anchor[0] + lo.x,
+        gy: anchor[1] + lo.y,
+        gz: anchor[2] + lo.z,
         nx,
         ny,
         nz,
         cells: vec![0u8; (nx * ny * nz) as usize],
-        tones,
+        tones: Vec::new(),
+        streamers: strands(&grown, world),
         leaf_voxels: 0,
         bark_voxels: 0,
     };
 
-    let (ox, oy, oz) = env.origin;
-    for (n, seg) in grown.wood.iter().enumerate() {
-        let pick = hash01(ox, oy, oz, 1100 + n as i32);
-        let tone = 1 + (pick * bark_n as f32) as u8 % bark_n.max(1) as u8;
-        volume.rod(seg.a, seg.b, seg.r0, seg.r1, tone);
-    }
-
-    if leaf_tones.is_empty() {
-        return volume;
-    }
-    let growth = library.growth(env.species);
-    let density = if growth.branch_density == 0 {
-        1.0
-    } else {
-        0.7 + 0.6 * growth.branch_density as f32 / 100.0
-    };
-    for (n, anchor) in grown.leaves.iter().enumerate() {
-        scatter(&mut volume, env, *anchor, density, bark_n, n as i32);
+    let mut seen: HashMap<([u8; 3], bool), u8> = HashMap::new();
+    for (at, voxel) in &grown.voxels {
+        let bark = voxel.kind == Kind::Bark;
+        let key = ([voxel.color.0, voxel.color.1, voxel.color.2], bark);
+        let tone = match seen.get(&key) {
+            Some(&tone) => tone,
+            None => {
+                if volume.tones.len() >= 255 {
+                    continue;
+                }
+                let surface = if bark { Surface::Bark } else { leaf_surface };
+                volume.tones.push(Tone { color: to_linear(key.0), surface });
+                let tone = volume.tones.len() as u8;
+                seen.insert(key, tone);
+                tone
+            }
+        };
+        volume.set(at.x - lo.x, at.y - lo.y, at.z - lo.z, tone);
     }
     volume
 }
 
-/// Gathers leaves around one point on the outermost wood.
-///
-/// Density falls under the point and rises toward the top of the tree and the
-/// outside of its footprint, which is what leaves the underside open and the
-/// crown thickest where it meets the sky.
-fn scatter(
-    volume: &mut TreeVoxels,
-    env: &Envelope,
-    anchor: [f32; 3],
-    density: f32,
-    bark_n: usize,
-    n: i32,
-) {
-    let leaf_n = volume.tones.len() - bark_n;
-    if leaf_n == 0 {
-        return;
+/// The tree's weeping strands, meshed once and moved into render space.
+fn strands(grown: &trees::VoxelTree, at: [f32; 3]) -> TreeMesh {
+    let mut mesh = trees::mesh_of(grown, Some(Kind::Streamer));
+    for p in &mut mesh.positions {
+        p[0] += at[0];
+        p[1] = p[1] * Z_SCALE + at[1];
+        p[2] += at[2];
     }
-    let reach = 0.95;
-    let lo = [anchor[0] - reach, anchor[1] - reach * Z_SCALE, anchor[2] - reach];
-    let hi = [anchor[0] + reach, anchor[1] + reach * Z_SCALE, anchor[2] + reach];
-    let [(i0, i1), (j0, j1), (k0, k1)] = volume.span(lo, hi);
-
-    let crown = (env.z1 + 1) as f32;
-    let base = env.crown_z0 as f32;
-    for i in i0..=i1 {
-        for j in j0..=j1 {
-            for k in k0..=k1 {
-                let p = volume.centre(i, j, k);
-                if !env.contains(p) {
-                    continue;
-                }
-                let far = ((p[0] - anchor[0]).powi(2)
-                    + ((p[1] - anchor[1]) / Z_SCALE).powi(2)
-                    + (p[2] - anchor[2]).powi(2))
-                .sqrt();
-                if far > reach {
-                    continue;
-                }
-                // Thinner below the anchor than above it, and thinner deep
-                // inside the crown than out at its shell.
-                let under = if p[1] < anchor[1] { 0.66 } else { 1.0 };
-                let high = 0.68 + 0.32 * ((p[1] / Z_SCALE - base) / (crown - base)).clamp(0.0, 1.0);
-                let c = env.centre_at(p[1]);
-                let out = ((p[0] - c[0]).powi(2) + (p[2] - c[1]).powi(2)).sqrt()
-                    / env.radius_at(p[1]).max(0.5);
-                let shell = 0.72 + 0.42 * out.clamp(0.0, 1.0);
-                // Capped, so even the thickest part of a crown keeps some air
-                // and the sky reaches through it.
-                let fill = (1.9 * (1.0 - 0.75 * far / reach) * under * high * shell * density)
-                    .min(0.86);
-
-                let (ci, cj, ck) = (
-                    (volume.gx + i).div_euclid(CLUSTER),
-                    (volume.gy + j).div_euclid(CLUSTER),
-                    (volume.gz + k).div_euclid(CLUSTER),
-                );
-                if hash01(ci, cj, ck, 3) >= fill {
-                    continue;
-                }
-                let pick = hash01(ci, cj, ck, 11 + n % 3);
-                let tone = bark_n + (pick * leaf_n as f32) as usize % leaf_n;
-                volume.set(i, j, k, tone as u8 + 1);
-            }
-        }
-    }
+    mesh
 }
 
 /// Trees that have been grown, kept so a chunk never regrows one.
 #[derive(Default)]
 pub struct Forest {
     trees: HashMap<(i32, i32, i32), Option<Arc<TreeVoxels>>>,
+}
+
+/// One chunk's trees, split by the material each surface wants. Empty meshes
+/// are normal: most chunks hold no conifer, and only weeping species hang
+/// strands.
+#[derive(Default)]
+pub struct CanopyMeshes {
+    pub bark: MeshData,
+    pub broadleaf: MeshData,
+    pub needle: MeshData,
+    pub streamers: MeshData,
+}
+
+impl CanopyMeshes {
+    pub fn is_empty(&self) -> bool {
+        self.iter().all(|m| m.is_empty())
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.iter().map(|m| m.triangle_count()).sum()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &MeshData> {
+        [&self.bark, &self.broadleaf, &self.needle, &self.streamers].into_iter()
+    }
+
+    fn slot(&mut self, surface: Surface) -> &mut MeshData {
+        match surface {
+            Surface::Bark => &mut self.bark,
+            Surface::Broadleaf => &mut self.broadleaf,
+            Surface::Needle => &mut self.needle,
+        }
+    }
 }
 
 /// What a chunk's trees cost.
@@ -376,39 +301,50 @@ impl Forest {
         chunk: &Chunk,
         opts: MeshOptions,
         library: &mut TileLibrary,
-    ) -> MeshData {
-        self.build_budgeted(world, chunk, opts, library, &mut CanopyBudget::default())
+        world_origin: (i32, i32, i32),
+    ) -> CanopyMeshes {
+        self.build_budgeted(
+            world,
+            chunk,
+            opts,
+            library,
+            world_origin,
+            &mut CanopyBudget::default(),
+        )
     }
 
     /// `build_chunk`, counting what it cost.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_budgeted(
         &mut self,
         world: &World,
         chunk: &Chunk,
         opts: MeshOptions,
         library: &mut TileLibrary,
+        world_origin: (i32, i32, i32),
         budget: &mut CanopyBudget,
-    ) -> MeshData {
-        let mut mesh = MeshData::default();
+    ) -> CanopyMeshes {
+        let mut meshes = CanopyMeshes::default();
         if chunk.z > opts.z_ceiling {
-            return mesh;
+            return meshes;
         }
         let mut origins = self.nearby(world, chunk, opts, library);
         if origins.is_empty() {
-            return mesh;
+            return meshes;
         }
         origins.sort_unstable();
         origins.dedup();
 
         let mut volume = Volume::new(chunk);
         for (origin, species) in origins {
-            let grown = self.tree(world, library, origin, species);
+            let grown = self.tree(world, library, origin, species, world_origin);
             let Some(grown) = grown else { continue };
             budget.trees += 1;
             volume.absorb(&grown);
+            hang(&grown.streamers, chunk, &mut meshes.streamers);
         }
-        emit(&volume, &mut mesh, budget);
-        mesh
+        emit(&volume, &mut meshes, budget);
+        meshes
     }
 
     /// The trees whose tiles reach into a chunk.
@@ -444,6 +380,7 @@ impl Forest {
         library: &mut TileLibrary,
         origin: (i32, i32, i32),
         species: i32,
+        world_origin: (i32, i32, i32),
     ) -> Option<Arc<TreeVoxels>> {
         if let Some(found) = self.trees.get(&origin) {
             return found.clone();
@@ -451,11 +388,52 @@ impl Forest {
         let built = Envelope::read(world, library, origin, species).map(|env| {
             let growth = library.growth(species);
             let habit = env.habit(growth);
-            let grown = crate::tree::grow(&env, growth, habit);
-            Arc::new(voxelise(&env, &grown, library))
+            Arc::new(voxelise(&env, library, growth, habit, world_origin))
         });
         self.trees.insert(origin, built.clone());
         built
+    }
+}
+
+/// Copies the strands that hang inside this chunk.
+///
+/// A quad goes wherever its middle falls, so a strand crossing a chunk floor is
+/// split between the two rather than drawn twice.
+fn hang(strands: &TreeMesh, chunk: &Chunk, out: &mut MeshData) {
+    if strands.indices.is_empty() {
+        return;
+    }
+    let (ox, oy, oz) = chunk.origin();
+    let inside = |p: [f32; 3]| {
+        p[0] >= ox as f32
+            && p[0] < (ox + BLOCK) as f32
+            && p[2] >= oy as f32
+            && p[2] < (oy + BLOCK) as f32
+            && p[1] >= oz as f32 * Z_SCALE
+            && p[1] < (oz + 1) as f32 * Z_SCALE
+    };
+    for quad in strands.positions.chunks_exact(4).enumerate() {
+        let (n, corners) = quad;
+        let mid = [
+            (corners[0][0] + corners[2][0]) * 0.5,
+            (corners[0][1] + corners[2][1]) * 0.5,
+            (corners[0][2] + corners[2][2]) * 0.5,
+        ];
+        if !inside(mid) {
+            continue;
+        }
+        let base = n * 4;
+        out.push_textured_quad(
+            [corners[0], corners[1], corners[2], corners[3]],
+            strands.normals[base],
+            strands.colors[base],
+            [
+                strands.uvs[base],
+                strands.uvs[base + 1],
+                strands.uvs[base + 2],
+                strands.uvs[base + 3],
+            ],
+        );
     }
 }
 
@@ -466,7 +444,7 @@ struct Volume {
     ny: i32,
     cells: Vec<u8>,
     palette: Vec<Tone>,
-    keys: HashMap<u32, u8>,
+    keys: HashMap<(u32, u32, u32, u32), u8>,
     origin: (i32, i32, i32),
 }
 
@@ -525,10 +503,16 @@ impl Volume {
     }
 
     fn intern(&mut self, tone: Tone) -> u8 {
-        let key = ((tone.color[0] * 4095.0) as u32) << 20
-            | ((tone.color[1] * 4095.0) as u32) << 8
-            | ((tone.color[2] * 255.0) as u32)
-            | if tone.leaf.is_some() { 1 << 31 } else { 0 };
+        // Shades come from a handful of palette entries, so exact bits are a
+        // fine key, and the surface has to be part of it: the same colour on
+        // bark and on leaves needs two slots or one would take the other's
+        // cutout.
+        let key = (
+            tone.color[0].to_bits(),
+            tone.color[1].to_bits(),
+            tone.color[2].to_bits(),
+            tone.surface.slot() as u32,
+        );
         if let Some(&found) = self.keys.get(&key) {
             return found;
         }
@@ -542,8 +526,9 @@ impl Volume {
     }
 }
 
-/// Turns the volume's surface into quads, merging coplanar runs of one shade.
-fn emit(volume: &Volume, mesh: &mut MeshData, budget: &mut CanopyBudget) {
+/// Turns the volume's surface into quads, merging coplanar runs of one shade
+/// and sorting them into the mesh for the material each shade wants.
+fn emit(volume: &Volume, out: &mut CanopyMeshes, budget: &mut CanopyBudget) {
     let d = DETAIL as f32;
     let (ox, oy, oz) = volume.origin;
     let mut mask: Vec<u8> = Vec::new();
@@ -613,17 +598,34 @@ fn emit(volume: &Volume, mesh: &mut MeshData, budget: &mut CanopyBudget) {
                     let rgba =
                         [tone.color[0] * lit, tone.color[1] * lit, tone.color[2] * lit, 1.0];
                     push_face(
-                        mesh, face, ox, oy, oz, d, plane, a, a + h, b, b + w, rgba, tone.leaf,
+                        out.slot(tone.surface),
+                        face,
+                        ox,
+                        oy,
+                        oz,
+                        d,
+                        plane,
+                        a,
+                        a + h,
+                        b,
+                        b + w,
+                        rgba,
                     );
                     b += w;
                 }
             }
         }
     }
-    budget.triangles += mesh.indices.len() / 3;
+    budget.triangles += out.bark.triangle_count()
+        + out.broadleaf.triangle_count()
+        + out.needle.triangle_count();
 }
 
 /// Appends one merged rectangle, wound so it faces out of the tree.
+///
+/// UVs are the face's own world coordinates, one texture repeat to the tile, so
+/// bark and leaves show the same texel size as the ground whatever the voxel
+/// resolution and however far a merged run reaches.
 #[allow(clippy::too_many_arguments)]
 fn push_face(
     mesh: &mut MeshData,
@@ -638,7 +640,6 @@ fn push_face(
     b0: i32,
     b1: i32,
     color: [f32; 4],
-    leaf: Option<Rect>,
 ) {
     let wx = |i: i32| ox as f32 + i as f32 / d;
     let wy = |j: i32| (oz as f32 + j as f32 / d) * Z_SCALE;
@@ -671,43 +672,59 @@ fn push_face(
         }
     };
 
-    match leaf {
-        // The sprite stretches over a merged run rather than repeating, because
-        // the atlas has no wrap inside a cell. A leaf cutout survives that: the
-        // holes widen but they stay holes.
-        Some(uv) => mesh.push_textured_quad(
-            corners,
-            normal,
-            color,
-            [[uv.u0, uv.v0], [uv.u0, uv.v1], [uv.u1, uv.v1], [uv.u1, uv.v0]],
-        ),
-        None => mesh.push_quad(corners, normal, color),
-    }
+    // Vertical faces take v from world height, so bark fissures run up a trunk.
+    let uv = |p: [f32; 3]| match face {
+        0 | 1 => [p[2], p[1] / Z_SCALE],
+        2 | 3 => [p[0], p[2]],
+        _ => [p[0], p[1] / Z_SCALE],
+    };
+    mesh.push_textured_quad(
+        corners,
+        normal,
+        color,
+        [uv(corners[0]), uv(corners[1]), uv(corners[2]), uv(corners[3])],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_chunk(block_x: i32, block_y: i32, z: i32) -> Chunk {
+        Chunk { block_x, block_y, z, voxels: Vec::new() }
+    }
+
     #[test]
-    fn a_limb_is_at_least_one_voxel_wide_and_unbroken() {
-        let mut volume = TreeVoxels {
-            gx: 0,
-            gy: 0,
-            gz: 0,
-            nx: 64,
-            ny: 16,
-            nz: 64,
-            cells: vec![0; 64 * 16 * 64],
-            tones: vec![Tone { color: [0.4, 0.3, 0.2], leaf: None }],
-            leaf_voxels: 0,
-            bark_voxels: 0,
+    fn a_shade_is_interned_once_per_surface() {
+        let mut volume = Volume::new(&test_chunk(0, 0, 0));
+        let bark = Tone { color: [0.4, 0.3, 0.2], surface: Surface::Bark };
+        let leaf = Tone { surface: Surface::Broadleaf, ..bark };
+        assert_eq!(volume.intern(bark), volume.intern(bark));
+        // The same colour on two materials has to stay two palette entries, or
+        // bark would be drawn with the leaf cutout.
+        assert_ne!(volume.intern(bark), volume.intern(leaf));
+    }
+
+    #[test]
+    fn strands_go_to_the_chunk_that_holds_them() {
+        let mut strands = TreeMesh::default();
+        let quad = |x: f32, y: f32| {
+            [[x, y, 0.5], [x + 0.2, y, 0.5], [x + 0.2, y - 0.2, 0.5], [x, y - 0.2, 0.5]]
         };
-        volume.rod([2.0, 1.0, 2.0], [4.0, 1.0, 2.0], 0.05, 0.05, 1);
-        for i in (2 * DETAIL)..(4 * DETAIL) {
-            let any = (0..16).any(|j| (0..64).any(|k| volume.at(i, j, k) != 0));
-            assert!(any, "the limb broke at voxel column {i}");
+        for corner in quad(4.0, 3.5).into_iter().chain(quad(40.0, 3.5)) {
+            strands.positions.push(corner);
+            strands.normals.push([0.0, 0.0, 1.0]);
+            strands.colors.push([1.0, 1.0, 1.0, 1.0]);
+            strands.uvs.push([0.0, 0.0]);
         }
-        assert!(volume.bark_voxels > 0);
+        strands.indices.extend(0..12u32);
+
+        let mut mesh = MeshData::default();
+        hang(&strands, &test_chunk(0, 0, 3), &mut mesh);
+        assert_eq!(mesh.triangle_count(), 2, "only the near strand belongs here");
+
+        let mut far = MeshData::default();
+        hang(&strands, &test_chunk(2, 0, 3), &mut far);
+        assert_eq!(far.triangle_count(), 2, "the far strand belongs two blocks over");
     }
 }
