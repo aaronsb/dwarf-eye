@@ -1,0 +1,12 @@
+[package]
+name = "dwarf-eye"
+description = "A voxel view of a live Dwarf Fortress map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bevy = "0.19.1"
+dfhack-remote = { path = "../dfhack-remote" }
+dwarf-eye-world = { path = "../dwarf-eye-world" }
