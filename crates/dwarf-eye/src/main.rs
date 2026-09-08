@@ -32,7 +32,9 @@ use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
 use clouds::Weather;
-use shadow::{CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat};
+use shadow::{
+    CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
+};
 use sky::Clock;
 use dwarf_eye_trees as trees;
 use dwarf_eye_world::canopy::CanopyMeshes;
@@ -174,7 +176,9 @@ pub struct HorizonMaterial(pub Handle<TerrainMat>);
 
 /// Tree crowns. Their own material so they can be shaded as leaves rather than
 /// as stone, and so cloud shadows still reach them: `clouds::bake_shadow`
-/// updates every terrain material asset, and this is one of them.
+/// updates every terrain material asset, and this is one of them. These four
+/// are the only ones that carry the canopy sky term, which is what leaves a
+/// crown with a lit side and a shaded one.
 /// One material per canopy surface: bark, broadleaf cutout, needle cutout, and
 /// the leaflet strip weeping strands hang from.
 #[derive(Resource)]
@@ -295,18 +299,27 @@ fn setup(
     let strip = images.add(tree_texture(trees::texture::streamer_strip(texels)));
     let bark_texture = images.add(tree_texture(trees::texture::bark(texels)));
 
+    let sky = canopy_sky();
     let cutout = |texture: Handle<Image>| {
         let mut leaves = terrain(0.0);
+        leaves.extension.uniform.canopy = sky;
         leaves.base.base_color_texture = Some(texture);
         leaves.base.alpha_mode = AlphaMode::Mask(0.5);
         leaves.base.double_sided = true;
         leaves.base.cull_mode = None;
-        leaves.base.perceptual_roughness = 0.95;
-        leaves.base.diffuse_transmission = 0.4;
-        leaves.base.thickness = 0.25;
+        // A leaf is a dull, matt surface: any sheen on it reads as wet plastic
+        // and washes the shaded side back out.
+        leaves.base.perceptual_roughness = 0.97;
+        leaves.base.reflectance = 0.02;
+        // Enough for a backlit leaf to glow when the sun is behind it, and no
+        // more: transmission takes the sky's fill from every direction too,
+        // which is what lit the far side of every crown.
+        leaves.base.diffuse_transmission = leaf_transmission();
+        leaves.base.thickness = 0.12;
         leaves
     };
     let mut bark = terrain(0.0);
+    bark.extension.uniform.canopy = sky;
     bark.base.base_color_texture = Some(bark_texture);
     bark.base.alpha_mode = AlphaMode::Opaque;
     bark.base.perceptual_roughness = 0.95;
