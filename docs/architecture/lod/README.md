@@ -1,14 +1,35 @@
 # Level of detail
 
 Status: fine chunks landed (`crates/dwarf-eye-world/src/mesh.rs`); coarse
-horizon landed (`crates/dwarf-eye-world/src/horizon.rs`); mid detail planned
-(issue #10); seam skirt planned (issue #9).
+horizon landed (`crates/dwarf-eye-world/src/horizon.rs`); mid detail in flight
+(issue #10); far band from region data planned (issue #31); seam skirt planned
+(issue #9).
 
 ## What it does
 
 Draws three tiers of ground: full voxel detail where DF has tiles, nothing yet
 in between, and a coarse heightfield from the region and world maps out to the
 horizon.
+
+## Principle
+
+One instance vocabulary, three data sources chosen by availability per
+location:
+
+- cached fine tiles where the character has been;
+- the region tile (48-tile pitch: elevation, biome, vegetation, rainfall, tree
+  and plant materials, rivers, site footprints) where not;
+- the world tile (768-tile pitch) beyond the region details.
+
+The factory classifies from whichever source it has, so a tree is a tree whether
+it came from a tiletype or from a region tile's tree materials and vegetation
+density. Every band renders the same objects: L-system trees and bushes at the
+resolution the band needs, from full voxels down to one canonical crown per
+species; building prefabs from site footprints or from construction tiles;
+water and rivers as surfaces. Approximation lives in the placement rule, seeded
+from absolute coordinates, so a horizon tree keeps its place as the camera
+approaches and is replaced in place when fine data arrives. The band is chosen
+by projected tile size on screen, not by which source fed it.
 
 ## The tiers
 
