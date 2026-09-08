@@ -17,6 +17,21 @@
 //! Dwarf Fortress. This module is the translation: DF tiles become that crate's
 //! envelope, plant raws and sprite palettes become its parameters, and the
 //! result comes back as voxels for `canopy.rs` to slice.
+//!
+//! The shape the game shows comes from five knobs, and the accepted look is
+//! what these values give. Change one at a time.
+//!
+//! - `height` is the envelope's levels plus [`headroom`], so a crown may dome
+//!   or spike above the flat plane DF's tiles stop at.
+//! - `limb_frac` is [`spread`] (the mean crown radius DF reports) times 0.75
+//!   over the height, so the preset grows to this tree's size instead of
+//!   pressing against the bounds.
+//! - [`envelope`] is a cylinder of [`extent`], not the per-level footprints: a
+//!   bound on gross overshoot, never a mould.
+//! - The generator's own `SLACK` lets a limb reach half a tile past that, which
+//!   is what lets a trunk follow DF's jogging tile column.
+//! - `clear_frac` is where the game says the crown starts; the crown's dome
+//!   fall-off and porosity are the species preset's own.
 
 use crate::canopy::CanopyPart;
 use crate::library::TileLibrary;
