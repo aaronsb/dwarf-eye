@@ -156,11 +156,14 @@ fn drive(
 ) {
     let Weather { cumulus, stratus, cirrus: _, fog } = *weather;
 
-    // A clear day is a thin haze; fog thickens it and pulls it to the ground.
-    // Rain arrives as stratus, which thickens it a little too.
+    // A clear day is a thin haze, thicker in the first and last hours of
+    // light when the air holds the night's moisture; fog thickens it and
+    // pulls it to the ground. Rain arrives as stratus, which adds a little.
+    let elevation = clock.sun_direction().y.clamp(0.0, 1.0);
+    let low_sun = 1.0 - (elevation * 4.0).min(1.0);
     rays.density = over
         .density
-        .unwrap_or(0.002 + fog * 0.033 + stratus * 0.004 + cumulus * 0.001);
+        .unwrap_or(0.005 + low_sun * 0.008 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002);
     let height = 60.0 - 44.0 * fog.clamp(0.0, 1.0);
     rays.falloff = over.falloff.unwrap_or(1.0 / height);
     rays.g = over.g.unwrap_or(0.6);
