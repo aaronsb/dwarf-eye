@@ -2384,6 +2384,7 @@ dependencies = [
  "anyhow",
  "bevy",
  "dfhack-remote",
+ "dwarf-eye-trees",
  "dwarf-eye-world",
 ]
 

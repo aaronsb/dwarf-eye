@@ -1,9 +1,10 @@
-//! Procedural voxel trees.
+//! Procedural voxel trees and other vegetation.
 //!
 //! Three stages, each usable on its own: [`grow`] builds a skeleton of segments
 //! and leaf clusters, [`rasterise`] turns that into voxels, and [`mesh`] merges
 //! the visible faces into triangles. Everything is a pure function of the
-//! parameters and the seed.
+//! parameters and the seed, so the same plant can be rebuilt anywhere without
+//! storing it.
 //!
 //! ```
 //! use dwarf_eye_trees::{grow, mesh, oak, rasterise};
@@ -12,6 +13,30 @@
 //! let mesh = mesh(&voxels);
 //! assert!(!mesh.indices.is_empty());
 //! ```
+//!
+//! # Driving it from Dwarf Fortress
+//!
+//! [`build`] is the single call a treatment registry needs: it takes the
+//! grammar, the species knobs, a seed and an optional envelope, and returns
+//! triangles. The main app is expected to fill those in like this.
+//!
+//! - **Kind** comes from the classified tile. A DF tile carries a plant shape
+//!   (sapling, shrub, trunk, branch, twig, cap) which maps onto
+//!   [`VegetationKind`]; a dead plant maps to [`VegetationKind::DeadTree`].
+//! - **Params** come from the plant raws. Height and trunk width from the
+//!   plant's growth data, [`Habit`] from whether it is a conifer, and
+//!   [`Palette`] from the sprite colours DF already gives for wood and leaves,
+//!   two or three shades sampled per material. Porosity is per species:
+//!   [`TreeParams::leaf_density`] is the coarse air between clusters and
+//!   [`TreeParams::cutout_openness`] the fine air inside a leaf face, which is
+//!   what makes a conifer read as open next to a solid oak.
+//! - **Seed** is a hash of the tree's origin tile, so a tree is the same every
+//!   time the block is streamed in and neighbouring trees differ.
+//! - **Envelope** is built from the DF tiles the tree actually occupies: one
+//!   [`Footprint`] per z-level, `true` where a tile belongs to this tree.
+//!   Growth then bends toward each level's centroid and stops at the edge, so
+//!   the mesh stays inside the space the fortress map gave it.
+//! - **Resolution** is `voxels_per_tile`, matched to the rest of the map.
 
 pub mod grow;
 pub mod math;
@@ -24,10 +49,27 @@ pub use grow::{LeafCluster, Segment, Skeleton, grow};
 pub use math::{IVec3, Vec3, ivec3, vec3};
 pub use mesh::{Stats, TreeMesh, mesh, mesh_of, stats};
 pub use params::{
-    Envelope, Footprint, Habit, Palette, Preset, Rgb, TreeParams, birch, bush, oak, pine, spruce,
-    willow,
+    Envelope, Footprint, Habit, Palette, Preset, Rgb, TreeParams, VegetationKind, birch, bush,
+    dead_tree, mushroom_tree, oak, pine, sapling, shrub, spruce, tall_grass, willow,
 };
 pub use raster::{Kind, Voxel, VoxelTree, rasterise};
+
+/// Grow, voxelise and mesh in one call: the entry point a treatment registry
+/// maps a classified tile onto.
+///
+/// `kind` overrides [`TreeParams::kind`], so one species' parameters can be
+/// reused for its sapling, its shrub form and its dead stump.
+pub fn build(
+    kind: VegetationKind,
+    params: &TreeParams,
+    seed: u64,
+    envelope: Option<&Envelope>,
+    voxels_per_tile: u32,
+) -> TreeMesh {
+    let mut params = params.clone();
+    params.kind = kind;
+    mesh(&rasterise(&grow(&params, seed, envelope), voxels_per_tile))
+}
 
 #[cfg(test)]
 mod tests {
@@ -71,6 +113,10 @@ mod tests {
     fn bark_stays_under_a_fifth_of_leaf() {
         for (name, params) in presets() {
             let counts = rasterise(&grow(&params, 7, None), 4).counts();
+            if params.leaf_density <= 0.0 {
+                assert_eq!(counts.leaf, 0, "{name:?} is meant to be bare");
+                continue;
+            }
             assert!(counts.leaf > 0, "{name:?} grew no leaves");
             assert!(
                 counts.bark * 5 < counts.leaf,
@@ -97,6 +143,23 @@ mod tests {
         for segment in &tree.segments {
             assert!(segment.b.y <= 10.5, "grew above the envelope: {}", segment.b.y);
             assert!(segment.b.x.abs() <= 4.0 && segment.b.z.abs() <= 4.0, "grew out the side");
+        }
+    }
+
+    #[test]
+    fn build_matches_the_stages() {
+        let params = shrub();
+        let one = build(VegetationKind::Shrub, &params, 21, None, 4);
+        let staged = mesh(&rasterise(&grow(&params, 21, None), 4));
+        assert_eq!(one.positions, staged.positions);
+        assert!(!one.indices.is_empty());
+    }
+
+    #[test]
+    fn every_preset_builds() {
+        for (name, params) in presets() {
+            let built = build(params.kind, &params, 5, None, 4);
+            assert!(!built.indices.is_empty(), "{name:?} meshed to nothing");
         }
     }
 

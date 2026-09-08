@@ -10,8 +10,10 @@ pub struct TreeMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
-    /// 0..1 per voxel face, tiled across a merged run so a cutout texture
-    /// repeats rather than stretching.
+    /// World-space, one texture repeat per tile: a face's two off-axis world
+    /// coordinates. Every surface in the scene then shares one texel density
+    /// whatever the voxel resolution, and a merged run simply spans more
+    /// repeats. Needs a Repeat sampler.
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     /// Per vertex: 0 bark, 1 leaf.
@@ -194,7 +196,13 @@ fn emit(
     let start = out.positions.len() as u32;
     // (axis, u, v) is cyclic, so edge_u x edge_v points along +axis.
     let quad = [point(0.0, 0.0), point(1.0, 0.0), point(1.0, 1.0), point(0.0, 1.0)];
-    let uvs = [[0.0, 0.0], [w as f32, 0.0], [w as f32, h as f32], [0.0, h as f32]];
+    // Side faces take v from world Y, so bark fissures run up the trunk.
+    let uv = |p: [f32; 3]| match axis {
+        0 => [p[2], p[1]],
+        1 => [p[0], p[2]],
+        _ => [p[0], p[1]],
+    };
+    let uvs = [uv(quad[0]), uv(quad[1]), uv(quad[2]), uv(quad[3])];
     let color = cell.1.to_linear();
     for k in 0..4 {
         out.positions.push(quad[k]);

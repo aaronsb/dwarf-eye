@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::grow::Skeleton;
+use crate::grow::{Skeleton, shell_distance};
 use crate::math::{IVec3, Vec3, ivec3};
 use crate::params::Rgb;
 use crate::rng::{hash3, hash_unit};
@@ -91,11 +91,14 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
 
     let crown = skeleton.crown_center * scale;
     let crown_radius = (skeleton.crown_radius * scale).max(1.0);
+    let stretch = skeleton.params.crown_stretch;
+    let hollow = skeleton.params.crown_hollow.clamp(0.0, 1.0);
     let density = skeleton.params.leaf_density;
 
     for cluster in &skeleton.leaves {
         let center = cluster.center * scale;
-        let radius = (cluster.radius * scale).max(1.0);
+        // A blade of grass is allowed to be a single voxel wide.
+        let radius = (cluster.radius * scale).max(0.45);
         let ri = radius.ceil() as i32 + 1;
         let cx = center.x.round() as i32;
         let cy = center.y.round() as i32;
@@ -114,19 +117,24 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
                     if d > radius * wobble {
                         continue;
                     }
-                    let shell = ((p - crown).length() / crown_radius).clamp(0.0, 1.2);
-                    // Dense at the crown's surface, open in its core.
-                    let mut keep = density * (0.28 + 1.0 * shell);
+                    let shell = (shell_distance(p, crown, stretch) / crown_radius).clamp(0.0, 1.2);
+                    // Dense at the crown's surface, open in its core, as far as
+                    // the species is hollow at all.
+                    let mut keep = density * (1.0 - hollow + hollow * (0.28 + shell));
                     // The underside is thinner than the top, as light dictates.
-                    keep *= if p.y >= crown.y { 1.15 } else { 0.62 };
+                    if p.y < crown.y {
+                        keep *= 1.0 - hollow * 0.38;
+                    } else {
+                        keep *= 1.0 + hollow * 0.15;
+                    }
                     if hash_unit(x, y, z, cluster.seed) > keep.clamp(0.02, 0.98) {
                         continue;
                     }
                     let mut color = pick(&palette.leaf, key, 0x2C71);
                     // The outermost leaves catch the light.
                     let lit = cluster.shell * 0.6 + shell * 0.4;
-                    if lit > 0.72 && hash_unit(x, y, z, 0x77A3) < (lit - 0.72) * 2.6 {
-                        color = color.lerp(palette.tip, 0.75);
+                    if lit > 0.6 && hash_unit(x, y, z, 0x77A3) < (lit - 0.6) * 2.2 {
+                        color = color.lerp(palette.tip, 0.85);
                     }
                     voxels.insert(key, Voxel { kind: Kind::Leaf, color });
                 }
