@@ -77,6 +77,12 @@ const BLOCKED: f32 = 2.0;
 /// lean on a wall as long as they like; a script cannot.
 const STRIKES: u32 = 3;
 
+/// How long a scripted walk may push at an edge it is not allowed to cross
+/// before it gives up. A step the game refuses shows as an unconfirmed strike;
+/// a step our own reading of the ground refuses is never sent at all, and
+/// without this a script would lean on a wall in silence.
+const STALL: f32 = 1.5;
+
 /// Time constant of the glide that absorbs every jump: a step onto a ramp, a
 /// spring back, the game moving the character a tile of its own accord.
 /// Roughly a 0.15 s settle.
@@ -332,6 +338,8 @@ pub struct WalkMode {
     blocked: [f32; 9],
     /// Steps in a row the game has not taken. Reset by any real movement.
     strikes: u32,
+    /// How long the camera has been pushing at an edge it may not cross.
+    stalled: f32,
     /// The gap between where the camera is drawn and where it stands on the
     /// ground plan, decayed away so every jump reads as a glide. Height is
     /// never part of it: the eye rides the surface, so it slides down a slope
@@ -344,6 +352,8 @@ pub struct WalkMode {
     drive: Vec<Leg>,
     /// Set once the environment has been read.
     started: bool,
+    /// Why a scripted walk gave up, if it did.
+    aborted: Option<String>,
     /// What the HUD says about the mode.
     pub line: String,
 }
@@ -475,6 +485,19 @@ impl WalkMode {
     fn moved(&mut self, tile: IVec3) {
         self.confirmed = Some(tile);
         self.strikes = 0;
+        self.stalled = 0.0;
+    }
+
+    /// Calls a scripted walk off and says why, once, in a line the live test
+    /// looks for. A walk driven by hand is left alone: a player leaning on a
+    /// wall is not a fault.
+    fn abandon(&mut self, why: &str) {
+        if self.drive.is_empty() {
+            return;
+        }
+        self.drive.clear();
+        self.aborted = Some(why.to_string());
+        warn!("walk: scripted walk stopped, {why}");
     }
 }
 
@@ -619,10 +642,11 @@ pub fn walk(
             w.blocked[WalkMode::slot(dir)] = BLOCKED;
         });
         // A player can lean on a wall all day; a scripted walk is called off
-        // rather than left bouncing.
-        if walk.strikes >= STRIKES && !walk.drive.is_empty() {
-            warn!("walk: {} steps in a row went unconfirmed; scripted walk stopped", walk.strikes);
-            walk.drive.clear();
+        // rather than left bouncing. The count runs across directions, so
+        // turning to face a different obstacle does not reset it.
+        if walk.strikes >= STRIKES {
+            let why = format!("{} steps in a row went unconfirmed", walk.strikes);
+            walk.abandon(&why);
         }
     }
 
@@ -700,6 +724,17 @@ pub fn walk(
         if over.y != 0 && held.y == 0 {
             want.y = want.y.clamp(MARGIN, 1.0 - MARGIN);
         }
+        // Pushing at an edge with no step going out at all: the ground we can
+        // see says there is nothing to walk onto, so the game is never asked
+        // and no strike is ever scored. A script has to notice that itself.
+        if taken.is_none() && walk.pending.is_none() {
+            walk.stalled += dt;
+            if walk.stalled > STALL {
+                walk.abandon("the way ahead is not walkable");
+            }
+        }
+    } else {
+        walk.stalled = 0.0;
     }
     walk.offset = want.clamp(Vec2::ZERO, Vec2::ONE);
 
@@ -733,10 +768,11 @@ pub fn walk(
 
     let shut = walk.blocked.iter().filter(|&&b| b > 0.0).count();
     let state = match (walk.strikes, walk.pending.is_some(), shut) {
-        (s, _, _) if s >= STRIKES => "stuck",
-        (_, true, _) => "stepping",
-        (_, _, n) if n > 0 => "blocked",
-        _ => "walking",
+        _ if walk.aborted.is_some() => walk.aborted.clone().unwrap(),
+        (s, _, _) if s >= STRIKES => "stuck".into(),
+        (_, true, _) => "stepping".into(),
+        (_, _, n) if n > 0 => "blocked".into(),
+        _ => "walking".to_string(),
     };
     let tile = confirmed - origin;
     walk.line = format!("walk    character tile ({}, {}, {})   {state}", tile.x, tile.y, tile.z);
@@ -793,6 +829,10 @@ fn reconcile(walk: &mut WalkMode) {
             // step of ours is moot and the camera just goes along, keeping the
             // player's place in the cell and their heading. A long jump —
             // travel — is taken outright rather than slid through.
+            //
+            // A scripted route, though, no longer means what it meant: it was
+            // aimed from a tile the character has left, so it stops here.
+            walk.abandon("the character was moved from outside");
             walk.blocked = [0.0; 9];
             walk.moved(tile);
             walk.jump(|w| {

@@ -121,6 +121,14 @@ fn the_viewer_walks_the_character_east_and_back() {
             .collect::<Vec<_>>()
     };
 
+    // Walk mode calls a scripted route off rather than leaning on a wall or
+    // carrying on from a tile the character has been moved away from. Its
+    // reason is the most useful thing the run can tell us, so it comes first.
+    assert!(
+        noted("scripted walk stopped").is_empty(),
+        "the route was abandoned: {:?}",
+        noted("scripted walk stopped")
+    );
     assert!(
         noted("stale").is_empty(),
         "steps reached the game late, which the one-slot order is meant to make impossible: {:?}",
