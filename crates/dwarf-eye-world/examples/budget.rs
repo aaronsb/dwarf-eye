@@ -30,12 +30,14 @@ fn main() -> Result<()> {
         total.foliage += budget.foliage;
         total.liquids += budget.liquids;
         total.other += budget.other;
+        total.canopy += budget.canopy;
         chunks += 1;
     }
-    let sum = total.models + total.ramps + total.ground_under + total.cubes + total.floors + total.foliage + total.liquids + total.other;
+    let sum = total.canopy + total.models + total.ramps + total.ground_under + total.cubes + total.floors + total.foliage + total.liquids + total.other;
     println!("{chunks} chunks, {sum} triangles");
     for (name, n) in [
-        ("sprite models (trees, shrubs, boulders)", total.models),
+        ("tree canopies", total.canopy),
+        ("sprite models (trunks, shrubs, boulders)", total.models),
         ("ramps", total.ramps),
         ("ground under billboards", total.ground_under),
         ("cubes (walls, soil, trunks without sprites)", total.cubes),

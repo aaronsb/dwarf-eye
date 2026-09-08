@@ -1,5 +1,6 @@
 //! Resolves a tile to a cached voxel model built from DF's own sprite.
 
+use crate::canopy::CanopyPart;
 use crate::mesh::MeshData;
 use crate::model::{Caps, RenderMode, build_flat_tile, build_model, build_ramp};
 use anyhow::Result;
@@ -41,6 +42,10 @@ struct TileInfo {
     mode: RenderMode,
     /// Species-independent tiles look straight at the generic sheet.
     generic: bool,
+    /// Part of a tree's crown, meshed as a merged volume rather than a model.
+    canopy: Option<CanopyPart>,
+    /// Trunk or root: the woody column a crown hangs on.
+    trunk: bool,
 }
 
 /// Decides how a tiletype's mask becomes geometry.
@@ -52,7 +57,7 @@ fn mode_for(shape: TiletypeShape, name: &str) -> Option<RenderMode> {
     let tree = name.starts_with("Tree");
     match shape {
         // A sloping trunk is still a trunk, and roots are trunks underground.
-        S::Wall | S::Ramp if tree => Some(RenderMode::Extrude),
+        S::Wall | S::Ramp | S::TrunkBranch if tree => Some(RenderMode::Extrude),
         S::Branch | S::Twig => Some(RenderMode::ThinExtrude),
         S::Sapling | S::Shrub | S::Boulder => Some(RenderMode::Billboard),
         // Ground cover, including the walkable surface of a treetop.
@@ -62,8 +67,30 @@ fn mode_for(shape: TiletypeShape, name: &str) -> Option<RenderMode> {
     }
 }
 
+/// Whether a tiletype belongs to a tree's crown.
+///
+/// Branches and twigs are leaves outright. The cap tiles are the solid part of
+/// a treetop — floor where it is walkable, wall around its rim — and DF gives
+/// them a wall or floor shape, so only the name separates them from masonry.
+fn canopy_part(shape: TiletypeShape, name: &str) -> Option<CanopyPart> {
+    use TiletypeShape as S;
+    match shape {
+        // A trunk branch is a heavy limb inside the crown. The graphics raws
+        // call it TREE_HEAVY_BRANCH and DFHack calls it TreeTrunkBranch, so it
+        // resolves to no sprite at all; folding it into the volume is both
+        // right and what keeps it from drawing as a bare block among leaves.
+        S::Branch | S::TrunkBranch => Some(CanopyPart::Branch),
+        S::Twig => Some(CanopyPart::Twig),
+        _ if name.starts_with("Tree") && name.contains("Cap") => Some(CanopyPart::Cap),
+        _ => None,
+    }
+}
+
 /// Below this mean saturation a sprite is a pattern to tint, not a colour.
 const PATTERN_SATURATION: f32 = 0.22;
+
+/// Foliage colour for a species whose sheets carry no twigs.
+const DEFAULT_FOLIAGE: [u8; 3] = [82, 138, 58];
 
 /// Height of a ground slab, as a fraction of a z-level.
 const FLOOR_HEIGHT: f32 = 0.12;
@@ -187,6 +214,8 @@ pub struct TileLibrary {
     /// Ground families packed for use beneath free-standing objects.
     under_uv: HashMap<&'static str, (Rect, bool)>,
     under_model: HashMap<&'static str, Option<Model>>,
+    /// Species index -> the colour its crown is painted, cached on first use.
+    canopy_color: HashMap<i32, [u8; 3]>,
 }
 
 impl TileLibrary {
@@ -229,6 +258,8 @@ impl TileLibrary {
                     dirs: raws::direction_mask(t.direction()),
                     mode,
                     generic,
+                    canopy: canopy_part(t.shape(), name),
+                    trunk: mode == RenderMode::Extrude && canopy_part(t.shape(), name).is_none(),
                 },
             );
         }
@@ -254,6 +285,7 @@ impl TileLibrary {
             flat_tint: HashMap::new(),
             under_uv: HashMap::new(),
             under_model: HashMap::new(),
+            canopy_color: HashMap::new(),
         };
         library.pack_ground();
         library.pack_under();
@@ -474,6 +506,37 @@ impl TileLibrary {
         };
         self.cache.insert(key, built.clone());
         built
+    }
+
+    /// Whether this tiletype is a tree's woody column.
+    pub fn is_trunk(&self, tile: i32) -> bool {
+        self.tiles.get(&tile).is_some_and(|t| t.trunk)
+    }
+
+    /// Which part of a tree's crown this tiletype is, if any.
+    pub fn canopy_part(&self, tile: i32) -> Option<CanopyPart> {
+        self.tiles.get(&tile).and_then(|t| t.canopy)
+    }
+
+    /// The colour of a species' foliage: the mean of its twig sprite, falling
+    /// back to its branches and then to a generic leaf green.
+    pub fn canopy_color(&mut self, mat_index: i32) -> [u8; 3] {
+        if let Some(&found) = self.canopy_color.get(&mat_index) {
+            return found;
+        }
+        let plant_id = self
+            .plants
+            .get(mat_index.max(0) as usize)
+            .cloned()
+            .unwrap_or_default();
+        let color = ["TREE_TWIGS", "TREE_BRANCH"]
+            .into_iter()
+            .find_map(|family| {
+                self.art.tree_sprite(&plant_id, family, 0).and_then(sprite_mean)
+            })
+            .unwrap_or(DEFAULT_FOLIAGE);
+        self.canopy_color.insert(mat_index, color);
+        color
     }
 
     /// Whether this tiletype has a sprite treatment at all.
