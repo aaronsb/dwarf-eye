@@ -1,0 +1,8 @@
+[package]
+name = "dwarf-eye-trees"
+description = "Procedural voxel trees: skeleton growth, voxelisation and greedy meshing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

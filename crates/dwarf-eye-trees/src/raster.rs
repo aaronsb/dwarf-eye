@@ -1,0 +1,170 @@
+//! Turning a skeleton into voxels: wood along the segments, foliage as ragged
+//! clusters that thin out toward the crown's core and underside.
+
+use std::collections::BTreeMap;
+
+use crate::grow::Skeleton;
+use crate::math::{IVec3, Vec3, ivec3};
+use crate::params::Rgb;
+use crate::rng::{hash3, hash_unit};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Bark,
+    Leaf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Voxel {
+    pub kind: Kind,
+    pub color: Rgb,
+}
+
+#[derive(Clone, Debug)]
+pub struct VoxelTree {
+    pub voxels: BTreeMap<IVec3, Voxel>,
+    pub voxels_per_tile: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoxelCounts {
+    pub bark: usize,
+    pub leaf: usize,
+}
+
+impl VoxelTree {
+    pub fn counts(&self) -> VoxelCounts {
+        let mut counts = VoxelCounts::default();
+        for v in self.voxels.values() {
+            match v.kind {
+                Kind::Bark => counts.bark += 1,
+                Kind::Leaf => counts.leaf += 1,
+            }
+        }
+        counts
+    }
+
+    /// Inclusive min and max over the occupied voxels.
+    pub fn bounds(&self) -> Option<(IVec3, IVec3)> {
+        let mut it = self.voxels.keys();
+        let first = *it.next()?;
+        let mut lo = first;
+        let mut hi = first;
+        for k in self.voxels.keys() {
+            lo.x = lo.x.min(k.x);
+            lo.y = lo.y.min(k.y);
+            lo.z = lo.z.min(k.z);
+            hi.x = hi.x.max(k.x);
+            hi.y = hi.y.max(k.y);
+            hi.z = hi.z.max(k.z);
+        }
+        Some((lo, hi))
+    }
+}
+
+/// Voxelise a skeleton at `voxels_per_tile` resolution.
+///
+/// Wood is drawn first and foliage never overwrites it, so limbs stay readable
+/// through the canopy.
+pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
+    let scale = voxels_per_tile.max(1) as f32;
+    let mut voxels: BTreeMap<IVec3, Voxel> = BTreeMap::new();
+    let palette = &skeleton.params.palette;
+
+    for segment in &skeleton.segments {
+        let a = segment.a * scale;
+        let b = segment.b * scale;
+        let span = (b - a).length();
+        let steps = (span / 0.4).ceil().max(1.0) as i32;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let p = a.lerp(b, t);
+            let mut r = (segment.radius_a + (segment.radius_b - segment.radius_a) * t) * scale;
+            // Past the trunk a limb is a thread: one or two voxels, no more.
+            r = if segment.depth == 0 { r.max(0.55) } else { r.clamp(0.5, 1.05) };
+            fill_ball(&mut voxels, p, r, |v| Voxel {
+                kind: Kind::Bark,
+                color: pick(&palette.bark, v, 0x8A17),
+            });
+        }
+    }
+
+    let crown = skeleton.crown_center * scale;
+    let crown_radius = (skeleton.crown_radius * scale).max(1.0);
+    let density = skeleton.params.leaf_density;
+
+    for cluster in &skeleton.leaves {
+        let center = cluster.center * scale;
+        let radius = (cluster.radius * scale).max(1.0);
+        let ri = radius.ceil() as i32 + 1;
+        let cx = center.x.round() as i32;
+        let cy = center.y.round() as i32;
+        let cz = center.z.round() as i32;
+        for z in (cz - ri)..=(cz + ri) {
+            for y in (cy - ri)..=(cy + ri) {
+                for x in (cx - ri)..=(cx + ri) {
+                    let key = ivec3(x, y, z);
+                    if voxels.contains_key(&key) {
+                        continue;
+                    }
+                    let p = Vec3 { x: x as f32, y: y as f32, z: z as f32 };
+                    // A wobbly edge, so clusters read as foliage not spheres.
+                    let wobble = 0.72 + hash_unit(x, y, z, cluster.seed ^ 0x51E1) * 0.55;
+                    let d = (p - center).length();
+                    if d > radius * wobble {
+                        continue;
+                    }
+                    let shell = ((p - crown).length() / crown_radius).clamp(0.0, 1.2);
+                    // Dense at the crown's surface, open in its core.
+                    let mut keep = density * (0.28 + 1.0 * shell);
+                    // The underside is thinner than the top, as light dictates.
+                    keep *= if p.y >= crown.y { 1.15 } else { 0.62 };
+                    if hash_unit(x, y, z, cluster.seed) > keep.clamp(0.02, 0.98) {
+                        continue;
+                    }
+                    let mut color = pick(&palette.leaf, key, 0x2C71);
+                    // The outermost leaves catch the light.
+                    let lit = cluster.shell * 0.6 + shell * 0.4;
+                    if lit > 0.72 && hash_unit(x, y, z, 0x77A3) < (lit - 0.72) * 2.6 {
+                        color = color.lerp(palette.tip, 0.75);
+                    }
+                    voxels.insert(key, Voxel { kind: Kind::Leaf, color });
+                }
+            }
+        }
+    }
+
+    VoxelTree { voxels, voxels_per_tile: voxels_per_tile.max(1) }
+}
+
+fn fill_ball(
+    voxels: &mut BTreeMap<IVec3, Voxel>,
+    center: Vec3,
+    radius: f32,
+    make: impl Fn(IVec3) -> Voxel,
+) {
+    let ri = radius.ceil() as i32;
+    let cx = center.x.round() as i32;
+    let cy = center.y.round() as i32;
+    let cz = center.z.round() as i32;
+    for z in (cz - ri)..=(cz + ri) {
+        for y in (cy - ri)..=(cy + ri) {
+            for x in (cx - ri)..=(cx + ri) {
+                let d = Vec3 { x: x as f32, y: y as f32, z: z as f32 } - center;
+                if d.length() <= radius {
+                    voxels.insert(ivec3(x, y, z), make(ivec3(x, y, z)));
+                }
+            }
+        }
+    }
+}
+
+/// Pick a palette shade from the voxel's own coordinate, so the choice does not
+/// depend on the order voxels were written in.
+fn pick(shades: &[Rgb], at: IVec3, salt: u64) -> Rgb {
+    if shades.is_empty() {
+        return Rgb(255, 0, 255);
+    }
+    let h = hash3(at.x, at.y, at.z, salt);
+    shades[(h % shades.len() as u64) as usize]
+}

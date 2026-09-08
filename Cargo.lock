@@ -2396,6 +2396,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwarf-eye-trees"
+version = "0.1.0"
+
+[[package]]
 name = "dwarf-eye-world"
 version = "0.1.0"
 dependencies = [
