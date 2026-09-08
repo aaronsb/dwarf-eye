@@ -748,7 +748,8 @@ mod tests {
         let mut ground = Ground { center: IVec3::new(100, 200, 30), solids };
         let span = 2 * GROUND_RADIUS + 1;
         // One tile east and one level down, by hand.
-        let index = 0 * span * span + GROUND_RADIUS * span + (GROUND_RADIUS + 1);
+        // Level z-1 is the first of the three, so its plane starts at zero.
+        let index = GROUND_RADIUS * span + (GROUND_RADIUS + 1);
         ground.solids[index as usize] = Some(Solid::Ramp);
         assert_eq!(ground.get(IVec3::new(101, 200, 29)), Some(Solid::Ramp));
         assert_eq!(ground.get(IVec3::new(100, 200, 30)), None);
