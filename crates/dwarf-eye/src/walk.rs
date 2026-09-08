@@ -800,7 +800,12 @@ pub fn walk(
         .to_string(),
     };
     let tile = confirmed - origin;
-    walk.line = format!("walk    character tile ({}, {}, {})   {state}", tile.x, tile.y, tile.z);
+    // The eye's height against the ground it is riding, which is what says
+    // whether a slope is being followed or cut through.
+    walk.line = format!(
+        "walk    character tile ({}, {}, {})   eye {eye:.2} over ground {surface:.2}   {state}",
+        tile.x, tile.y, tile.z
+    );
 }
 
 /// Settles the camera against what the game says, once a position report is in.
