@@ -54,6 +54,12 @@ blocks) into a 1190-tall one: a taller window or a longer lens pushes the band
 out, which is the point of measuring in pixels. `DWARF_EYE_LOD_NEAR` overrides
 it, in blocks.
 
+The bands are a list, not a pair: `canopy.rs:BANDS` orders them nearest first,
+`main.rs:band_edges` gives one handover distance per gap and
+`main.rs:band_ranges` turns those into one `VisibilityRange` per band. A coarser
+stage — a canonical crown per species, a green box — is one more entry in each,
+one more mesh per chunk from the worker, and nothing else.
+
 `main.rs:size_bands` recomputes N from the window and the camera's own
 projection, and rewrites the ranges already on the GPU when either changes.
 Bevy does the swapping: each canopy entity carries a `VisibilityRange`, near
