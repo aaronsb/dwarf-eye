@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     println!("view centre: tile ({cx}, {cy}, {cz})\n");
 
     let bounds = BlockBounds::around_tile(cx, cy, cz, 3, 1);
-    let fetched = df.fetch(bounds, true)?;
+    let fetched = df.fetch(bounds, true)?.len();
     println!("fetched {fetched} blocks into {} chunks\n", df.world.chunk_count());
 
     for z in (cz - 1..=cz + 1).rev() {

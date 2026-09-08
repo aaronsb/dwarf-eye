@@ -329,11 +329,10 @@ pub fn build_chunk_budgeted(
                     // whichever neighbour is a wall.
                     if lib.mode(voxel.tile_id) == Some(RenderMode::Ramp) {
                         let mut high = 0u8;
-                        for (bit, dx, dy) in [(1u8, 0, -1), (2, 0, 1), (4, -1, 0), (8, 1, 0)] {
-                            if world
-                                .voxel(x + dx, y + dy, z)
-                                .is_some_and(|n| n.solid.occludes())
-                            {
+                        for (bit, dx, dy) in crate::ramp::NEIGHBOURS {
+                            if world.voxel(x + dx, y + dy, z).is_some_and(|n| {
+                                matches!(n.solid, Solid::Cube | Solid::Fortification)
+                            }) {
                                 high |= bit;
                             }
                         }

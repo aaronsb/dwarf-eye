@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         let moved = last_window != Some(window);
         last_window = Some(window);
 
-        let fetched = df.fetch(bounds, moved)?;
+        let fetched = df.fetch(bounds, moved)?.len();
         let dropped = df.world.retain_within(bounds).len();
 
         let mut triangles = 0usize;

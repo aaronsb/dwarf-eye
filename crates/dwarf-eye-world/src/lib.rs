@@ -7,6 +7,7 @@ pub mod library;
 pub mod mesh;
 pub mod model;
 pub mod palette;
+pub mod ramp;
 pub mod session;
 pub mod skeleton;
 pub mod world;
