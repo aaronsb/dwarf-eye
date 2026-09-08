@@ -48,7 +48,14 @@ pub struct ShadowUniform {
     pub ground: f32,
     /// Zero when the sky is clear, so the lookup is skipped.
     pub enabled: f32,
-    /// One on the horizon material, which yields to loaded blocks.
+    /// Non-zero on a horizon material, all of which yield to loaded blocks,
+    /// and which of the two it is:
+    ///
+    /// - `1` the coarse ground, whose UV names an atlas cell rather than a
+    ///   point; `cloud_shadow.wgsl:horizon_texel` wraps that sprite across the
+    ///   surface by world position, one sprite to a world tile;
+    /// - `2` the far crowns, whose UVs are already world-space on a leaf
+    ///   texture of their own and want the standard material's own sampling.
     pub horizon: f32,
     /// Block coordinate of the mask's first texel.
     pub mask_origin: Vec2,

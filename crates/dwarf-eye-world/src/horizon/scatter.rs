@@ -7,13 +7,16 @@
 //! reshuffled, when the fine map arrives; and lowering the density only drops
 //! the tail of the list, so the trees that remain do not move.
 //!
-//! Which stage of the tree chain an instance draws at is projected size: a
-//! canonical crown while the species' own height still spans a few pixels, its
-//! bounding box beyond that, and past `REACH` nothing at all — the ground
-//! carries the canopy as colour instead (`terrace.rs:canopy_at`).
+//! Which stage of the tree chain an instance draws at is **not** decided here.
+//! Every placed tree carries all three stages and Bevy swaps between them by
+//! the camera's own distance to that tree (`main.rs:horizon_ranges`), the way
+//! the canopy bands do: a region-sourced tree can stand a few tiles from the
+//! camera, and deciding its stage from its distance to the window's centre
+//! drew boxes the size of houses right in front of the eye. Past `REACH`
+//! nothing is placed at all and the ground carries the canopy as colour
+//! instead (`terrace.rs:canopy_at`).
 
 use dwarf_eye_trees::Preset;
-use dwarf_eye_trees::params::TreeParams;
 
 use super::field::hash;
 use super::terrace::Terrain;
@@ -47,26 +50,33 @@ const STRAY: f32 = 0.07;
 const CONTRAST: f32 = 0.03;
 const CONTRAST_FROM: f32 = 1200.0;
 const CONTRASTS: [Preset; 2] = [Preset::Spruce, Preset::DeadTree];
-/// A crown draws as its full mesh while its height in tiles times this exceeds
-/// the distance to it: a projected-size rule, so a tall pine keeps its shape
-/// further out than a bush.
-const DETAIL_RATIO: f32 = 30.0;
-
-/// Which stage of the tree chain an instance draws at.
+/// The stages of the far band's tree chain, nearest first. Each is one entity
+/// per tree carrying its own `VisibilityRange`, so the swap is Bevy's and the
+/// measure is the camera's distance to that tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stage {
-    /// The canonical crown: `dwarf_eye_trees::crown`.
+    /// A grown tree at one voxel to a tile: `horizon::grown`.
+    Grown,
+    /// The canonical crown, a trunk under one to three boxes:
+    /// `dwarf_eye_trees::crown`.
     Crown,
     /// Its bounding box in the crown's mean colour: `dwarf_eye_trees::crown_box`.
     Box,
 }
 
+/// Nearest first, which is the order `main.rs` builds the ranges in.
+pub const STAGES: [Stage; 3] = [Stage::Grown, Stage::Crown, Stage::Box];
+
 /// One placed tree, in render space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CrownInstance {
     pub pos: [f32; 3],
-    pub scale: f32,
+    /// How tall this tree stands, in tiles. A stage's mesh has a height of its
+    /// own, so the transform's scale is this over that.
+    pub height: f32,
     pub yaw: f32,
+    /// Which of the species' canonical growths the nearest stage draws.
+    pub variant: u32,
 }
 
 /// A region tile's worth of forest: what grows there and how thickly.
@@ -97,7 +107,7 @@ pub fn crown_count(vegetation: i32, radius: f32) -> usize {
 /// Places a region tile's crowns, skipping any that fall where the fine map
 /// stands. Positions come out in a fixed order, so a smaller count is a prefix
 /// of a larger one.
-pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<(Preset, Stage, CrownInstance)>) {
+pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<(Preset, CrownInstance)>) {
     if patch.presets.is_empty() {
         return;
     }
@@ -119,17 +129,13 @@ pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<
         if unit(6) < EMERGENT {
             jitter *= EMERGENT_SCALE;
         }
-        let natural = TreeParams::preset(preset).height.max(0.5);
-        let scale = DF_TREE_HEIGHT / natural * jitter;
-        let height = natural * scale;
-        let stage = if radius < height * DETAIL_RATIO { Stage::Crown } else { Stage::Box };
         out.push((
             preset,
-            stage,
             CrownInstance {
                 pos: [tx as f32 + 0.5, terrain.slab_top(level), tz as f32 + 0.5],
-                scale,
+                height: DF_TREE_HEIGHT * jitter,
                 yaw: unit(4) * std::f32::consts::TAU,
+                variant: seed(7) % super::grown::VARIANTS,
             },
         ));
     }

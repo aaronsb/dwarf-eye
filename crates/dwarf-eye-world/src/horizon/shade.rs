@@ -15,16 +15,16 @@ pub const GRASS: Rgb = [96, 142, 62];
 const DRY_GRASS: Rgb = [150, 156, 90];
 const WET_GRASS: Rgb = [58, 138, 52];
 pub const CANOPY: Rgb = [66, 106, 52];
-const SNOW: Rgb = [226, 232, 240];
+pub const SNOW: Rgb = [226, 232, 240];
 pub const SOIL: Rgb = [134, 96, 67];
 /// Bare rock, above the treeline.
-const ROCK: Rgb = [142, 136, 126];
+pub const ROCK: Rgb = [142, 136, 126];
 /// A site building's walls, where its stone says nothing.
 pub const BUILDING: Rgb = [128, 112, 96];
 
 /// Elevation above which the ground fades from grass to bare rock: DF's
 /// world-tile scale runs 0-99 ocean, 100-149 normal biomes, 150+ mountains.
-const ROCK_ELEVATION: f32 = 150.0;
+pub const ROCK_ELEVATION: f32 = 150.0;
 const ROCK_ELEVATION_FULL: f32 = 200.0;
 
 pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
@@ -41,6 +41,19 @@ pub fn jitter(rgb: Rgb, ax: i32, az: i32, amount: f32) -> Rgb {
         (rgb[0] as f32 * factor).round().clamp(0.0, 255.0) as u8,
         (rgb[1] as f32 * factor).round().clamp(0.0, 255.0) as u8,
         (rgb[2] as f32 * factor).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// Pulls a linear colour toward its own luminance, the way the tile mesher
+/// pulls a material colour before it multiplies a near-grey sprite by it
+/// (`mesh.rs:damp`): DF's material colours are strong, and a hillside of them
+/// reads as paint.
+pub fn damp(c: [f32; 3], keep: f32) -> [f32; 3] {
+    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    [
+        luma + (c[0] - luma) * keep,
+        luma + (c[1] - luma) * keep,
+        luma + (c[2] - luma) * keep,
     ]
 }
 

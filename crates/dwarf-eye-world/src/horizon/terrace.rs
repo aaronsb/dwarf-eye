@@ -18,6 +18,8 @@ use crate::mesh::{FLOOR_HEIGHT, MeshData, Z_SCALE};
 use super::field::Field;
 use super::fine::FineSurface;
 use super::shade::{jitter, riser_color, to_linear, top_color};
+use super::skin::{self, Skins};
+use super::stitch;
 use super::{REGION_TILE, Window};
 
 /// Cell pitch in tiles and the radius, in tiles from the window centre, out to
@@ -55,6 +57,8 @@ pub struct Terrain<'a> {
     pub field: &'a Field,
     pub fine: &'a FineSurface,
     pub window: &'a Window,
+    /// Where the ground sprites the coarse bands wear sit in the atlas.
+    pub skins: &'a Skins,
     /// Radii at which crowns are at full density and at none, in tiles, so the
     /// ground knows how much canopy to carry itself.
     pub crown_near: f32,
@@ -92,30 +96,33 @@ impl Terrain<'_> {
     }
 
     /// The survey, relieved and quantised, at a cell's centre.
-    fn survey_level(&self, cx: i32, cz: i32) -> i32 {
+    pub(crate) fn survey_level(&self, cx: i32, cz: i32) -> i32 {
         let cell = self.field.relieved(cx + self.window.origin.0, cz + self.window.origin.1);
         (cell.surface() - self.window.origin.2 as f32).round() as i32
     }
 
     /// The z-level a coarse cell stands at.
     ///
-    /// At the rim of the fine map it is the neighbouring fine column's own
-    /// level, so the two surfaces meet exactly; the lowest of them where
-    /// several are adjacent, so the coarse never rides over fine ground.
-    /// Elsewhere it is the quantised survey.
+    /// At the rim of the fine map it is the lowest fine **tile** along the
+    /// sides it faces (`stitch::Terrain::stitched_level`), so the coarse never
+    /// rides over fine ground and a neighbouring slab's riser hangs from the
+    /// same level the stitched cell's body holds. Elsewhere it is the
+    /// quantised survey.
     pub fn cell_level(&self, cx: i32, cz: i32, pitch: i32) -> i32 {
-        let mut snapped: Option<i32> = None;
-        for (dx, dz) in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)] {
-            if let Some(l) = self.fine.level(cx + dx, cz + dz) {
-                snapped = Some(snapped.map_or(l, |s: i32| s.min(l)));
-            }
+        let (x0, z0) = (cell_origin(cx, pitch), cell_origin(cz, pitch));
+        if stitch::touches_fine(self.fine, x0, z0, pitch) {
+            return self.stitched_level(x0, z0, pitch);
         }
-        snapped.unwrap_or_else(|| self.survey_level(cx, cz))
+        self.survey_level(cx, cz)
     }
 
     /// The z-level of the ground over a tile, from whichever tier owns it.
+    ///
+    /// Inside the fine map it is that tile's own top, not its block column's
+    /// percentile: this is what a scattered tree stands on and what a riser
+    /// drops to.
     pub fn level_at(&self, tx: i32, tz: i32) -> Option<i32> {
-        if let Some(level) = self.fine.level(tx, tz) {
+        if let Some(level) = self.fine.tile_level(tx, tz).or_else(|| self.fine.level(tx, tz)) {
             return Some(level);
         }
         let pitch = self.pitch_at(tx, tz)?;
@@ -160,13 +167,44 @@ impl Terrain<'_> {
     fn emit_cell(&self, mesh: &mut MeshData, x0: i32, z0: i32, pitch: i32) {
         let (cx, cz) = (x0 + pitch / 2, z0 + pitch / 2);
         // The fine map owns this ground; the block mask discards anything the
-        // coarse band would draw over it anyway.
-        if self.fine.covers(cx, cz) {
+        // coarse band would draw over it anyway. Every corner, not the centre:
+        // a sixteen-tile block column and a six-tile cell do not line up, and
+        // dropping a cell whose middle is covered left the tiles at its edge
+        // with no ground from either tier.
+        let corners = [(x0, z0), (x0 + pitch - 1, z0), (x0, z0 + pitch - 1), (x0 + pitch - 1, z0 + pitch - 1)];
+        if corners.iter().all(|&(x, z)| self.fine.covers(x, z)) {
             return;
         }
+        let cell = self.field.relieved(cx + self.window.origin.0, cz + self.window.origin.1);
+        let ground = skin::ground_of(&cell);
+        let side = skin::side_of(&cell);
+
+        // A cell that touches the fine map is stitched to it rather than laid
+        // flat: the level difference is spread across the cell's own width and
+        // its fine-facing edge follows the fine tiles tile by tile.
+        if stitch::touches_fine(self.fine, x0, z0, pitch) {
+            let top = jitter(
+                top_color(&cell, self.canopy_at(cx, cz)),
+                cx + self.window.origin.0,
+                cz + self.window.origin.1,
+                JITTER,
+            );
+            let riser = riser_color(&cell, top);
+            self.emit_stitched(
+                mesh,
+                x0,
+                z0,
+                pitch,
+                ground,
+                self.skins.tint(ground, top),
+                side,
+                self.skins.side_tint(side, riser),
+            );
+            return;
+        }
+
         let level = self.cell_level(cx, cz, pitch);
         let y = self.slab_top(level);
-        let cell = self.field.relieved(cx + self.window.origin.0, cz + self.window.origin.1);
         let top = jitter(
             top_color(&cell, self.canopy_at(cx, cz)),
             cx + self.window.origin.0,
@@ -175,13 +213,22 @@ impl Terrain<'_> {
         );
         let (fx0, fz0) = (x0 as f32, z0 as f32);
         let (fx1, fz1) = ((x0 + pitch) as f32, (z0 + pitch) as f32);
-        mesh.push_quad(
+        // Water has no sprite: the coarse sea keeps its flat colour on the
+        // white cell, the way the world grid and the rivers do.
+        let (top_uv, top_color) = if cell.underwater() {
+            (dwarf_eye_art::atlas::WHITE_UV, to_linear(top))
+        } else {
+            (self.skins.uv(ground), self.skins.tint(ground, top))
+        };
+        mesh.push_textured_quad(
             [[fx0, y, fz0], [fx0, y, fz1], [fx1, y, fz1], [fx1, y, fz0]],
             [0.0, 1.0, 0.0],
-            to_linear(top),
+            top_color,
+            [top_uv; 4],
         );
 
-        let riser = to_linear(riser_color(&cell, top));
+        let riser = self.skins.side_tint(side, riser_color(&cell, top));
+        let riser_uv = self.skins.side_uv(side);
         for (dx, dz) in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)] {
             let (nx, nz) = (cx + dx, cz + dz);
             // At the rim of the fine map, hang a short skirt whatever the
@@ -195,7 +242,7 @@ impl Terrain<'_> {
                 // under this edge, so drop a skirt over the step.
                 None => y - OUTER_SKIRT,
             };
-            push_riser(mesh, [fx0, fx1], [bottom, y], [fz0, fz1], (dx, dz), riser);
+            push_riser(mesh, [fx0, fx1], [bottom, y], [fz0, fz1], (dx, dz), riser, riser_uv);
         }
     }
 }
@@ -209,6 +256,7 @@ fn push_riser(
     [z0, z1]: [f32; 2],
     (dx, dz): (i32, i32),
     color: [f32; 4],
+    uv: [f32; 2],
 ) {
     if y1 - y0 <= 0.0 {
         return;
@@ -222,7 +270,7 @@ fn push_riser(
     } else {
         ([[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], [1.0, 0.0, 0.0])
     };
-    mesh.push_quad(corners, normal, color);
+    mesh.push_textured_quad(corners, normal, color, [uv; 4]);
 }
 
 /// The render height a smooth sample sits at, for the bands that keep one.

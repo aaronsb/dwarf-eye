@@ -60,6 +60,45 @@ fn downsample(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     (out, w, h)
 }
 
+/// A tiling surface with its own mip chain: the canopy textures, for geometry
+/// far enough off that one texel is well under a pixel.
+///
+/// The near canopy samples its cutout nearest and unmipped, which keeps a leaf
+/// hole hard-edged where a hole is still pixels across. The horizon's crowns
+/// are hundreds of tiles out, where that same sampling is pure sparkle, so
+/// they take a mipped, linearly minified copy of the same bytes.
+pub fn tiled_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
+    let mut data = pixels.clone();
+    let (mut level, mut w, mut h) = (pixels, width, height);
+    let mut levels = 1;
+    while w > 1 && h > 1 {
+        let (next, nw, nh) = downsample(&level, w, h);
+        data.extend_from_slice(&next);
+        level = next;
+        w = nw;
+        h = nh;
+        levels += 1;
+    }
+
+    let mut image = Image::new(
+        Extent3d { width, height, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.mip_level_count = levels;
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Nearest,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    image
+}
+
 /// Builds the atlas texture with its mip chain.
 pub fn atlas_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
     let mut data = pixels.clone();

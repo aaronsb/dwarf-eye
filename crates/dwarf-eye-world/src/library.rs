@@ -689,6 +689,36 @@ impl TileLibrary {
         rows
     }
 
+    /// Where a ground family sits in the atlas, and whether its sheet is a
+    /// near-grey pattern for the material to colour.
+    ///
+    /// Read-only, and the horizon's only way in: the coarse bands wear the
+    /// same sprites the fine tiles do, so a slab beside a floor shows the
+    /// texture continuing. Families packed for use beneath objects answer
+    /// first; the rest are found through whichever tiletype packed them.
+    pub fn ground_cell(&self, family: &str) -> Option<(Rect, bool)> {
+        if let Some(found) = self.under_uv.get(family) {
+            return Some(*found);
+        }
+        let mut best: Option<(i32, Rect, bool)> = None;
+        for (id, info) in &self.tiles {
+            if info.mode != RenderMode::FlatTile || !info.candidates.iter().any(|c| c == family) {
+                continue;
+            }
+            let Some(rect) = self.flat_uv.get(&(*id, -1)) else { continue };
+            if best.is_none_or(|(seen, _, _)| *id < seen) {
+                best = Some((*id, *rect, self.flat_tint.get(&(*id, -1)).copied().unwrap_or(false)));
+            }
+        }
+        best.map(|(_, rect, tint)| (rect, tint))
+    }
+
+    /// The strip a wall family's four sides share, for geometry that wants a
+    /// cut bank rather than a floor.
+    pub fn wall_side_cell(&self, family: &str) -> Option<(Rect, bool)> {
+        self.wall_side.get(family).copied()
+    }
+
     /// The packed ground texture, for the renderer to upload.
     pub fn atlas(&self) -> &Atlas {
         &self.atlas
