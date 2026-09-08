@@ -54,4 +54,3 @@ rfr!(
 );
 rfr!(GET_REGION_MAPS, "GetRegionMaps", EMPTY, "RemoteFortressReader.RegionMaps");
 rfr!(GET_REGION_MAPS_NEW, "GetRegionMapsNew", EMPTY, "RemoteFortressReader.RegionMaps");
-
