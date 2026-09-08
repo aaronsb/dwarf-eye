@@ -298,7 +298,12 @@ fn rebuild(
     let mut lines = Vec::new();
     for (i, slot) in Preset::ALL.iter().enumerate() {
         let preset = lab.forced.unwrap_or(*slot);
-        let params = TreeParams::preset(preset);
+        let mut params = TreeParams::preset(preset);
+        // TREE_LAB_HEIGHT grows every preset at one height, for comparing a
+        // preset here against the same species in the game.
+        if let Some(height) = std::env::var("TREE_LAB_HEIGHT").ok().and_then(|v| v.parse().ok()) {
+            params.height = height;
+        }
         let seed = lab.seed.wrapping_add(i as u64 * 0x9E3779B97F4A7C15);
         let skeleton = grow(&params, seed, None);
         let voxels = rasterise(&skeleton, lab.voxels_per_tile);
