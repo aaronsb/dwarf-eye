@@ -62,6 +62,15 @@ const STAIR_FOOTING: f32 = 0.5 * Z_SCALE;
 /// else is going on.
 const CLEARANCE: f32 = 0.25 * Z_SCALE;
 
+/// How far in front of the eye the near plane reaches, in tiles. Walking down
+/// a slope the ground just ahead stands higher than the ground underfoot, and
+/// it is that ground the near plane cuts into first.
+const NEAR: f32 = 0.2;
+
+/// A rise steeper than this beside the eye is a wall, not the floor being
+/// walked on, and standing next to a wall must not lift the camera.
+const A_WALL: f32 = 0.75 * Z_SCALE;
+
 /// How close to a shut edge the camera may press.
 const MARGIN: f32 = 0.12;
 
@@ -581,6 +590,8 @@ pub fn toggle(keys: Res<ButtonInput<KeyCode>>, bridge: NonSend<Bridge>, mut walk
     walk.pending = None;
     walk.blocked = [0.0; 9];
     walk.strikes = 0;
+    walk.stalled = 0.0;
+    walk.aborted = None;
     walk.glide = Vec2::ZERO;
     walk.line = if wanted { "walk    finding the character…".into() } else { String::new() };
 }
@@ -762,17 +773,31 @@ pub fn walk(
     }
     let ground = walk.anchor() + walk.glide;
     let surface = walk.surface(ground.x, ground.y);
-    // Whatever else happens, the eye stays above what it is standing on.
-    let eye = (surface + EYE).max(surface + CLEARANCE);
+    // The near plane reaches a little past the eye, so the ground immediately
+    // around it has to clear too — going down a slope, the tile behind the eye
+    // is still the high one. A rise of most of a level is a wall standing
+    // beside us rather than ground underfoot, and is left out.
+    let mut underfoot = surface;
+    for probe in [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y] {
+        let near = ground + probe * NEAR;
+        let height = walk.surface(near.x, near.y);
+        if height > underfoot && height - surface < A_WALL {
+            underfoot = height;
+        }
+    }
+    let eye = (surface + EYE).max(underfoot + CLEARANCE);
     transform.translation = Vec3::new(ground.x, eye, ground.y);
 
     let shut = walk.blocked.iter().filter(|&&b| b > 0.0).count();
-    let state = match (walk.strikes, walk.pending.is_some(), shut) {
-        _ if walk.aborted.is_some() => walk.aborted.clone().unwrap(),
-        (s, _, _) if s >= STRIKES => "stuck".into(),
-        (_, true, _) => "stepping".into(),
-        (_, _, n) if n > 0 => "blocked".into(),
-        _ => "walking".to_string(),
+    let state = match &walk.aborted {
+        Some(why) => why.clone(),
+        None => match (walk.strikes, walk.pending.is_some(), shut) {
+            (s, _, _) if s >= STRIKES => "stuck",
+            (_, true, _) => "stepping",
+            (_, _, n) if n > 0 => "blocked",
+            _ => "walking",
+        }
+        .to_string(),
     };
     let tile = confirmed - origin;
     walk.line = format!("walk    character tile ({}, {}, {})   {state}", tile.x, tile.y, tile.z);
