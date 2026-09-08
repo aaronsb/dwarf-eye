@@ -34,6 +34,11 @@ one material is one entity and one draw call for a chunk's whole crown, and at
 that distance there is no bark grain or leaf hole left to tell apart.
 `canopy.rs:Band::coats` says what each mesh wears.
 
+Fine terrain stays at full detail however far away, out to
+`worker.rs:RETAIN_RADIUS` 40 blocks horizontally. What remains of issue #10 is
+the terrain mid tier: a surface-only 4-tile heightfield coloured from the top
+voxels, keeping the block mask over it, after which retention can grow.
+
 ## The projected-size rule
 
 Which band a chunk draws is decided by how large a near-detail leaf voxel would
@@ -72,11 +77,6 @@ Bevy ignores `OcclusionCulling` on a device whose GPU preprocessing cannot
 cull, and says nothing about it, so `main.rs:report_culling` reads
 `GpuPreprocessingSupport` in the render app and logs one line at startup:
 `GPU preprocessing available; occlusion culling on`.
-
-Fine terrain stays at full detail however far away, out to
-`worker.rs:RETAIN_RADIUS` 40 blocks horizontally. What remains of issue #10 is
-the terrain mid tier: a surface-only 4-tile heightfield coloured from the top
-voxels, keeping the block mask over it, after which retention can grow.
 
 Full detail outside the live window is not obtainable. DF discards the local map
 on offload and regenerates it from region details, and no DFHack call reaches
