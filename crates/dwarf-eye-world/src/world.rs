@@ -116,6 +116,16 @@ impl World {
         self.chunks.get(&(block_x, block_y, z))
     }
 
+    /// Places a chunk that came from somewhere other than the game, such as
+    /// the disk cache. Never replaces one the game has already supplied.
+    pub fn restore(&mut self, key: (i32, i32, i32), voxels: Vec<Voxel>) -> bool {
+        if self.chunks.contains_key(&key) {
+            return false;
+        }
+        self.chunks.insert(key, Chunk { block_x: key.0, block_y: key.1, z: key.2, voxels });
+        true
+    }
+
     /// Looks up a single tile by absolute tile coordinates.
     pub fn voxel(&self, x: i32, y: i32, z: i32) -> Option<Voxel> {
         let chunk = self.chunk(x.div_euclid(BLOCK), y.div_euclid(BLOCK), z)?;

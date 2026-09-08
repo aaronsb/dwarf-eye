@@ -23,6 +23,9 @@ pub const REGION_TILE: i32 = 48;
 pub const REGIONS_PER_WORLD: i32 = 16;
 /// Region maps carry a one-tile overlap on each side.
 const REGION_MAP_SIDE: i32 = 17;
+/// How many world tiles out the 48-tile grid runs before the world grid takes
+/// over.
+const REACH: i32 = 12;
 
 const WATER: Rgb = [60, 110, 190];
 const GRASS: Rgb = [96, 142, 62];
@@ -260,7 +263,6 @@ pub fn build(
     let bias = if gap_n > 0 { gap / gap_n as f32 } else { 0.0 };
 
     let (pwx, pwy) = (window.x0.div_euclid(REGIONS_PER_WORLD), window.y0.div_euclid(REGIONS_PER_WORLD));
-    const REACH: i32 = 6;
     for ry in (pwy - REACH) * REGIONS_PER_WORLD..(pwy + REACH + 1) * REGIONS_PER_WORLD {
         for rx in (pwx - REACH) * REGIONS_PER_WORLD..(pwx + REACH + 1) * REGIONS_PER_WORLD {
             if samples.contains_key(&(rx, ry)) {
@@ -305,6 +307,37 @@ pub fn build(
 
     let mut mesh = MeshData::default();
     emit_region_grid(&mut mesh, &samples, &window);
+
+    // The rest of the world at one sample per world tile. It runs a world
+    // tile under the fine ring and sits two levels lower there, so the join
+    // is a step hidden beneath the finer surface rather than a crack.
+    let mut far: HashMap<(i32, i32), Sample> = HashMap::new();
+    for wy in 0..height {
+        for wx in 0..width {
+            let Some((elevation, water, vegetation)) = world_at(wx, wy) else { continue };
+            let inside = (wx - pwx).abs() < REACH && (wy - pwy).abs() < REACH;
+            let deep = (wx - pwx).abs() < REACH - 1 && (wy - pwy).abs() < REACH - 1;
+            let water = if water == i32::MIN { elevation } else { water };
+            let underwater = elevation < water;
+            let height = (if underwater { water } else { elevation }) as f32 - bias;
+            far.insert(
+                (wx, wy),
+                Sample {
+                    y: window.height(0) + height * Z_SCALE + 0.1 - if inside { 2.0 } else { 0.0 },
+                    color: shade(palette, None, vegetation, 0, underwater),
+                    interior: deep,
+                },
+            );
+        }
+    }
+    let spacing = REGION_TILE * REGIONS_PER_WORLD;
+    emit(&mut mesh, &far, spacing as f32, |wx, wy, s| {
+        [
+            (wx * spacing - window.origin.0 + spacing / 2) as f32,
+            s.y,
+            (wy * spacing - window.origin.1 + spacing / 2) as f32,
+        ]
+    });
     mesh
 }
 

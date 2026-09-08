@@ -7,6 +7,7 @@
 //! converts every request and reply, so chunks keep their places and the map
 //! paints in as the character travels.
 
+use crate::cache::Cache;
 use crate::palette::Palette;
 use crate::world::{BLOCK, BlockBounds, World};
 use anyhow::Result;
@@ -23,6 +24,8 @@ pub struct Session {
     pub version: rfr::VersionInfo,
     /// Absolute position of the render origin: tiles in x/y, z-level in z.
     origin: (i32, i32, i32),
+    /// Chunks from earlier sessions, and where new ones are written.
+    cache: Option<Cache>,
 }
 
 /// Absolute position of a window's corner: tiles in x/y, z-level in z.
@@ -40,7 +43,46 @@ impl Session {
         let materials = client.call_empty(methods::GET_MATERIAL_LIST)?;
         let world = World::new(Palette::new(tiletypes, materials));
         let origin = window_origin(&map_info);
-        Ok(Self { client, world, map_info, version, origin })
+        let cache = Cache::open(map_info.world_name_english(), map_info.save_name()).ok();
+        Ok(Self { client, world, map_info, version, origin, cache })
+    }
+
+    /// Absolute key of a render-space chunk key.
+    fn absolute(&self, key: (i32, i32, i32)) -> (i32, i32, i32) {
+        (key.0 + self.origin.0 / BLOCK, key.1 + self.origin.1 / BLOCK, key.2 + self.origin.2)
+    }
+
+    fn relative(&self, key: (i32, i32, i32)) -> (i32, i32, i32) {
+        (key.0 - self.origin.0 / BLOCK, key.1 - self.origin.1 / BLOCK, key.2 - self.origin.2)
+    }
+
+    pub fn cache_dir(&self) -> Option<&std::path::Path> {
+        self.cache.as_ref().map(Cache::dir)
+    }
+
+    /// Brings every cached chunk of this world into the render space. Returns
+    /// their keys.
+    pub fn restore_cache(&mut self) -> Vec<(i32, i32, i32)> {
+        let Some(cache) = &self.cache else { return Vec::new() };
+        let Ok(entries) = cache.load_all() else { return Vec::new() };
+        let mut keys = Vec::new();
+        for (absolute, voxels) in entries {
+            let key = self.relative(absolute);
+            if self.world.restore(key, voxels) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// Writes chunks to the cache under their absolute keys.
+    pub fn persist(&self, keys: &[(i32, i32, i32)]) {
+        let Some(cache) = &self.cache else { return };
+        for &key in keys {
+            if let Some(chunk) = self.world.chunk(key.0, key.1, key.2) {
+                let _ = cache.store(self.absolute(key), chunk);
+            }
+        }
     }
 
     /// Re-reads where the window sits. True when it has moved since the last

@@ -10,11 +10,11 @@ mod noise;
 mod shadow;
 mod sky;
 mod stars;
+mod texture;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
@@ -167,7 +167,7 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         // Far enough to take in the outer terrain.
-        Projection::Perspective(PerspectiveProjection { far: 8000.0, ..default() }),
+        Projection::Perspective(PerspectiveProjection { far: 40000.0, ..default() }),
         Transform::from_xyz(0.0, 40.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
         AtmosphereSettings {
             // Raymarching integrates the sky directly, which removes the seams
@@ -269,16 +269,7 @@ fn drain_worker(
                 *clock = Clock { year, tick };
             }
             Event::Atlas { width, height, pixels } => {
-                let mut image = Image::new(
-                    Extent3d { width, height, depth_or_array_layers: 1 },
-                    TextureDimension::D2,
-                    pixels,
-                    TextureFormat::Rgba8UnormSrgb,
-                    RenderAssetUsages::RENDER_WORLD,
-                );
-                // DF's art is pixel art; smoothing it would defeat the point.
-                image.sampler = ImageSampler::nearest();
-                let handle = images.add(image);
+                let handle = images.add(texture::atlas_image(width, height, pixels));
                 if let Some(mut m) = materials.get_mut(&material.0) {
                     m.base.base_color_texture = Some(handle);
                 }

@@ -28,7 +28,7 @@ pub const LAYER_TOP: f32 = 200.0;
 /// The cirrus sheet, well above the main layer.
 pub const CIRRUS_HEIGHT: f32 = 290.0;
 /// How far the ray is followed, in tiles.
-pub const MAX_DISTANCE: f32 = 2600.0;
+pub const MAX_DISTANCE: f32 = 6000.0;
 /// The whole field repeats at this period, in tiles.
 pub const WEATHER_PERIOD: f32 = 2048.0;
 pub const BASE_PERIOD: f32 = 256.0;
@@ -151,7 +151,7 @@ impl Default for Tuning {
             haze: 0.0006,
             cirrus_opacity: 0.5,
             shadow_strength: 0.85,
-            steps: 64.0,
+            steps: 72.0,
         }
     }
 }

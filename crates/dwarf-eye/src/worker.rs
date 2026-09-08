@@ -111,6 +111,22 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
         ),
     })?;
 
+    // Land from earlier sessions comes back before the first fetch.
+    let restored = df.restore_cache();
+    bevy::log::info!(
+        "{} chunks restored from {}",
+        restored.len(),
+        df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
+    );
+    if !restored.is_empty() {
+        events.send(Event::Status(format!(
+            "{} chunks restored from {}",
+            restored.len(),
+            df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        )))?;
+        remesh_all(&df, library.as_mut(), MeshOptions { z_ceiling: i32::MAX, show_hidden: true }, events)?;
+    }
+
     let mut horizon_sent = false;
     loop {
         let command = match commands.try_recv() {
@@ -169,6 +185,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 }
 
                 if !arrived.is_empty() {
+                    df.persist(&arrived);
                     events.send(Event::Status(format!(
                         "{} blocks fetched, {} chunks held",
                         arrived.len(),
