@@ -228,3 +228,25 @@ mod tests {
         assert_eq!(mesh(&tree).indices.len() / 3, 12);
     }
 }
+
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// What a preset costs at a given height, for comparing the game against
+    /// the lab. `cargo test -p dwarf-eye-trees -- --nocapture reference`
+    #[test]
+    fn leaf_voxels_by_height() {
+        for height in [8.0f32, 10.0, 12.0, 15.0, 20.0] {
+            for preset in [Preset::Oak, Preset::Spruce] {
+                let mut params = TreeParams::preset(preset);
+                params.height = height;
+                let mut leaf = 0;
+                for seed in 0..4u64 {
+                    leaf += rasterise(&grow(&params, seed, None), 4).counts().leaf;
+                }
+                println!("{} at height {height}: {} leaf voxels", preset.name(), leaf / 4);
+            }
+        }
+    }
+}
