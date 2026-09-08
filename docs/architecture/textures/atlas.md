@@ -5,8 +5,8 @@ Status: landed (`crates/dwarf-eye-art/src/atlas.rs`,
 
 ## What it does
 
-Packs every ground, ramp and leaf sprite into one 2048x2048 texture so the whole
-terrain draws with one material.
+Packs every ground, wall, ramp and leaf sprite into one 2048x2048 texture so the
+whole terrain draws with one material.
 
 ## How
 
@@ -19,8 +19,20 @@ so vertex-coloured geometry points at `atlas::WHITE_UV` and shares the material
 (`mesh.rs:push_quad`, `horizon.rs`).
 
 `library.rs` fills the atlas once during `TileLibrary::load`, in the order
-`pack_leaves`, `pack_ground`, `pack_under`, `pack_ramps`. The worker sends the
-finished pixels as `Event::Atlas` and `main.rs:drain_worker` uploads them.
+`pack_leaves`, `pack_ground`, `pack_under`, `pack_ramps`, `pack_walls`. The
+worker sends the finished pixels as `Event::Atlas` and `main.rs:drain_worker`
+uploads them.
+
+## What is in it
+
+`cargo run -p dwarf-eye-world --example atlas` prints the count and the
+per-family wall report; the worker's status line prints the count alone.
+
+| | cells |
+|---|---|
+| ground, ramps, leaves, white | 181 |
+| walls: 8 sheets x (15 neighbour variants + 1 side face) | 128 |
+| total, of a 1024 cap | 309 |
 
 `texture.rs:atlas_image` builds `MIP_LEVELS` 4 levels below the base by 2x2 box
 filtering in linear light with alpha-weighted colour (`texture.rs:downsample`),
@@ -39,8 +51,8 @@ over it, clamped to 4..128. Voxel resolution is separate:
 ## Invariants and gotchas
 
 - Capacity is 1024 cells and `Atlas::insert` returns `None` past that. Every
-  caller skips silently, so sprites simply stop appearing. Ramps alone cost 47
-  cells per family.
+  caller skips silently, so sprites simply stop appearing. Ramps cost 47 cells
+  per family and walls 16 per sheet.
 - `PAD` 16 in `dwarf-eye-art` and `MIP_LEVELS` 4 in `dwarf-eye` encode the same
   invariant in two crates. Four halvings leave a 4-pixel cell with a pixel of
   its own bleed each side; more levels, or less padding, bleeds neighbours in.
@@ -55,4 +67,4 @@ over it, clamped to 4..128. Voxel resolution is separate:
 
 ## Related issues
 
-#13 (walls would add a large family of cells to the same atlas).
+#13 (closed, the 128 wall cells; [walls.md](walls.md)).

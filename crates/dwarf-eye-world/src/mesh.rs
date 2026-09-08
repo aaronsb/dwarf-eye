@@ -5,7 +5,9 @@ use crate::factory::{Extent, Style};
 use crate::library::TileLibrary;
 use crate::model::{Caps, RenderMode};
 use crate::palette::{Rgb, Solid};
+use crate::wall;
 use crate::world::{BLOCK, Chunk, World};
+use dwarf_eye_art::atlas::Rect;
 
 /// Vertical exaggeration of a z-level relative to a tile's width.
 ///
@@ -114,6 +116,93 @@ impl MeshData {
                 .map(|c| [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2], c[3]]),
         );
         self.indices.extend(model.indices.iter().map(|i| i + base));
+    }
+
+    /// Appends a box that samples the atlas: `top` on the lid and the bottom,
+    /// `side` on the four walls.
+    ///
+    /// The lid is laid out the way a flat tile is, north at `v0`, so a wall's
+    /// top face lines up with the floor beside it. A side runs `v0` at the top
+    /// of the box to `v1` at its foot, one cell of texture per z-level, so a
+    /// cliff stacks without stretching.
+    fn textured_cuboid(
+        &mut self,
+        lo: [f32; 3],
+        hi: [f32; 3],
+        color: [f32; 4],
+        skip: Faces,
+        top: Rect,
+        side: Rect,
+    ) {
+        let [x0, y0, z0] = lo;
+        let [x1, y1, z1] = hi;
+        // Every side is wound bottom, top, top, bottom, so one set of UVs
+        // serves all four.
+        let face = [
+            [side.u0, side.v1],
+            [side.u0, side.v0],
+            [side.u1, side.v0],
+            [side.u1, side.v1],
+        ];
+
+        if !skip.top {
+            self.push_textured_quad(
+                [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
+                [0.0, 1.0, 0.0],
+                shade(color, 1.0),
+                [
+                    [top.u0, top.v0],
+                    [top.u0, top.v1],
+                    [top.u1, top.v1],
+                    [top.u1, top.v0],
+                ],
+            );
+        }
+        if !skip.bottom {
+            self.push_textured_quad(
+                [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+                [0.0, -1.0, 0.0],
+                shade(color, 0.55),
+                [
+                    [top.u0, top.v0],
+                    [top.u1, top.v0],
+                    [top.u1, top.v1],
+                    [top.u0, top.v1],
+                ],
+            );
+        }
+        if !skip.north {
+            self.push_textured_quad(
+                [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
+                [0.0, 0.0, -1.0],
+                shade(color, 0.8),
+                face,
+            );
+        }
+        if !skip.south {
+            self.push_textured_quad(
+                [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]],
+                [0.0, 0.0, 1.0],
+                shade(color, 0.8),
+                face,
+            );
+        }
+        if !skip.west {
+            self.push_textured_quad(
+                [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
+                [-1.0, 0.0, 0.0],
+                shade(color, 0.68),
+                face,
+            );
+        }
+        if !skip.east {
+            self.push_textured_quad(
+                [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
+                [1.0, 0.0, 0.0],
+                shade(color, 0.68),
+                face,
+            );
+        }
     }
 
     /// Appends a box spanning `lo`..`hi`, skipping the faces marked in `skip`.
@@ -443,6 +532,33 @@ pub fn build_chunk_budgeted(
                     }
                 }
             }
+            // A wall wears DF's wall sheet: the variant for the walls it joins
+            // on its top face, and a strip cut from the same sprite on its
+            // sides.
+            //
+            // The set comes from the neighbours, not from DF's own
+            // `direction()`. Only smoothed and constructed walls carry one, and
+            // it links a wall to the masonry it was cut with rather than to the
+            // rock it stands in, so a smoothed wall against a rough one would
+            // report an open side where a voxel view shows solid stone.
+            let skin = matches!(voxel.solid, Solid::Cube | Solid::Fortification)
+                .then(|| {
+                    let lib = library.as_deref()?;
+                    if !lib.is_wall(voxel.tile_id) {
+                        return None;
+                    }
+                    let mut mask = 0;
+                    for (bit, dx, dy) in wall::NEIGHBOURS {
+                        if world.voxel(x + dx, y + dy, z).is_some_and(|n| {
+                            matches!(n.solid, Solid::Cube | Solid::Fortification)
+                        }) {
+                            mask |= bit;
+                        }
+                    }
+                    lib.wall_skin(voxel.tile_id, mask)
+                })
+                .flatten();
+
             let full = Faces {
                 top: occluded(0, 0, 1),
                 bottom: occluded(0, 0, -1),
@@ -456,7 +572,29 @@ pub fn build_chunk_budgeted(
             match voxel.solid {
                 Solid::Empty => {}
                 Solid::Cube | Solid::Fortification => {
-                    mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + Z_SCALE, fz + 1.0], color, full);
+                    let (lo, hi) = ([fx, fy, fz], [fx + 1.0, fy + Z_SCALE, fz + 1.0]);
+                    match skin {
+                        // A near-grey sheet is a pattern the material colours,
+                        // as the ground is; a sheet with colour of its own
+                        // keeps it and takes only the tile's brightness.
+                        Some(skin) => {
+                            let wobble = jitter(x, y, z);
+                            let tint = if skin.tint {
+                                damp([color[0], color[1], color[2]], 0.35)
+                            } else {
+                                [wobble, wobble, wobble]
+                            };
+                            mesh.textured_cuboid(
+                                lo,
+                                hi,
+                                [tint[0], tint[1], tint[2], 1.0],
+                                full,
+                                skin.top,
+                                skin.side,
+                            );
+                        }
+                        None => mesh.cuboid(lo, hi, color, full),
+                    }
                 }
                 Solid::Floor => {
                     let rims = rim_faces();
