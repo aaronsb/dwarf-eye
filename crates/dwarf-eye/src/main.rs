@@ -251,12 +251,15 @@ fn setup(
     commands.insert_resource(TerrainMaterial(materials.add(terrain(0.0))));
     commands.insert_resource(HorizonMaterial(materials.add(terrain(1.0))));
 
-    // Leaves are rough and scatter light through themselves, and the geometry
-    // is already full of holes, so no alpha mask and no double-sided draw.
+    // Leaf faces carry the species' twig sprite as a cutout, so the mask is
+    // what lets sky through the crown and dapples the shadow under it. Holes
+    // mean back faces show, so the draw is double sided.
     let mut leaves = terrain(0.0);
-    leaves.base.alpha_mode = AlphaMode::Opaque;
+    leaves.base.alpha_mode = AlphaMode::Mask(0.5);
+    leaves.base.double_sided = true;
+    leaves.base.cull_mode = None;
     leaves.base.perceptual_roughness = 0.95;
-    leaves.base.diffuse_transmission = 0.45;
+    leaves.base.diffuse_transmission = 0.4;
     leaves.base.thickness = 0.25;
     commands.insert_resource(CanopyMaterial(materials.add(leaves)));
     commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });

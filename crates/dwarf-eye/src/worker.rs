@@ -8,7 +8,8 @@ use crate::clouds::Weather;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
-use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk, canopy};
+use dwarf_eye_world::canopy::Forest;
+use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -81,6 +82,9 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
     // it never comes back.
     let mut last_window: Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))> = None;
 
+    // Trees are grown once each and kept, so a chunk never regrows one.
+    let mut forest = Forest::default();
+
     // Dwarf Fortress's own sprites, indexed by tiletype and species.
     let tiletypes: rfr::TiletypeList = df.client.call_empty(methods::GET_TILETYPE_LIST)?;
     let plants: rfr::PlantRawList = df.client.call_empty(methods::GET_PLANT_RAWS)?;
@@ -131,7 +135,13 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
             restored.len(),
             df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
         )))?;
-        remesh_all(&df, library.as_mut(), MeshOptions { z_ceiling: i32::MAX, show_hidden: true }, events)?;
+        remesh_all(
+            &df,
+            library.as_mut(),
+            &mut forest,
+            MeshOptions { z_ceiling: i32::MAX, show_hidden: true },
+            events,
+        )?;
     }
 
     let mut horizon_sent = false;
@@ -147,7 +157,9 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
 
         match command {
             Command::Shutdown => return Ok(()),
-            Command::Remesh { opts } => remesh_all(&df, library.as_mut(), opts, events)?,
+            Command::Remesh { opts } => {
+                remesh_all(&df, library.as_mut(), &mut forest, opts, events)?
+            }
             Command::Run { command, args } => {
                 let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                 match df.client.run_command(&command, &borrowed) {
@@ -169,7 +181,8 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
                 if let Err(err) = collect(
-                    &mut df, center, opts, force, &mut last_window, &mut horizon_sent, library.as_mut(), events,
+                    &mut df, center, opts, force, &mut last_window, &mut horizon_sent,
+                    library.as_mut(), &mut forest, events,
                 ) {
                     events.send(Event::Status(format!("waiting for the map: {err:#}")))?;
                 }
@@ -267,6 +280,7 @@ fn collect(
     last_window: &mut Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))>,
     horizon_sent: &mut bool,
     mut library: Option<&mut TileLibrary>,
+    forest: &mut Forest,
     events: &Sender<Event>,
 ) -> Result<()> {
     // The game's window follows the character; a move changes what every
@@ -308,7 +322,10 @@ fn collect(
         )))?;
         // A new block changes its neighbours' culling, so those remesh along
         // with it.
-        remesh_touched(df, library.as_deref_mut(), opts, events, &arrived)?;
+        // A block that has just arrived can lengthen a tree whose top we could
+        // not see, so those trees are grown again rather than reused.
+        forest.retire_near(&arrived);
+        remesh_touched(df, library.as_deref_mut(), forest, opts, events, &arrived)?;
     }
 
     // The outer terrain needs the map's own surface to meet it, so it waits
@@ -355,6 +372,7 @@ const RETAIN_DEPTH: i32 = 120;
 fn remesh_touched(
     df: &Session,
     mut library: Option<&mut TileLibrary>,
+    forest: &mut Forest,
     opts: MeshOptions,
     events: &Sender<Event>,
     arrived: &[(i32, i32, i32)],
@@ -371,7 +389,7 @@ fn remesh_touched(
         let Some(chunk) = df.world.chunk(key.0, key.1, key.2) else { continue };
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
         let crown = match library.as_deref_mut() {
-            Some(lib) => canopy::build(&df.world, chunk, opts, lib),
+            Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib),
             None => MeshData::default(),
         };
         batch.push((key, mesh, crown));
@@ -389,6 +407,7 @@ fn remesh_touched(
 fn remesh_all(
     df: &Session,
     mut library: Option<&mut TileLibrary>,
+    forest: &mut Forest,
     opts: MeshOptions,
     events: &Sender<Event>,
 ) -> Result<()> {
@@ -399,7 +418,7 @@ fn remesh_all(
         let key = (chunk.block_x, chunk.block_y, chunk.z);
         let mesh = build_chunk(&df.world, chunk, opts, library.as_deref_mut());
         let crown = match library.as_deref_mut() {
-            Some(lib) => canopy::build(&df.world, chunk, opts, lib),
+            Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib),
             None => MeshData::default(),
         };
         batch.push((key, mesh, crown));
