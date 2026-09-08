@@ -10,3 +10,13 @@ anyhow.workspace = true
 bevy = "0.19.1"
 dfhack-remote = { path = "../dfhack-remote" }
 dwarf-eye-world = { path = "../dwarf-eye-world" }
+dwarf-eye-trees = { path = "../dwarf-eye-trees" }
+
+[[bin]]
+name = "dwarf-eye"
+path = "src/main.rs"
+
+# A bench for the tree generator, with no Dwarf Fortress connection.
+[[bin]]
+name = "tree-lab"
+path = "src/bin/tree-lab.rs"

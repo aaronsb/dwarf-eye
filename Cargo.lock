@@ -2384,6 +2384,7 @@ dependencies = [
  "anyhow",
  "bevy",
  "dfhack-remote",
+ "dwarf-eye-trees",
  "dwarf-eye-world",
 ]
 
@@ -2394,6 +2395,10 @@ dependencies = [
  "anyhow",
  "image",
 ]
+
+[[package]]
+name = "dwarf-eye-trees"
+version = "0.1.0"
 
 [[package]]
 name = "dwarf-eye-world"
