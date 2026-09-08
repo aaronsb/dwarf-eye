@@ -59,6 +59,12 @@ Four layers, described in `docs/architecture/testing/`:
 A change to a component names which layers it touched. New pure logic gets a
 unit test; a look change gets a screenshot pair in the report.
 
+The showcase (`make showcase`, docs/gallery/) runs at a version tag, not per
+change: `make release TAG=vX.Y.Z` tags, shoots the scene list against the
+running game, commits the gallery with the tag in its header. Between tags,
+verify a look change with one or two shots of your own; each viewer launch is a
+forced pass on the player's game, so state a launch budget in every brief.
+
 ## Facts not recoverable from the code
 
 - DFHack refuses replies over 64 MiB and also answers CR_LINK_FAILURE when no
