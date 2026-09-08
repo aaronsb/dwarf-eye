@@ -39,6 +39,8 @@ struct TileInfo {
     /// Ground to draw beneath a free-standing object.
     beneath: Option<&'static str>,
     dirs: u8,
+    /// Neighbours a branch tile joins, read from DFHack's direction string.
+    links: u8,
     mode: RenderMode,
     /// Species-independent tiles look straight at the generic sheet.
     generic: bool,
@@ -256,6 +258,7 @@ impl TileLibrary {
                     candidates,
                     beneath,
                     dirs: raws::direction_mask(t.direction()),
+                    links: crate::skeleton::links_from_direction(t.direction()),
                     mode,
                     generic,
                     canopy: canopy_part(t.shape(), name),
@@ -506,6 +509,11 @@ impl TileLibrary {
         };
         self.cache.insert(key, built.clone());
         built
+    }
+
+    /// Which neighbours a branch tile joins.
+    pub fn branch_links(&self, tile: i32) -> u8 {
+        self.tiles.get(&tile).map(|t| t.links).unwrap_or(0)
     }
 
     /// Whether this tiletype is a tree's woody column.

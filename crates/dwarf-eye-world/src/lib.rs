@@ -8,6 +8,7 @@ pub mod mesh;
 pub mod model;
 pub mod palette;
 pub mod session;
+pub mod skeleton;
 pub mod world;
 
 pub use mesh::{MeshData, MeshOptions, build_chunk};
