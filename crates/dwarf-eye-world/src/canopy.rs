@@ -64,6 +64,11 @@ const REACH: i32 = 2;
 /// crown is never shorn off at the ceiling of what has been sent.
 const OVERHEAD: i32 = 24;
 
+/// Sub-voxels per tile the close band cuts a tree into: one step down from
+/// [`DETAIL`], so no hand-off doubles the voxel size and the first one — the
+/// one the eye is nearest to and most likely to catch — is the smallest.
+pub const CLOSE_DETAIL: i32 = DETAIL - 1;
+
 /// Sub-voxels per tile the mid band cuts a tree into: half of [`DETAIL`], so a
 /// crown holds an eighth of the near band's cells and its leaves still wear the
 /// cutout.
@@ -76,14 +81,20 @@ pub const FAR_DETAIL: i32 = DETAIL / 4;
 
 /// How finely one chunk's crowns are cut, and what rides along with them.
 ///
-/// The near band is the full tree, its plants and its hanging strands. The mid
-/// band is the same tree at [`MID_DETAIL`], without the ground cover but still
-/// under the leaf cutout, so light keeps coming through a crown well past the
-/// first hand-off. The far band is [`FAR_DETAIL`] and opaque: a tuft is under a
-/// pixel there and a hole in the cutout costs a masked pass to draw air.
+/// The near band is the full tree, its plants and its hanging strands. The
+/// close and mid bands are the same tree at [`CLOSE_DETAIL`] and
+/// [`MID_DETAIL`], without the ground cover but still under the leaf cutout,
+/// so light keeps coming through a crown well past the first hand-off. The far
+/// band is [`FAR_DETAIL`] and opaque: a tuft is under a pixel there and a hole
+/// in the cutout costs a masked pass to draw air.
+///
+/// The steps are 4, 3, 2, 1 rather than 4, 2, 1: no hand-off doubles the voxel
+/// size, and the first one, nearest the eye and the one the player is most
+/// likely to be looking at, is the gentlest of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Band {
     Near,
+    Close,
     Mid,
     Far,
 }
@@ -93,15 +104,29 @@ pub enum Band {
 /// The list is the whole of the ordering: a coarser stage — a canonical crown
 /// per species, a green box — is one more entry here, one more mesh per chunk
 /// and one more handover distance, with nothing else to restructure.
-pub const BANDS: [Band; 3] = [Band::Near, Band::Mid, Band::Far];
+pub const BANDS: [Band; 4] = [Band::Near, Band::Close, Band::Mid, Band::Far];
 
 impl Band {
     pub fn detail(self) -> i32 {
         match self {
             Band::Near => DETAIL,
+            Band::Close => CLOSE_DETAIL,
             Band::Mid => MID_DETAIL,
             Band::Far => FAR_DETAIL,
         }
+    }
+
+    /// What this band asks the rasteriser for: the near band's wood, however
+    /// coarse its own cells.
+    ///
+    /// A limb thinner than a cell is drawn a cell wide, so an uncorrected
+    /// coarse cut fattens every twig and its crown fills with bark the fine one
+    /// does not show — over a crown of oak, 1.4% of the near band's pixels
+    /// against 13% of the far band's, which is most of what makes a hand-off
+    /// read as a jump. Every band therefore cuts its wood like [`DETAIL`].
+    /// Pinned by `every_band_shows_the_near_band_s_wood`.
+    pub fn cut(self) -> trees::Cut {
+        trees::Cut { wood_like: DETAIL as u32 }
     }
 
     /// Where this band hands over to the next, in tiles, given where the near
@@ -149,7 +174,7 @@ impl Band {
     /// far band's first slot is ever filled.
     pub fn coats(self) -> [Coat; 4] {
         match self {
-            Band::Near | Band::Mid => [
+            Band::Near | Band::Close | Band::Mid => [
                 Coat::Bark,
                 Coat::Cutout(Surface::Broadleaf),
                 Coat::Cutout(Surface::Needle),
@@ -202,6 +227,16 @@ pub fn near_band_override(fov_y: f32, viewport_height: f32) -> f32 {
         Some(blocks) => blocks * BLOCK as f32,
         None => near_band(fov_y, viewport_height),
     }
+}
+
+/// What the band cut at this resolution asks the rasteriser for, so the tree
+/// lab shows a crown exactly as the band that draws it will.
+pub fn cut_at(detail: i32) -> trees::Cut {
+    BANDS
+        .iter()
+        .find(|b| b.detail() == detail)
+        .map(|b| b.cut())
+        .unwrap_or(trees::Cut::fine(detail.max(1) as u32))
 }
 
 /// Which of the canopy materials a face wants.
@@ -847,7 +882,7 @@ impl Forest {
         let skeleton = crate::tree::skeleton(&env, growth, habit, library, world_origin);
         let mut wanted = None;
         for cut in BANDS {
-            let rastered = crate::tree::rasterise(&skeleton, cut.detail());
+            let rastered = crate::tree::rasterise(&skeleton, cut.detail(), cut.cut());
             let grown = Arc::new(voxelise(&rastered, &env, habit, cut));
             if cut == band {
                 wanted = Some(Arc::clone(&grown));
@@ -1265,20 +1300,53 @@ mod tests {
 
     #[test]
     fn each_band_is_coarser_than_the_one_before_it() {
-        assert_eq!(BANDS.len(), 3);
+        assert_eq!(BANDS.len(), 4);
+        assert_eq!(BANDS[0], Band::Near);
         assert_eq!(Band::Near.detail(), DETAIL);
-        assert_eq!(Band::Mid.detail() * 2, Band::Near.detail());
-        assert_eq!(Band::Far.detail() * 4, Band::Near.detail());
-        // Ground cover is the near band's alone; strands ride one band further,
-        // since they are already meshed.
-        assert!(!Band::Mid.undergrowth(), "the mid band drops plants and tufts");
-        assert!(Band::Mid.strands(), "the mid band keeps the strands it is handed");
+        assert_eq!(Band::Far.detail(), 1, "the last band is one voxel a tile");
+        let details: Vec<i32> = BANDS.iter().map(|b| b.detail()).collect();
+        assert!(details.windows(2).all(|w| w[0] > w[1]), "{details:?} is not coarsening");
+        // One step at a time: a hand-off that doubles the voxel is the jump the
+        // bands exist to avoid.
+        assert!(
+            details.windows(2).all(|w| w[0] - w[1] == 1),
+            "{details:?} skips a resolution"
+        );
+        // Ground cover is the near band's alone; strands ride to the last
+        // cutout band, since they are already meshed.
+        for band in [Band::Close, Band::Mid] {
+            assert!(!band.undergrowth(), "{band:?} kept plants and tufts");
+            assert!(band.strands(), "{band:?} dropped the strands it is handed");
+        }
+        assert!(Band::Near.undergrowth());
         assert!(!Band::Far.strands());
+    }
+
+    /// The wood, not the leaves, is what a coarse cut gets wrong: a limb
+    /// thinner than a cell is drawn a cell wide, so bark grows with the cell
+    /// unless the band asks for the near band's limbs.
+    #[test]
+    fn every_band_shows_the_near_band_s_wood() {
+        for band in BANDS {
+            assert_eq!(band.cut().wood_like, DETAIL as u32, "{band:?} fattens its twigs");
+            assert_eq!(cut_at(band.detail()), band.cut());
+        }
+        // A resolution no band draws is nobody's stand-in, so it is itself.
+        assert_eq!(cut_at(7), trees::Cut::fine(7));
+
+        // What that is worth: the coarse cut keeps a fraction of the twigs the
+        // fine one has, in proportion to how much wider it would draw them.
+        let skeleton = trees::grow(&trees::oak(), 11, None);
+        let bark = |band: Band| {
+            trees::rasterise_cut(&skeleton, band.detail() as u32, band.cut()).counts().bark
+        };
+        let plain = trees::rasterise(&skeleton, FAR_DETAIL as u32).counts().bark;
+        assert!(bark(Band::Far) * 3 < plain * 2, "{} against {plain} uncorrected", bark(Band::Far));
     }
 
     #[test]
     fn only_the_last_voxel_band_wears_no_cutout() {
-        for band in [Band::Near, Band::Mid] {
+        for band in [Band::Near, Band::Close, Band::Mid] {
             assert_eq!(
                 band.coats().iter().filter(|c| c.masked()).count(),
                 3,
@@ -1304,9 +1372,11 @@ mod tests {
     #[test]
     fn the_bands_hand_over_in_order() {
         // Each band ends where its own leaf voxel falls to two pixels, so a
-        // coarser cut reaches further: near, then half, then quarter.
+        // coarser cut reaches further: near, then a third further, then twice,
+        // then four times.
         let near = near_band(std::f32::consts::FRAC_PI_4, 720.0);
         assert!((Band::Near.edge(near) - near).abs() < 1e-3);
+        assert!((Band::Close.edge(near) - near * 4.0 / 3.0).abs() < 1e-3);
         assert!((Band::Mid.edge(near) - near * 2.0).abs() < 1e-3);
         assert!((Band::Far.edge(near) - near * 4.0).abs() < 1e-3);
         let edges: Vec<f32> = BANDS.iter().map(|b| b.edge(near)).collect();
@@ -1317,9 +1387,11 @@ mod tests {
     fn a_coarser_cut_holds_a_fraction_of_the_voxels() {
         let skeleton = trees::grow(&trees::oak(), 11, None);
         let near = trees::rasterise(&skeleton, DETAIL as u32).counts();
+        let close = trees::rasterise(&skeleton, CLOSE_DETAIL as u32).counts();
         let mid = trees::rasterise(&skeleton, MID_DETAIL as u32).counts();
         let far = trees::rasterise(&skeleton, FAR_DETAIL as u32).counts();
         assert!(far.leaf > 0, "the coarse cut lost the crown");
+        assert!(close.leaf < near.leaf, "near {} close {}", near.leaf, close.leaf);
         assert!(mid.leaf * 2 < near.leaf, "near {} mid {}", near.leaf, mid.leaf);
         assert!(far.leaf * 8 < near.leaf, "near {} far {}", near.leaf, far.leaf);
     }

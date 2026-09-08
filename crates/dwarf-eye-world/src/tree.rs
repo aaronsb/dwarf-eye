@@ -544,11 +544,15 @@ pub fn skeleton(
     grown
 }
 
-/// Cuts a grown tree into voxels at a band's own resolution.
-pub fn rasterise(skeleton: &trees::Skeleton, detail: i32) -> trees::VoxelTree {
+/// Cuts a grown tree into voxels at a band's own resolution and fill.
+///
+/// `cut` is the band's compensation, not the species': a coarse cut fattens
+/// every twig and closes up the foliage, so the band asks for less of both and
+/// its crown reads like the near band's (`canopy::Band::cut`).
+pub fn rasterise(skeleton: &trees::Skeleton, detail: i32, cut: trees::Cut) -> trees::VoxelTree {
     use crate::canopy::timing::PHASES;
     let started = std::time::Instant::now();
-    let voxels = trees::rasterise(skeleton, detail.max(1) as u32);
+    let voxels = trees::rasterise_cut(skeleton, detail.max(1) as u32, cut);
     PHASES.rasterise.since(started);
     voxels
 }

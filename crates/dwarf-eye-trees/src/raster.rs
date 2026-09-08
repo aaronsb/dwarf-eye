@@ -22,6 +22,10 @@ const SHADE_PATCH: i32 = 2;
 /// leaf is ever kept further out than this multiple of its cluster's radius.
 const WOBBLE_MAX: f32 = 0.72 + 0.55;
 
+/// The thinnest a limb can be drawn, in voxels: past the trunk a limb is a
+/// thread, and a thread still has to fill the cell it is in.
+const THREAD: f32 = 0.5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Bark,
@@ -178,12 +182,48 @@ fn extent(skeleton: &Skeleton, scale: f32) -> Option<(IVec3, IVec3)> {
     ))
 }
 
+/// What a cut owes a finer one, so the two read alike.
+///
+/// A voxel cannot be thinner than itself: a limb narrower than the cut's own
+/// cell is still drawn a whole cell wide. That is what makes a coarse crown
+/// darker and denser than the fine crown it stands in for — the wood in it
+/// grows with the cell — and it is what a detail hand-off shows as a jump.
+/// Foliage needs no such correction: a crown is cells deep, so whatever hole a
+/// thinner fill opens the layer behind it closes, and thinning the leaves moves
+/// a crown's mean colour by under a percent. Measured in the tree lab;
+/// `docs/architecture/lod/README.md` carries the figures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    /// The resolution whose wood this cut should show, in voxels per tile.
+    ///
+    /// A limb thinner than a voxel is kept only as often as its true width
+    /// asks for, measured against what a cut at this resolution would draw, so
+    /// the bark showing through a crown stays where the finer cut put it. Equal
+    /// to the cut's own resolution, nothing is dropped and the cut is exactly
+    /// what it always was.
+    pub wood_like: u32,
+}
+
+impl Cut {
+    /// The cut that changes nothing: every limb the skeleton has, at this
+    /// resolution.
+    pub fn fine(voxels_per_tile: u32) -> Self {
+        Cut { wood_like: voxels_per_tile }
+    }
+}
+
 /// Voxelise a skeleton at `voxels_per_tile` resolution.
 ///
 /// Wood is drawn first and foliage never overwrites it, so limbs stay readable
 /// through the canopy.
 pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
+    rasterise_cut(skeleton, voxels_per_tile, Cut::fine(voxels_per_tile))
+}
+
+/// [`rasterise`], compensated for how coarse the cut is (see [`Cut`]).
+pub fn rasterise_cut(skeleton: &Skeleton, voxels_per_tile: u32, cut: Cut) -> VoxelTree {
     let scale = voxels_per_tile.max(1) as f32;
+    let reference = cut.wood_like.max(1) as f32;
     let palette = &skeleton.params.palette;
     let Some((lo, hi)) = extent(skeleton, scale) else {
         return VoxelTree {
@@ -195,6 +235,22 @@ pub fn rasterise(skeleton: &Skeleton, voxels_per_tile: u32) -> VoxelTree {
     let mut grid = Grid::new(lo, hi);
 
     for segment in &skeleton.segments {
+        // How much wider than the truth this cut draws the limb, over how much
+        // wider the reference cut draws it: one where the cut is the reference
+        // or the limb is thicker than a cell either way, and below one where a
+        // coarse cell has fattened a twig the reference kept thin. Keeping the
+        // twig that often leaves the same bark showing through the crown. The
+        // draw is on the limb's place in the world, not on the cut, so a twig
+        // one cut drops is dropped by every coarser one as well.
+        if segment.depth > 0 && scale < reference {
+            let widest = segment.radius_a.max(segment.radius_b);
+            let fine = (widest * reference / THREAD).min(1.0);
+            let keep = if fine > 0.0 { (widest * scale / THREAD).min(1.0) / fine } else { 1.0 };
+            let at = segment.a * 64.0;
+            if keep < 1.0 && hash_unit(at.x as i32, at.y as i32, at.z as i32, 0x7BC1) > keep {
+                continue;
+            }
+        }
         let a = segment.a * scale;
         let b = segment.b * scale;
         let span = (b - a).length();
