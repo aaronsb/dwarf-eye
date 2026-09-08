@@ -1,12 +1,5 @@
 # Everyday entry points. All builds are release: Bevy is unusable in debug.
-#
-#   make run                 the viewer against the running game
-#   make run CLOUDS=cumulus=0.6 VIEW=0,-30   with a forced sky and camera aim
-#   make lab                 the tree generator bench (no game needed)
-#   make shot                a screenshot of the viewer, saved to shots/
-#   make budget              where the triangles go over the live window
-#   make test                unit tests (no game needed)
-#   make check               format check, clippy, tests
+# `make` alone prints the targets.
 
 CARGO ?= cargo
 BIN    = target/release/dwarf-eye
@@ -26,7 +19,31 @@ env = $(if $(CLOUDS),DWARF_EYE_CLOUDS=$(CLOUDS)) \
       $(if $(TEXELS),DWARF_EYE_TEXELS=$(TEXELS)) \
       RUST_LOG=warn,dwarf_eye=info
 
-.PHONY: all build run lab shot lab-shot budget horizon test check fmt clippy clean clean-cache
+.PHONY: help all build run lab shot lab-shot budget horizon test check fmt clippy clean clean-cache
+
+help:
+	@echo "dwarf-eye"
+	@echo
+	@echo "  make build        build every crate (release)"
+	@echo "  make run          the viewer, against the running game"
+	@echo "  make lab          the tree generator bench (no game needed)"
+	@echo "  make shot         screenshot of the viewer into shots/ after DELAY seconds"
+	@echo "  make lab-shot     screenshot of the bench into shots/"
+	@echo "  make budget       where the triangles go over the live window"
+	@echo "  make horizon      what DFHack reports beyond the live window"
+	@echo "  make test         unit tests (no game needed)"
+	@echo "  make check        format check, clippy, tests"
+	@echo "  make clean        remove build output"
+	@echo "  make clean-cache  remove the on-disk chunk cache for every world"
+	@echo
+	@echo "Knobs, passed through to the app:"
+	@echo "  CLOUDS=cumulus=0.6,cirrus=0.3   force a sky"
+	@echo "  VIEW=yaw,pitch                  aim the camera, degrees"
+	@echo "  CAM=2                           how far back the camera starts"
+	@echo "  TEXELS=32                       texture density per tile"
+	@echo "  DELAY=14                        seconds before a shot"
+	@echo
+	@echo "  e.g.  make run CLOUDS=cumulus=0.6 VIEW=0,-30"
 
 all: build
 
