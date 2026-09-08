@@ -41,6 +41,24 @@ function needs. Agents given a task receive the same rule and the page path.
 - The chunk cache under `~/.cache/dwarf-eye/` is shared with the user's
   instance. Bump a format version instead of deleting files.
 
+## Testing and validation
+
+Four layers, described in `docs/architecture/testing/`:
+
+- unit tests per crate (`make test`, no game): pure functions such as clock
+  arithmetic, ramp corner heights, walk classification and heading, tree
+  rasterisation pinned by voxel counts and checksums;
+- probes: the examples under `crates/dwarf-eye-world/examples/` (`sky`,
+  `budget`, `coverage`, `luaq`, `settime`, `slice`) read or poke the live game
+  without the GPU;
+- live integration tests gated by `DWARF_EYE_LIVE=1` (`make walk-test`), which
+  move the adventurer and are never part of `make test`;
+- visual verification: a before and after screenshot at the same framing via
+  `DWARF_EYE_SHOT`, and the tree lab for lighting and vegetation without a game.
+
+A change to a component names which layers it touched. New pure logic gets a
+unit test; a look change gets a screenshot pair in the report.
+
 ## Facts not recoverable from the code
 
 - DFHack refuses replies over 64 MiB and also answers CR_LINK_FAILURE when no
