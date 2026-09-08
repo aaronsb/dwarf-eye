@@ -105,6 +105,16 @@ Only 20 of 72 tree species ship their own sheet; the rest fall back to the
 generic `TILE_GRAPHICS` table, which spells absent connections in lowercase
 (`TREE_TRUNK_S_nwe` is the same tile as `TREE_TRUNK_S`).
 
+DFHack's tiletype names and the raws' family names drifted apart, so
+`library.rs` carries an alias table: DFHack says `TreeBranches`, the raws say
+`TREE_BRANCH`; roots resolve to the environment sheet's `ROOT_WALL`. Families
+such as `ROOT_WALL` ship only directional variants, so a lookup that matches
+neither the tile's connections nor an undirected entry falls through to the
+closest variant by direction bits.
+
+`cargo run --release -p dwarf-eye-world --example coverage` reports which tiles
+in view get a sprite and which fall back to plain blocks.
+
 ### Colour
 
 DF's `state_color` describes a material as a substance, not as terrain: loam is

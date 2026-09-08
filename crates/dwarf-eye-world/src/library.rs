@@ -33,11 +33,28 @@ struct TileInfo {
 /// sitting on top of one, so nothing has to be inferred from neighbours.
 fn mode_for(shape: TiletypeShape, name: &str) -> Option<RenderMode> {
     use TiletypeShape as S;
+    let tree = name.starts_with("Tree");
     match shape {
-        S::Wall if name.starts_with("Tree") => Some(RenderMode::Extrude),
+        // A sloping trunk is still a trunk, and roots are trunks underground.
+        S::Wall | S::Ramp if tree => Some(RenderMode::Extrude),
         S::Branch | S::Twig => Some(RenderMode::ThinExtrude),
         S::Sapling | S::Shrub | S::Boulder => Some(RenderMode::Billboard),
+        // Canopy floors are the walkable surface of a treetop.
+        S::Floor if tree => Some(RenderMode::FlatTile),
         _ => None,
+    }
+}
+
+/// Reconciles DFHack's tiletype names with the graphics raws' family names.
+///
+/// The two vocabularies drifted: DFHack says `TreeBranches`, the raws say
+/// `TREE_BRANCH`; roots live under the environment sheet's `ROOT_WALL`.
+fn alias(family: &str) -> &str {
+    match family {
+        "TREE_BRANCHES" | "TREE_BRANCHES_SMOOTH" => "TREE_BRANCH",
+        "TREE_ROOTS" => "ROOT_WALL",
+        "TREE_TRUNK_SLOPING" => "TREE_TRUNK_SLOPE",
+        other => other,
     }
 }
 
@@ -72,7 +89,7 @@ impl TileLibrary {
                     _ => "BOULDER".to_string(),
                 }
             } else {
-                raws::family_from_tiletype(name)
+                alias(&raws::family_from_tiletype(name)).to_string()
             };
             tiles.insert(
                 t.id,

@@ -91,11 +91,16 @@ pub fn parse_part(part: &str) -> TileKey {
 /// not always match the raws'.
 pub fn family_from_tiletype(name: &str) -> String {
     let mut tokens: Vec<String> = Vec::new();
+    let mut previous_digit = false;
     for c in name.chars() {
-        if c.is_uppercase() || tokens.is_empty() {
+        // The raws separate trailing variant numbers, so `TreeCapFloor1` has to
+        // become `TREE_CAP_FLOOR_1` rather than `TREE_CAP_FLOOR1`.
+        let digit = c.is_ascii_digit();
+        if tokens.is_empty() || c.is_uppercase() || (digit && !previous_digit) {
             tokens.push(String::new());
         }
         tokens.last_mut().unwrap().push(c.to_ascii_uppercase());
+        previous_digit = digit;
     }
     while tokens.len() > 1
         && tokens.last().is_some_and(|t| t.len() == 1 && is_direction_group(t))
@@ -118,6 +123,22 @@ pub fn direction_mask(direction: &str) -> u8 {
         };
     }
     bits
+}
+
+/// The variant of `family` whose connection set is closest to `dirs`.
+///
+/// Ties break on the lowest direction mask, so a given tile always resolves to
+/// the same sprite across runs.
+fn nearest(
+    table: &HashMap<TileKey, SpriteRef>,
+    family: &str,
+    dirs: u8,
+) -> Option<SpriteRef> {
+    table
+        .iter()
+        .filter(|(k, _)| k.family == family)
+        .min_by_key(|(k, _)| ((k.dirs ^ dirs).count_ones(), k.dirs))
+        .map(|(_, v)| *v)
 }
 
 /// Every `[TAG:a:b:c]` token on a line, as its colon-separated fields.
@@ -156,10 +177,14 @@ impl GraphicsIndex {
                 return Some(*found);
             }
         }
-        self.generic
-            .get(&exact)
-            .or_else(|| self.generic.get(&plain))
-            .copied()
+        if let Some(found) = self.generic.get(&exact).or_else(|| self.generic.get(&plain)) {
+            return Some(*found);
+        }
+
+        // Some families, such as `ROOT_WALL`, only ship directional variants.
+        // Take the closest one rather than dropping the tile to a plain block.
+        nearest(&self.generic, family, dirs)
+            .or_else(|| self.plants.get(plant_id).and_then(|t| nearest(t, family, dirs)))
     }
 
     /// A species-independent tile such as `SHRUB` or `SAPLING`.
