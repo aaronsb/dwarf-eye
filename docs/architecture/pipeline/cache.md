@@ -23,11 +23,25 @@ at which that column turned to unrevealed rock, versioned by its first line
 `def1` (`cache.rs:load_floors`, `cache.rs:store_floors`).
 
 Column floors are the fetch depth. `Session::fetch` descends in slabs and
-`Session::open_box` narrows the request box to the columns still open;
-`Session::read_floors` records the highest wholly hidden block per column and
-removes a floor when that level comes back visible. `UNDER_FLOOR` is 1, so the
-block below a floor is still fetched and the floor block has a neighbour to cull
-against.
+`Session::open_box` narrows the request box to the columns still open. The
+bookkeeping lives in `session.rs:Floors`, one stop and one deepest-seen level
+per column, with these rules:
+
+- Close: a column with no floor closes at the highest wholly hidden level
+  strictly below the deepest level it has ever seen. A standing floor never
+  moves on its own.
+- Overhang: a hidden block over ground already seen is not a floor.
+- Reopen: ground seen at or under the floor drops it, and the same descent
+  chases that column down until rock resumes.
+- Retract: the deepest block seen coming back wholly hidden erases that memory,
+  so the column closes where it was.
+- Probe: every 30 s (`PROBE_EVERY`) an unforced pass asks under every floor to
+  the bottom of the window. Hidden blocks are weighed and dropped, never cached
+  or meshed. When nothing changed the probe returns zero blocks.
+- Lateral: a sighting deeper than a four-neighbour's floor probes that neighbour
+  to the same level in the same pass.
+- The character's own block column and its eight neighbours drop their floors
+  when the character's z reaches them. Forced and first passes take no probe.
 
 ## Invariants and gotchas
 
@@ -39,17 +53,18 @@ against.
 - The floor test on restore reads the chunk's own tiles, not the sidecar, so a
   stale `floors` file cannot delete land somebody has seen.
 - A `floors` file from another version reads as nothing known, not as an error.
-- Floors are dropped only within one block of the character and only when the
-  character is at or below the floor (`Session::fetch`). A forced pass re-reads
-  floors rather than discarding them.
-- Ground revealed under a floor block that itself stays hidden is never asked
-  for again. A tunnel from a neighbour or a cavern opened by an event is
-  invisible until the character descends. That is issue #23.
+- DFHack gates tiles and designations by separate hashes, so a block can arrive
+  with tiles and no `hidden` array. `session.rs:seen_into` treats a missing
+  array as unknown; reading it as revealed reopened columns over untouched rock.
+- Ground revealed without being cut arrives with seen bits and no tiles. Those
+  blocks are re-asked forced, one small request per level.
+- The change hashes belong to the plugin, not the connection: a second viewer on
+  the same game consumes changes the first would have been sent.
 - The cache is shared with the user's own running instance. Bump `MAGIC` or
   `FLOORS_VERSION` rather than deleting files; `make clean-cache` is the
   deliberate reset.
 
 ## Related issues
 
-#23 (periodic full-depth re-probe and lateral propagation), #22 (closed, skip
+#23 (closed, periodic probe and lateral chase), #22 (closed, skip
 blocks below the revealed surface), #17 (closed, restore-and-mesh cost).
