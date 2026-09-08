@@ -19,6 +19,7 @@ struct CloudShadow {
     enabled: f32,
     horizon: f32,
     mask_origin: vec2<f32>,
+    canopy: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> cloud: CloudShadow;

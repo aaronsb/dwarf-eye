@@ -27,6 +27,8 @@ struct CloudShadow {
     horizon: f32,
     // Block coordinate of the mask's first texel.
     mask_origin: vec2<f32>,
+    // How much of the sky's indirect light foliage keeps, 0 on the ground.
+    canopy: f32,
 }
 
 // Bevy substitutes the material group index; it is 3 in this version, and
@@ -62,6 +64,15 @@ fn transmittance(world: vec3<f32>) -> f32 {
     return 1.0 - cloud.strength * (1.0 - t);
 }
 
+// How much of the sky one canopy face sees, from the face's own normal rather
+// than the one flipped toward the camera: a leaf looking up is open to the
+// whole sky, one looking sideways to half of it, and one looking down to the
+// ground under the tree.
+fn sky_reach(normal: vec3<f32>) -> f32 {
+    let up = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+    return mix(0.1, 1.0, up * up);
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     if masked(in.world_position.xyz) {
@@ -70,6 +81,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);
+
+    // Occlusion only touches the indirect terms, so this dims the sky's fill
+    // on a crown without touching the sun: the shaded side of a tree goes dark
+    // because nothing but the sky was ever lighting it.
+    if cloud.canopy > 0.0 {
+        let reach = cloud.canopy * sky_reach(in.world_normal);
+        pbr_input.diffuse_occlusion *= vec3(reach);
+        pbr_input.specular_occlusion *= reach;
+    }
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);

@@ -11,7 +11,7 @@
 //! loaded block, and horizon fragments over a marked block are discarded, in
 //! the main pass and the depth prepass alike.
 
-use bevy::asset::embedded_asset;
+use bevy::asset::{AssetPath, embedded_asset, embedded_path};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
@@ -19,7 +19,16 @@ use bevy::shader::ShaderRef;
 
 /// Embedded, so the binary carries its own shader instead of hunting for a file
 /// next to wherever it happens to be run from.
-const SHADER: &str = "embedded://dwarf_eye/cloud_shadow.wgsl";
+///
+/// `embedded_path!` keys the shader on the binary that embedded it and on this
+/// file's path inside it, which is not the same in the viewer as in a bench
+/// that includes this module from `bin/`. Asking for it the same way it was
+/// registered keeps both binaries finding it.
+macro_rules! embedded_shader {
+    ($name: expr) => {
+        ShaderRef::Path(AssetPath::from_path_buf(embedded_path!($name)).with_source("embedded"))
+    };
+}
 
 /// Terrain shading, plus a cloud shadow lookup.
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, CloudShadow>;
@@ -43,6 +52,12 @@ pub struct ShadowUniform {
     pub horizon: f32,
     /// Block coordinate of the mask's first texel.
     pub mask_origin: Vec2,
+    /// How much of the sky's indirect light foliage keeps, 0 on the ground.
+    ///
+    /// The sky fills from every direction, which leaves a crown lit all round
+    /// and with no shaded side. Foliage scales that fill down and weights it
+    /// toward the sky, so the sun is what decides which side of a tree is lit.
+    pub canopy: f32,
 }
 
 /// Bindings start at 100; the base `StandardMaterial` owns everything below.
@@ -63,6 +78,32 @@ pub struct CloudShadow {
 /// Blocks covered by the mask on each side.
 pub const MASK_BLOCKS: u32 = 512;
 
+/// How much of the sky's fill a crown keeps, weighted toward the faces that
+/// look up. The sky lights every side of a tree alike, so at full strength a
+/// crown has no shaded side at all and the sun stops reading as the light.
+/// `DWARF_EYE_CANOPY_SKY` overrides, for finding the right level.
+///
+/// The floor is above zero because zero would switch the term off rather than
+/// black the shade out.
+pub fn canopy_sky() -> f32 {
+    std::env::var("DWARF_EYE_CANOPY_SKY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.45f32)
+        .clamp(0.005, 2.0)
+}
+
+/// How much light a leaf passes from behind: enough to glow against a low sun,
+/// little enough that the sky no longer lights the whole crown through it.
+/// `DWARF_EYE_LEAF_LIGHT` overrides.
+pub fn leaf_transmission() -> f32 {
+    std::env::var("DWARF_EYE_LEAF_LIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.1f32)
+        .clamp(0.0, 1.0)
+}
+
 /// Registers the material and embeds its shader.
 pub struct CloudShadowPlugin;
 
@@ -76,12 +117,12 @@ impl Plugin for CloudShadowPlugin {
 
 impl MaterialExtension for CloudShadow {
     fn fragment_shader() -> ShaderRef {
-        SHADER.into()
+        embedded_shader!("cloud_shadow.wgsl")
     }
 
     /// The prepass writes depth before the main pass runs, so the horizon has
     /// to yield there too or its depth would hide the fine ground behind it.
     fn prepass_fragment_shader() -> ShaderRef {
-        "embedded://dwarf_eye/cloud_shadow_prepass.wgsl".into()
+        embedded_shader!("cloud_shadow_prepass.wgsl")
     }
 }

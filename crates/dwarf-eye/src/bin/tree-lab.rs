@@ -5,11 +5,18 @@
 //! forces one preset on every slot and Tab cycles through the rest, `[` and `]`
 //! change the voxel resolution, `-` and `=` halve and double the texel density,
 //! F12 saves a screenshot. `DWARF_EYE_SHOT=path[:seconds]` saves one after a
-//! delay and exits; `DWARF_EYE_TEXELS` sets the starting texel density and
-//! `TREE_LAB_CAM=x,y,z,yaw,pitch` the camera.
+//! delay and exits; `DWARF_EYE_TEXELS` sets the starting texel density,
+//! `TREE_LAB_CAM=x,y,z,yaw,pitch` the camera and
+//! `TREE_LAB_SUN=azimuth,elevation` (degrees) where the sun stands.
 
 #[path = "../camera.rs"]
 mod camera;
+// The canopy material itself, so the lab shades leaves exactly as the viewer
+// does: same extension, same sky-fill occlusion, same knobs.
+// The lab binds the whole material but reads none of the map's own knobs.
+#[allow(dead_code)]
+#[path = "../shadow.rs"]
+mod shadow;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::Exposure;
@@ -26,6 +33,9 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use camera::FlyCamera;
+use shadow::{
+    CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
+};
 use dwarf_eye_trees::texture::{self, Texels};
 use dwarf_eye_trees::{Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise};
 
@@ -42,6 +52,7 @@ fn main() {
             primary_window: Some(Window { title: "tree-lab".into(), ..default() }),
             ..default()
         }))
+        .add_plugins(shadow::CloudShadowPlugin)
         .init_resource::<Lab>()
         .init_resource::<TexelDensity>()
         .init_resource::<Report>()
@@ -72,6 +83,24 @@ impl Default for Lab {
             std::env::var("TREE_LAB_VPT").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         Self { forced, seed, voxels_per_tile, dirty: true }
     }
+}
+
+/// Where the sun stands, from `TREE_LAB_SUN=azimuth,elevation` in degrees:
+/// azimuth 0 puts it behind the camera, 90 to its right, 180 beyond the trees.
+/// The viewer takes its sun from the game clock, so this is the only place a
+/// low sun can be aimed at a crown on purpose.
+fn sun_direction() -> Vec3 {
+    let Some(spec) = std::env::var("TREE_LAB_SUN").ok() else {
+        return Vec3::new(55.0, 62.0, 85.0).normalize();
+    };
+    let n: Vec<f32> = spec.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect();
+    if n.len() != 2 {
+        return Vec3::new(55.0, 62.0, 85.0).normalize();
+    }
+    let (azimuth, elevation) = (n[0].to_radians(), n[1].to_radians());
+    // The camera looks up -Z, so azimuth turns from +Z, the way it faces.
+    Vec3::new(azimuth.sin() * elevation.cos(), elevation.sin(), azimuth.cos() * elevation.cos())
+        .normalize()
 }
 
 /// `TREE_LAB_CAM=x,y,z,yaw_deg,pitch_deg` places the camera for an unattended
@@ -110,10 +139,10 @@ struct Report(String);
 /// species trait.
 #[derive(Resource)]
 struct Materials {
-    bark: Handle<StandardMaterial>,
-    leaves: HashMap<Preset, Handle<StandardMaterial>>,
+    bark: Handle<TerrainMat>,
+    leaves: HashMap<Preset, Handle<TerrainMat>>,
     /// Weeping strands, on their own leaflet strip.
-    streamers: Handle<StandardMaterial>,
+    streamers: Handle<TerrainMat>,
 }
 
 #[derive(Component)]
@@ -126,6 +155,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut canopy: ResMut<Assets<TerrainMat>>,
     mut images: ResMut<Assets<Image>>,
     mut mediums: ResMut<Assets<ScatteringMedium>>,
     texels: Res<TexelDensity>,
@@ -163,7 +193,7 @@ fn setup(
             ..default()
         },
         SunDisk::EARTH,
-        Transform::from_xyz(55.0, 62.0, 85.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(sun_direction() * 4000.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     commands.spawn((
@@ -180,6 +210,20 @@ fn setup(
     let bark_texture = images.add(pixels(texture::bark(tex)));
     let streamer_texture = images.add(pixels(texture::streamer_strip(tex)));
 
+    // The cloud shadow lookup is switched off here: the lab has no weather.
+    // What the extension is carried for is its canopy term, which is what
+    // gives a crown a shaded side.
+    let flat = images.add(one_texel(255));
+    let unmasked = images.add(one_texel(0));
+    let canopy_material = |base: StandardMaterial| TerrainMat {
+        base,
+        extension: CloudShadow {
+            uniform: ShadowUniform { canopy: canopy_sky(), ..default() },
+            map: flat.clone(),
+            mask: unmasked.clone(),
+        },
+    };
+
     let foliage = |texture: Handle<Image>| StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(texture),
@@ -187,11 +231,12 @@ fn setup(
         alpha_mode: AlphaMode::Mask(0.5),
         double_sided: true,
         cull_mode: None,
-        perceptual_roughness: 0.95,
+        perceptual_roughness: 0.97,
         reflectance: 0.02,
-        // Leaves pass light, which is what keeps a canopy from going black.
-        diffuse_transmission: 0.5,
-        thickness: 0.2,
+        // Leaves pass a little light, enough to glow when the sun is behind
+        // them. More than that and the sky lights every side of the crown.
+        diffuse_transmission: leaf_transmission(),
+        thickness: 0.12,
         ..default()
     };
 
@@ -200,18 +245,18 @@ fn setup(
         let params = TreeParams::preset(preset);
         let needle = params.habit == Habit::Conifer;
         let cutout = images.add(pixels(texture::leaf_cutout(needle, params.cutout_openness, tex)));
-        leaves.insert(preset, materials.add(foliage(cutout)));
+        leaves.insert(preset, canopy.add(canopy_material(foliage(cutout))));
     }
 
     commands.insert_resource(Materials {
-        streamers: materials.add(foliage(streamer_texture)),
-        bark: materials.add(StandardMaterial {
+        streamers: canopy.add(canopy_material(foliage(streamer_texture))),
+        bark: canopy.add(canopy_material(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: Some(bark_texture),
             perceptual_roughness: 0.95,
             reflectance: 0.02,
             ..default()
-        }),
+        })),
         leaves,
     });
 
@@ -351,7 +396,7 @@ fn retexture(
     mut texels: ResMut<TexelDensity>,
     materials: Res<Materials>,
     mut images: ResMut<Assets<Image>>,
-    mut standard: ResMut<Assets<StandardMaterial>>,
+    mut standard: ResMut<Assets<TerrainMat>>,
 ) {
     if !texels.dirty {
         return;
@@ -361,18 +406,18 @@ fn retexture(
 
     let bark = images.add(pixels(texture::bark(tex)));
     if let Some(mut material) = standard.get_mut(&materials.bark) {
-        material.base_color_texture = Some(bark);
+        material.base.base_color_texture = Some(bark);
     }
     let strip = images.add(pixels(texture::streamer_strip(tex)));
     if let Some(mut material) = standard.get_mut(&materials.streamers) {
-        material.base_color_texture = Some(strip);
+        material.base.base_color_texture = Some(strip);
     }
     for preset in Preset::ALL {
         let params = TreeParams::preset(preset);
         let needle = params.habit == Habit::Conifer;
         let leaf = images.add(pixels(texture::leaf_cutout(needle, params.cutout_openness, tex)));
         if let Some(mut material) = standard.get_mut(&materials.leaves[&preset]) {
-            material.base_color_texture = Some(leaf);
+            material.base.base_color_texture = Some(leaf);
         }
     }
     info!("texel density now {tex} per tile");
@@ -433,6 +478,18 @@ fn screenshot(
     if *elapsed > delay + 1.5 {
         exit.write(AppExit::Success);
     }
+}
+
+/// A one-texel red image, for the bindings the canopy material always carries
+/// but the lab never reads: there is no weather here and no coarse horizon.
+fn one_texel(value: u8) -> Image {
+    Image::new(
+        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        vec![value],
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 fn pixels(texels: Texels) -> Image {
