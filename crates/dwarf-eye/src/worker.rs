@@ -76,7 +76,9 @@ impl Bridge {
 }
 
 fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
+    let started = std::time::Instant::now();
     let mut df = Session::connect_local()?;
+    bevy::log::info!("startup: connected and raws fetched in {:.1}s", started.elapsed().as_secs_f32());
     // The window we last asked for. DFHack answers with only the blocks it
     // thinks changed, so any chunk we prune has to be re-requested outright or
     // it never comes back.
@@ -121,12 +123,15 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
         ),
     })?;
 
+    bevy::log::info!("startup: sprite library ready at {:.1}s", started.elapsed().as_secs_f32());
+
     // Land from earlier sessions comes back before the first fetch.
     let restored = df.restore_cache();
     bevy::log::info!(
-        "{} chunks restored from {}",
+        "{} chunks restored from {} (at {:.1}s)",
         restored.len(),
-        df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        started.elapsed().as_secs_f32()
     );
     if !restored.is_empty() {
         events.send(Event::Coverage(grounded_blocks(&df.world)))?;
@@ -143,6 +148,9 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
             events,
         )?;
     }
+
+    bevy::log::info!("startup: restored chunks meshed at {:.1}s", started.elapsed().as_secs_f32());
+    let mut first_pass = true;
 
     let mut horizon_sent = false;
     loop {
@@ -178,6 +186,7 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                 }
             }
             Command::Fetch { center, opts, force } => {
+                let pass_started = std::time::Instant::now();
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
                 if let Err(err) = collect(
@@ -185,6 +194,14 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
                     library.as_mut(), &mut forest, events,
                 ) {
                     events.send(Event::Status(format!("waiting for the map: {err:#}")))?;
+                }
+                if first_pass {
+                    first_pass = false;
+                    bevy::log::info!(
+                        "startup: first window pass took {:.1}s, done at {:.1}s",
+                        pass_started.elapsed().as_secs_f32(),
+                        started.elapsed().as_secs_f32()
+                    );
                 }
             }
         }
