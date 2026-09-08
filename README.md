@@ -168,6 +168,43 @@ Stars are one mesh of emissive quads on a sphere, spun by the clock and faded by
 the sun's elevation. They sit at 620 units because the camera's default far
 plane is 1000; past that they are simply clipped away.
 
+### Clouds
+
+DF reports a cloud *kind* per world tile rather than a coverage number —
+cumulus, stratus, cirrus and fog — and those kinds differ mostly in how they
+occupy height. That maps onto a 3D density texture built from value noise and
+shaped per layer, in the proportions a real sky gives them: stratus is a
+near-total sheet an eighth as deep as it is broad, cumulus fills a third of the
+column but only patches of the ground plane, cirrus is thin and stretched.
+
+A `FogVolume` raymarches that texture, so the clouds are volume rather than a
+picture on the sky. Two details cost time:
+
+- **The deck cannot follow the camera vertically.** Doing so puts the viewer
+  inside the volume, and everything fogs to grey. Its altitude is pinned to the
+  terrain.
+- **Cloud undersides need a lot of ambient.** Inside a cloud the shadow map
+  reports full occlusion, so the volumetric ambient is the only light there is.
+  At the physical default they render black.
+
+Bevy's volumetric fog lights fog and never shadows scene geometry, so the
+clouds would float over a fully lit landscape. `cloud_shadow.wgsl` is a
+`MaterialExtension` on the terrain that marches the same density volume from
+each fragment toward the sun and dims the surface by what it passes through.
+Two things about it are worth knowing:
+
+- Material bindings live in bind group **3** in this version of Bevy, not 2 —
+  group 2 is the mesh. Hardcoding 2 leaves the bindings out of the pipeline
+  layout, and the shader fails validation with no other clue.
+- The 3D density texture must always be bound. Leaving it `None` drops its
+  binding from the layout with the same failure.
+- The march wraps horizontally rather than clipping at the deck's bounds.
+  Clipping puts a straight box edge across the ground where the sun ray leaves
+  the volume.
+
+`DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4` forces a sky for testing;
+`DWARF_EYE_CLOUD_DENSITY` tunes how solid it reads.
+
 ### Driving the world for testing
 
 DFHack's `RunCommand` is method id 1 and needs no binding, which makes the whole

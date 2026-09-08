@@ -5,6 +5,7 @@
 
 mod camera;
 mod clouds;
+mod shadow;
 mod sky;
 mod stars;
 mod worker;
@@ -18,13 +19,14 @@ use bevy::prelude::*;
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::light::{
-    Atmosphere, AtmosphereEnvironmentMapLight, FogVolume, SunDisk, VolumetricFog,
-    VolumetricLight, atmosphere::ScatteringMedium, light_consts::lux,
+    Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, VolumetricFog, VolumetricLight,
+    atmosphere::ScatteringMedium, light_consts::lux,
 };
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
 use clouds::Weather;
+use shadow::{CloudShadow, CloudUniform, TerrainMaterial as TerrainMat};
 use sky::Clock;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
@@ -51,6 +53,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(shadow::CloudShadowPlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<ChunkEntities>()
@@ -71,8 +74,8 @@ fn main() {
                 sky::drive_sun,
                 stars::drive,
                 clouds::drive,
+                sync_cloud_shadow,
                 poll_weather,
-                follow_camera_with_fog,
                 poll_clock,
                 request_blocks,
                 update_hud,
@@ -123,21 +126,15 @@ struct Hud;
 #[derive(Component)]
 struct ChunkTag(#[allow(dead_code)] ChunkKey);
 
-/// Edge length of the volume that light shafts are marched through.
-const FOG_VOLUME_SIZE: f32 = 320.0;
-
-/// Keeps the fog volume centred on the viewer.
-#[derive(Component)]
-struct FogFollowsCamera;
-
 /// Reused by every chunk, since colour lives in the vertex data.
 #[derive(Resource)]
-struct TerrainMaterial(Handle<StandardMaterial>);
+struct TerrainMaterial(Handle<TerrainMat>);
 
 fn setup(
     mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMat>>,
     mut mediums: ResMut<Assets<ScatteringMedium>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     // A physically-based atmosphere, so the sky colour follows the sun rather
     // than being painted on.
@@ -161,13 +158,20 @@ fn setup(
         // steps that otherwise read as seams.
         DebandDither::Enabled,
         Bloom::NATURAL,
-        // Lets the sky light the scene, which is what makes dusk read as dusk.
-        // Sky-driven ambient. Raised above the physical default because the
-        // scene has no bounce lighting to fill its shadows.
+        // Sky-driven ambient: the sky lights the scene, which is what makes
+        // dusk read as dusk. Raised above the physical default because there is
+        // no bounce lighting to fill the shadows.
         AtmosphereEnvironmentMapLight { intensity: 2.6, size: UVec2::splat(1024), ..default() },
-        // Light shafts. This needs no deferred pipeline — a volumetric light
-        // and a fog volume are enough.
-        VolumetricFog { ambient_intensity: 0.15, ..default() },
+        // Light shafts, and the ambient that keeps cloud undersides from going
+        // black: seen from below, a cloud is lit by scattered sky, not by the
+        // sun it is blocking.
+        VolumetricFog {
+            // Well above the physical default: inside a cloud the shadow map
+            // reports full occlusion, so ambient is all the light there is.
+            ambient_intensity: 3.2,
+            ambient_color: Color::srgb(0.62, 0.72, 0.88),
+            ..default()
+        },
         FlyCamera::default(),
     ));
 
@@ -183,20 +187,20 @@ fn setup(
         Transform::from_xyz(60.0, 120.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // The volume light shafts are drawn in. It follows the camera, since only
-    // what is near the viewer is worth marching.
-    commands.spawn((
-        FogVolume { density_factor: 0.018, ..default() },
-        Transform::from_scale(Vec3::splat(FOG_VOLUME_SIZE)),
-        FogFollowsCamera,
-    ));
-
-    commands.insert_resource(TerrainMaterial(materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.92,
-        reflectance: 0.03,
-        alpha_mode: AlphaMode::Mask(0.5),
-        ..default()
+    commands.insert_resource(TerrainMaterial(materials.add(TerrainMat {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.92,
+            reflectance: 0.03,
+            alpha_mode: AlphaMode::Mask(0.5),
+            ..default()
+        },
+        extension: CloudShadow {
+            uniform: CloudUniform { strength: 0.55, density_scale: 26.0, ..default() },
+            // Always bound: an unbound 3D texture leaves the binding out of the
+            // pipeline layout entirely.
+            density: images.add(clouds::empty_density()),
+        },
     })));
 
     commands.spawn((
@@ -213,7 +217,7 @@ fn drain_worker(
     bridge: NonSend<Bridge>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMat>>,
     material: Res<TerrainMaterial>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
@@ -243,7 +247,7 @@ fn drain_worker(
                 image.sampler = ImageSampler::nearest();
                 let handle = images.add(image);
                 if let Some(mut m) = materials.get_mut(&material.0) {
-                    m.base_color_texture = Some(handle);
+                    m.base.base_color_texture = Some(handle);
                 }
             }
             Event::Connected { world_name, save, center, size } => {
@@ -427,6 +431,33 @@ fn request_blocks(
     });
 }
 
+/// Hands the terrain shader the sun and the cloud volume, so the deck's shadow
+/// lands on the ground rather than staying up in the sky with the clouds.
+fn sync_cloud_shadow(
+    clock: Res<Clock>,
+    weather: Res<Weather>,
+    material: Res<TerrainMaterial>,
+    mut materials: ResMut<Assets<TerrainMat>>,
+    deck: Query<(&bevy::light::FogVolume, &Transform), With<clouds::CloudDeck>>,
+) {
+    let Some(mut terrain) = materials.get_mut(&material.0) else { return };
+    let Ok((volume, transform)) = deck.single() else { return };
+
+    if let Some(density) = volume.density_texture.clone() {
+        terrain.extension.density = density;
+    }
+    let uniform = &mut terrain.extension.uniform;
+    uniform.sun = clock.sun_direction();
+    uniform.centre = transform.translation;
+    uniform.size = transform.scale;
+    uniform.offset = volume.density_texture_offset;
+    uniform.enabled = if weather.is_clear() || volume.density_texture.is_none() {
+        0.0
+    } else {
+        1.0
+    };
+}
+
 /// Asks for the world's cloud cover now and then. The map message is large and
 /// the sky changes slowly, so this is deliberately infrequent.
 fn poll_weather(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
@@ -436,15 +467,6 @@ fn poll_weather(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) 
     }
     *next = 12.0;
     let _ = bridge.tx.send(Command::Weather);
-}
-
-/// Recentres the fog volume on the camera.
-fn follow_camera_with_fog(
-    camera: Query<&Transform, (With<FlyCamera>, Without<FogFollowsCamera>)>,
-    mut fog: Query<&mut Transform, With<FogFollowsCamera>>,
-) {
-    let (Ok(view), Ok(mut volume)) = (camera.single(), fog.single_mut()) else { return };
-    volume.translation = view.translation;
 }
 
 /// Asks for the game's calendar a few times a second.

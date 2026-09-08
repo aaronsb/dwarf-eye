@@ -18,8 +18,9 @@ const NX: usize = 96;
 const NY: usize = 48;
 const NZ: usize = 96;
 
-/// How wide the cloud deck is, in tiles.
-const DECK_WIDTH: f32 = 900.0;
+/// How wide the cloud deck is, in tiles. Wider than the camera's far plane, so
+/// its edge never comes into view.
+const DECK_WIDTH: f32 = 2400.0;
 /// How tall, from the base of the lowest layer to the top of the highest.
 const DECK_HEIGHT: f32 = 260.0;
 /// Height of the deck's base above the terrain.
@@ -194,8 +195,8 @@ pub fn build_density(weather: Weather) -> Image {
                 // Stratus: a flat sheet low down, almost total where present.
                 if weather.stratus > 0.0 {
                     let shape = band(altitude, 0.10, 0.22, 0.035);
-                    let n = fbm(Vec3::new(p.x, p.y * 3.0, p.z), 3);
-                    density = density.max(cover(n, weather.stratus * 0.92, 0.22) * shape * 0.8);
+                    let n = fbm(Vec3::new(p.x, p.y * 3.0, p.z), 6);
+                    density = density.max(cover(n, weather.stratus * 0.92, 0.10) * shape * 0.9);
                 }
 
                 // Cumulus: tall lumps. Density falls off toward the top, which
@@ -204,15 +205,15 @@ pub fn build_density(weather: Weather) -> Image {
                     let shape = band(altitude, 0.26, 0.62, 0.02);
                     let dome = 1.0 - ((altitude - 0.30) / 0.34).clamp(0.0, 1.0).powf(1.7);
                     // Squashing y makes the lumps wider than they are tall.
-                    let n = fbm(Vec3::new(p.x, p.y * 0.55, p.z), 4);
-                    density = density.max(cover(n, weather.cumulus * 0.62, 0.3) * shape * dome);
+                    let n = fbm(Vec3::new(p.x, p.y * 0.55, p.z), 9);
+                    density = density.max(cover(n, weather.cumulus * 0.62, 0.13) * shape * dome);
                 }
 
                 // Cirrus: high, thin, drawn out along the wind.
                 if weather.cirrus > 0.0 {
                     let shape = band(altitude, 0.80, 0.90, 0.03);
-                    let n = fbm(Vec3::new(p.x * 0.35, p.y * 6.0, p.z * 1.6), 5);
-                    density = density.max(cover(n, weather.cirrus * 0.5, 0.34) * shape * 0.35);
+                    let n = fbm(Vec3::new(p.x * 0.35, p.y * 6.0, p.z * 1.6), 11);
+                    density = density.max(cover(n, weather.cirrus * 0.5, 0.20) * shape * 0.45);
                 }
 
                 // Fog clings to the bottom of the volume.
@@ -247,12 +248,33 @@ pub fn build_density(weather: Weather) -> Image {
     image
 }
 
+/// A 1x1x1 empty volume, so the terrain material always has a 3D texture bound
+/// even before any weather arrives.
+pub fn empty_density() -> Image {
+    let mut image = Image::new(
+        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        TextureDimension::D3,
+        vec![0u8],
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        address_mode_w: ImageAddressMode::Repeat,
+        ..default()
+    });
+    image
+}
+
 pub fn setup(mut commands: Commands) {
     commands.spawn((
         FogVolume {
             density_factor: 0.0,
-            absorption: 0.42,
-            scattering: 0.65,
+            // Cloud lit from outside: mostly scattering, little absorption,
+            // or the undersides go black.
+            absorption: 0.18,
+            scattering: 0.92,
             ..default()
         },
         Transform::from_xyz(0.0, DECK_BASE, 0.0)
@@ -276,7 +298,12 @@ pub fn drive(
     if built.0 != Some(*weather) {
         built.0 = Some(*weather);
         volume.density_texture = (!weather.is_clear()).then(|| images.add(build_density(*weather)));
-        volume.density_factor = if weather.is_clear() { 0.0 } else { 0.09 };
+        // DWARF_EYE_CLOUD_DENSITY tunes how solid the deck reads.
+        let density: f32 = std::env::var("DWARF_EYE_CLOUD_DENSITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.085);
+        volume.density_factor = if weather.is_clear() { 0.0 } else { density };
     }
 
     // Follow the camera across the ground plane only. The altitude is fixed to
