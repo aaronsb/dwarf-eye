@@ -1,40 +1,41 @@
-//! Volumetric clouds, shaped by Dwarf Fortress's own weather.
+//! Clouds, shaped by Dwarf Fortress's own weather.
 //!
-//! DF reports a cloud type per world tile — cumulus, stratus, cirrus and fog —
-//! rather than a coverage number, and the three cloud kinds differ mostly in how
-//! they occupy height. That maps onto a 3D density texture: a fog volume
-//! raymarches it against the sun, so the clouds cast light shafts instead of
-//! being a picture pasted on the sky.
+//! DF reports a cloud *kind* per world tile — cumulus, stratus, cirrus and fog —
+//! rather than a coverage number, and the kinds differ mostly in how they occupy
+//! height. Each shapes a field of spherical puffs.
+//!
+//! Those puffs feed two consumers, so the clouds you see and the shadows they
+//! throw describe the same sky: the visible geometry, and a 3D density texture
+//! the terrain shader marches toward the sun.
 
+use crate::cloud_material::{CloudMaterial, CloudSubsurface};
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
-use bevy::light::FogVolume;
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-/// Density volume resolution. Height gets fewer samples than the ground plane
-/// because the layers are broad and flat relative to their thickness.
+/// Density volume resolution. Height gets fewer samples because the layers are
+/// broad and flat relative to their thickness.
 const NX: usize = 96;
 const NY: usize = 48;
 const NZ: usize = 96;
 
-/// How wide the cloud deck is, in tiles. Wider than the camera's far plane, so
-/// its edge never comes into view.
-const DECK_WIDTH: f32 = 2400.0;
-/// How tall, from the base of the lowest layer to the top of the highest.
-const DECK_HEIGHT: f32 = 260.0;
+/// Deck extent in tiles. Wider than the camera's far plane, so its edge never
+/// comes into view.
+pub const DECK_WIDTH: f32 = 2400.0;
+pub const DECK_HEIGHT: f32 = 320.0;
 /// Height of the deck's base above the terrain.
-const DECK_BASE: f32 = 40.0;
+pub const DECK_BASE: f32 = 40.0;
 
 /// The z-level the terrain sits at, so the deck can hold a fixed altitude.
 ///
-/// Tying the deck to the camera instead would put the viewer inside it, and a
-/// camera inside the cloud volume sees nothing but fog.
+/// Tying the deck to the camera instead would put the viewer inside it.
 #[derive(Resource, Default)]
 pub struct GroundLevel(pub f32);
 
 /// Cloud cover as Dwarf Fortress reports it, reduced to what a sky needs.
-#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+#[derive(Resource, Clone, Copy, PartialEq, Debug, Default)]
 pub struct Weather {
     /// Puffy and tall: little ground cover, a lot of vertical extent.
     pub cumulus: f32,
@@ -46,16 +47,9 @@ pub struct Weather {
     pub fog: f32,
 }
 
-impl Default for Weather {
-    fn default() -> Self {
-        Self { cumulus: 0.0, stratus: 0.0, cirrus: 0.0, fog: 0.0 }
-    }
-}
-
 impl Weather {
     /// A sky forced from the environment, for testing without waiting on the
-    /// world's own weather. `DWARF_EYE_CLOUDS=cumulus,stratus` or
-    /// `DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4`.
+    /// world. `DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4`.
     pub fn from_env() -> Option<Self> {
         let spec = std::env::var("DWARF_EYE_CLOUDS").ok()?;
         let mut weather = Weather::default();
@@ -101,14 +95,91 @@ impl Weather {
 #[derive(Component)]
 pub struct CloudDeck;
 
-/// The weather the current density texture was built for.
+/// The weather the current geometry was built for.
 #[derive(Resource, Default)]
 pub struct BuiltFor(pub Option<Weather>);
 
-/// Value noise, smoothed and tiling on the grid.
+/// Where the deck sits and what shadows it casts, for the terrain shader.
+#[derive(Resource, Default)]
+pub struct CloudField {
+    pub density: Option<Handle<Image>>,
+    pub centre: Vec3,
+    pub size: Vec3,
+    pub offset: Vec3,
+}
+
+/// One sphere of cloud.
+struct Puff {
+    /// Centre in deck-local space, the deck's own centre being the origin.
+    centre: Vec3,
+    radius: f32,
+    /// 0 at a wispy edge, 1 in the core.
+    depth: f32,
+    /// 0 at the cloud's flat base, 1 at its crown.
+    height: f32,
+}
+
+#[derive(Clone, Copy)]
+enum Layer {
+    Cumulus = 0,
+    Stratus = 1,
+    Cirrus = 2,
+}
+
+/// The proportions that tell one cloud kind from another.
+struct Profile {
+    /// Height above the deck's base.
+    altitude: f32,
+    puffs: i32,
+    radius: f32,
+    spread_x: f32,
+    spread_z: f32,
+    /// How far the crown rises above the base.
+    rise: f32,
+    jitter_y: f32,
+}
+
+impl Layer {
+    fn profile(self) -> Profile {
+        match self {
+            // Tall and lumpy: a lot of column, only patches of sky.
+            Layer::Cumulus => Profile {
+                altitude: 130.0,
+                puffs: 26,
+                radius: 30.0,
+                spread_x: 62.0,
+                spread_z: 62.0,
+                rise: 66.0,
+                jitter_y: 30.0,
+            },
+            // A near-total sheet, a fraction as deep as it is broad.
+            Layer::Stratus => Profile {
+                altitude: 70.0,
+                puffs: 16,
+                radius: 36.0,
+                spread_x: 96.0,
+                spread_z: 96.0,
+                rise: 9.0,
+                jitter_y: 6.0,
+            },
+            // High, thin, drawn out along the wind.
+            Layer::Cirrus => Profile {
+                altitude: 236.0,
+                puffs: 7,
+                radius: 13.0,
+                spread_x: 130.0,
+                spread_z: 26.0,
+                rise: 4.0,
+                jitter_y: 14.0,
+            },
+        }
+    }
+}
+
+/// A small deterministic generator, so the same sky comes back every run.
 fn hash3(x: i32, y: i32, z: i32) -> f32 {
     let mut h = (x as u32).wrapping_mul(0x8DA6_B343)
-        ^ (y as u32).wrapping_mul(0xD8163_841u32)
+        ^ (y as u32).wrapping_mul(0xD816_3841)
         ^ (z as u32).wrapping_mul(0xCB1A_B31F);
     h ^= h >> 13;
     h = h.wrapping_mul(0x2545_F491);
@@ -116,114 +187,140 @@ fn hash3(x: i32, y: i32, z: i32) -> f32 {
     (h & 0xFFFF) as f32 / 65535.0
 }
 
-fn smooth(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
+/// Lays out the cloud field: clusters on a jittered grid, puffs within each.
+fn generate_puffs(weather: Weather) -> Vec<Puff> {
+    const CELLS: i32 = 15;
+    let cell = DECK_WIDTH / CELLS as f32;
+    let mut puffs = Vec::new();
 
-/// Trilinear value noise on a grid of `period` cells, wrapping so the deck can
-/// scroll without a seam.
-fn noise(p: Vec3, period: i32) -> f32 {
-    let scaled = p * period as f32;
-    let (i, f) = (scaled.floor(), scaled.fract());
-    let (x0, y0, z0) = (i.x as i32, i.y as i32, i.z as i32);
-    let wrap = |v: i32| v.rem_euclid(period);
+    for cz in 0..CELLS {
+        for cx in 0..CELLS {
+            let jitter = |salt: i32| hash3(cx, cz, salt);
+            let base_x = (cx as f32 + 0.5 - CELLS as f32 * 0.5) * cell + (jitter(1) - 0.5) * cell;
+            let base_z = (cz as f32 + 0.5 - CELLS as f32 * 0.5) * cell + (jitter(2) - 0.5) * cell;
 
-    let (u, v, w) = (smooth(f.x), smooth(f.y), smooth(f.z));
-    let mut total = 0.0;
-    for (dz, wz) in [(0, 1.0 - w), (1, w)] {
-        for (dy, wy) in [(0, 1.0 - v), (1, v)] {
-            for (dx, wx) in [(0, 1.0 - u), (1, u)] {
-                total += hash3(wrap(x0 + dx), wrap(y0 + dy), wrap(z0 + dz)) * wx * wy * wz;
+            for (layer, coverage) in [
+                (Layer::Cumulus, weather.cumulus),
+                (Layer::Stratus, weather.stratus),
+                (Layer::Cirrus, weather.cirrus),
+            ] {
+                let index = layer as i32;
+                if coverage <= 0.01 || jitter(index + 10) > coverage {
+                    continue;
+                }
+                let profile = layer.profile();
+                let scale = 0.75 + jitter(index + 20) * 0.6;
+                let centre = Vec3::new(
+                    base_x,
+                    // Deck-local: the deck's centre is the origin.
+                    profile.altitude - DECK_HEIGHT * 0.5
+                        + (jitter(index + 30) - 0.5) * profile.jitter_y,
+                    base_z,
+                );
+
+                for puff in 0..profile.puffs {
+                    let h = |salt: i32| hash3(cx * 131 + puff, cz * 197 + puff, salt + index);
+                    let angle = h(1) * std::f32::consts::TAU;
+                    // Square root spreads the puffs evenly over the disc rather
+                    // than bunching them in the middle.
+                    let reach = h(2).sqrt();
+                    // A cloud is a few big masses with small lumps riding on
+                    // them, not a heap of equal balls.
+                    let mass = h(5).powf(2.4);
+                    let rise = (1.0 - reach) * profile.rise * scale * (0.35 + h(4) * 0.9);
+                    let offset = Vec3::new(
+                        angle.cos() * reach * profile.spread_x * scale,
+                        rise,
+                        angle.sin() * reach * profile.spread_z * scale,
+                    );
+                    puffs.push(Puff {
+                        centre: centre + offset,
+                        radius: profile.radius
+                            * scale
+                            * (0.32 + mass * 1.15)
+                            * (0.5 + (1.0 - reach) * 0.85),
+                        depth: 1.0 - reach,
+                        height: (rise / profile.rise.max(1.0)).clamp(0.0, 1.0),
+                    });
+                }
             }
         }
     }
-    total
+    puffs
 }
 
-/// Several octaves of value noise, for cloud edges that are ragged at more than
-/// one scale.
-fn fbm(p: Vec3, base_period: i32) -> f32 {
-    let mut total = 0.0;
-    let mut amplitude = 0.5;
-    let mut period = base_period;
-    for _ in 0..4 {
-        total += noise(p, period) * amplitude;
-        amplitude *= 0.5;
-        period *= 2;
+/// Turns the puffs into geometry, one low-poly sphere each.
+fn build_mesh(puffs: &[Puff]) -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    );
+
+    let unit = Sphere::new(1.0).mesh().ico(1).expect("icosphere");
+    let unit_positions: Vec<[f32; 3]> = unit
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|v| v.as_float3())
+        .map(<[[f32; 3]]>::to_vec)
+        .unwrap_or_default();
+    let unit_indices: Vec<u32> = match unit.indices() {
+        Some(Indices::U32(v)) => v.clone(),
+        Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+        None => Vec::new(),
+    };
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for puff in puffs {
+        let base = positions.len() as u32;
+        for p in &unit_positions {
+            let dir = Vec3::from_array(*p);
+            positions.push((puff.centre + dir * puff.radius).to_array());
+            normals.push(dir.to_array());
+            // Red: how deep in the body. Green: how far up the cloud.
+            colors.push([puff.depth, puff.height, 0.0, 1.0]);
+        }
+        indices.extend(unit_indices.iter().map(|i| i + base));
     }
-    total
-}
 
-/// Maps a value through a soft threshold, so `coverage` behaves like the
-/// fraction of sky filled rather than a brightness.
-fn cover(value: f32, coverage: f32, softness: f32) -> f32 {
-    if coverage <= 0.0 {
-        return 0.0;
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    if !indices.is_empty() {
+        mesh.insert_indices(Indices::U32(indices));
     }
-    // A higher coverage lowers the bar a sample has to clear.
-    let threshold = 1.0 - coverage;
-    ((value - threshold) / softness).clamp(0.0, 1.0)
+    mesh
 }
 
-/// A band that fades in and out over `feather` at each edge.
-fn band(v: f32, low: f32, high: f32, feather: f32) -> f32 {
-    let rise = ((v - low) / feather).clamp(0.0, 1.0);
-    let fall = ((high - v) / feather).clamp(0.0, 1.0);
-    rise * fall
-}
-
-/// Builds the density volume for a given sky.
-///
-/// The three layers differ in the proportions a real sky gives them: stratus is
-/// a near-total sheet an eighth as deep as it is broad, cumulus occupies a third
-/// of the column but only patches of the ground plane, cirrus is thin, high and
-/// stretched.
-pub fn build_density(weather: Weather) -> Image {
+/// Splats the same puffs into a density volume, so the shadows on the ground
+/// match the clouds in the sky.
+fn build_density(puffs: &[Puff]) -> Image {
     let mut data = vec![0u8; NX * NY * NZ];
+    let size = Vec3::new(DECK_WIDTH, DECK_HEIGHT, DECK_WIDTH);
+    let resolution = Vec3::new(NX as f32, NY as f32, NZ as f32);
 
-    for z in 0..NZ {
-        for y in 0..NY {
-            for x in 0..NX {
-                let p = Vec3::new(
-                    x as f32 / NX as f32,
-                    y as f32 / NY as f32,
-                    z as f32 / NZ as f32,
-                );
-                let altitude = p.y;
-                let mut density: f32 = 0.0;
+    for puff in puffs {
+        // Voxel range the sphere touches.
+        let lo = ((puff.centre - Vec3::splat(puff.radius)) / size + Vec3::splat(0.5)) * resolution;
+        let hi = ((puff.centre + Vec3::splat(puff.radius)) / size + Vec3::splat(0.5)) * resolution;
 
-                // Stratus: a flat sheet low down, almost total where present.
-                if weather.stratus > 0.0 {
-                    let shape = band(altitude, 0.10, 0.22, 0.035);
-                    let n = fbm(Vec3::new(p.x, p.y * 3.0, p.z), 6);
-                    density = density.max(cover(n, weather.stratus * 0.92, 0.10) * shape * 0.9);
+        for z in lo.z.floor().max(0.0) as usize..(hi.z.ceil() as usize).min(NZ) {
+            for y in lo.y.floor().max(0.0) as usize..(hi.y.ceil() as usize).min(NY) {
+                for x in lo.x.floor().max(0.0) as usize..(hi.x.ceil() as usize).min(NX) {
+                    let world = (Vec3::new(x as f32, y as f32, z as f32) / resolution
+                        - Vec3::splat(0.5))
+                        * size;
+                    let distance = world.distance(puff.centre) / puff.radius;
+                    if distance >= 1.0 {
+                        continue;
+                    }
+                    // Soft-edged sphere, so shadow edges are not faceted.
+                    let value = (1.0 - distance * distance).powf(1.5);
+                    let index = (z * NY + y) * NX + x;
+                    data[index] = data[index].max((value * 255.0) as u8);
                 }
-
-                // Cumulus: tall lumps. Density falls off toward the top, which
-                // is what gives them a flat base and a domed crown.
-                if weather.cumulus > 0.0 {
-                    let shape = band(altitude, 0.26, 0.62, 0.02);
-                    let dome = 1.0 - ((altitude - 0.30) / 0.34).clamp(0.0, 1.0).powf(1.7);
-                    // Squashing y makes the lumps wider than they are tall.
-                    let n = fbm(Vec3::new(p.x, p.y * 0.55, p.z), 9);
-                    density = density.max(cover(n, weather.cumulus * 0.62, 0.13) * shape * dome);
-                }
-
-                // Cirrus: high, thin, drawn out along the wind.
-                if weather.cirrus > 0.0 {
-                    let shape = band(altitude, 0.80, 0.90, 0.03);
-                    let n = fbm(Vec3::new(p.x * 0.35, p.y * 6.0, p.z * 1.6), 11);
-                    density = density.max(cover(n, weather.cirrus * 0.5, 0.20) * shape * 0.45);
-                }
-
-                // Fog clings to the bottom of the volume.
-                if weather.fog > 0.0 {
-                    let shape = 1.0 - (altitude / 0.06).clamp(0.0, 1.0);
-                    let n = fbm(Vec3::new(p.x * 2.0, p.y * 4.0, p.z * 2.0), 4);
-                    density = density.max(cover(n, weather.fog, 0.5) * shape * 0.6);
-                }
-
-                data[(z * NY + y) * NX + x] = (density.clamp(0.0, 1.0) * 255.0) as u8;
             }
         }
     }
@@ -235,16 +332,7 @@ pub fn build_density(weather: Weather) -> Image {
         TextureFormat::R8Unorm,
         RenderAssetUsages::RENDER_WORLD,
     );
-    // Repeat, so the deck can scroll on the wind without running out.
-    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        address_mode_w: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        ..default()
-    });
+    image.sampler = repeating();
     image
 }
 
@@ -258,60 +346,73 @@ pub fn empty_density() -> Image {
         TextureFormat::R8Unorm,
         RenderAssetUsages::RENDER_WORLD,
     );
-    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        address_mode_w: ImageAddressMode::Repeat,
-        ..default()
-    });
+    image.sampler = repeating();
     image
 }
 
-pub fn setup(mut commands: Commands) {
+fn repeating() -> ImageSampler {
+    ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        address_mode_w: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    })
+}
+
+pub fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<CloudMaterial>>,
+) {
     commands.spawn((
-        FogVolume {
-            density_factor: 0.0,
-            // Cloud lit from outside: mostly scattering, little absorption,
-            // or the undersides go black.
-            absorption: 0.18,
-            scattering: 0.92,
-            ..default()
-        },
-        Transform::from_xyz(0.0, DECK_BASE, 0.0)
-            .with_scale(Vec3::new(DECK_WIDTH, DECK_HEIGHT, DECK_WIDTH)),
+        Mesh3d(meshes.add(build_mesh(&[]))),
+        MeshMaterial3d(materials.add(CloudMaterial {
+            base: StandardMaterial {
+                base_color: Color::WHITE,
+                // The shader replaces the lighting; the base is only carrying
+                // the vertex path and the prepass.
+                unlit: true,
+                ..default()
+            },
+            extension: CloudSubsurface::default(),
+        })),
+        Transform::from_xyz(0.0, DECK_BASE + DECK_HEIGHT * 0.5, 0.0),
         CloudDeck,
     ));
 }
 
-/// Rebuilds the deck when the weather changes and drifts it on the wind.
+/// Rebuilds the field when the weather changes, and drifts it on the wind.
 pub fn drive(
     time: Res<Time>,
     weather: Res<Weather>,
-    mut built: ResMut<BuiltFor>,
-    mut images: ResMut<Assets<Image>>,
     ground: Res<GroundLevel>,
-    camera: Query<&Transform, (With<crate::camera::FlyCamera>, Without<CloudDeck>)>,
-    mut deck: Query<(&mut FogVolume, &mut Transform), With<CloudDeck>>,
+    mut built: ResMut<BuiltFor>,
+    mut field: ResMut<CloudField>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut deck: Query<(&mut Mesh3d, &mut Transform), With<CloudDeck>>,
 ) {
-    let Ok((mut volume, mut transform)) = deck.single_mut() else { return };
+    let Ok((mut mesh, mut transform)) = deck.single_mut() else { return };
 
     if built.0 != Some(*weather) {
         built.0 = Some(*weather);
-        volume.density_texture = (!weather.is_clear()).then(|| images.add(build_density(*weather)));
-        // DWARF_EYE_CLOUD_DENSITY tunes how solid the deck reads.
-        let density: f32 = std::env::var("DWARF_EYE_CLOUD_DENSITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.085);
-        volume.density_factor = if weather.is_clear() { 0.0 } else { density };
+        let puffs = generate_puffs(*weather);
+        mesh.0 = meshes.add(build_mesh(&puffs));
+        field.density = (!puffs.is_empty()).then(|| images.add(build_density(&puffs)));
     }
 
-    // Follow the camera across the ground plane only. The altitude is fixed to
-    // the terrain, so the deck stays overhead however high the camera climbs.
-    if let Ok(view) = camera.single() {
-        transform.translation.x = view.translation.x;
-        transform.translation.z = view.translation.z;
-    }
-    transform.translation.y = ground.0 + DECK_BASE + DECK_HEIGHT * 0.5;
-    volume.density_texture_offset += Vec3::new(0.004, 0.0, 0.0015) * time.delta_secs();
+    // The deck holds a fixed altitude above the terrain and drifts sideways.
+    let drift = time.elapsed_secs() * 0.9;
+    transform.translation = Vec3::new(
+        drift,
+        ground.0 + DECK_BASE + DECK_HEIGHT * 0.5,
+        drift * 0.35,
+    );
+
+    field.centre = transform.translation;
+    field.size = Vec3::new(DECK_WIDTH, DECK_HEIGHT, DECK_WIDTH);
+    field.offset = Vec3::ZERO;
 }

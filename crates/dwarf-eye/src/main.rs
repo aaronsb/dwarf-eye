@@ -4,6 +4,7 @@
 //! Start Dwarf Fortress with DFHack, load a fort or an adventurer, then run this.
 
 mod camera;
+mod cloud_material;
 mod clouds;
 mod shadow;
 mod sky;
@@ -54,6 +55,7 @@ fn main() {
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(shadow::CloudShadowPlugin)
+        .add_plugins(cloud_material::CloudMaterialPlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<ChunkEntities>()
@@ -63,6 +65,7 @@ fn main() {
         .insert_resource(Weather::from_env().unwrap_or_default())
         .init_resource::<clouds::BuiltFor>()
         .init_resource::<clouds::GroundLevel>()
+        .init_resource::<clouds::CloudField>()
         .insert_non_send(Bridge::spawn())
         .add_systems(Startup, (setup, stars::setup, clouds::setup))
         .add_systems(
@@ -75,6 +78,7 @@ fn main() {
                 stars::drive,
                 clouds::drive,
                 sync_cloud_shadow,
+                sync_cloud_light,
                 poll_weather,
                 poll_clock,
                 request_blocks,
@@ -436,26 +440,46 @@ fn request_blocks(
 fn sync_cloud_shadow(
     clock: Res<Clock>,
     weather: Res<Weather>,
+    field: Res<clouds::CloudField>,
     material: Res<TerrainMaterial>,
     mut materials: ResMut<Assets<TerrainMat>>,
-    deck: Query<(&bevy::light::FogVolume, &Transform), With<clouds::CloudDeck>>,
 ) {
     let Some(mut terrain) = materials.get_mut(&material.0) else { return };
-    let Ok((volume, transform)) = deck.single() else { return };
 
-    if let Some(density) = volume.density_texture.clone() {
+    if let Some(density) = field.density.clone() {
         terrain.extension.density = density;
     }
     let uniform = &mut terrain.extension.uniform;
     uniform.sun = clock.sun_direction();
-    uniform.centre = transform.translation;
-    uniform.size = transform.scale;
-    uniform.offset = volume.density_texture_offset;
-    uniform.enabled = if weather.is_clear() || volume.density_texture.is_none() {
-        0.0
-    } else {
-        1.0
-    };
+    uniform.centre = field.centre;
+    uniform.size = field.size;
+    uniform.offset = field.offset;
+    uniform.enabled = if weather.is_clear() || field.density.is_none() { 0.0 } else { 1.0 };
+}
+
+/// Keeps the cloud shading in step with the sun.
+fn sync_cloud_light(
+    clock: Res<Clock>,
+    mut materials: ResMut<Assets<cloud_material::CloudMaterial>>,
+) {
+    let sun = clock.sun_direction();
+    // Sunlight reddens and dims as it grazes the horizon, and the sky that
+    // fills the shadowed side goes with it.
+    let elevation = sun.y.clamp(-1.0, 1.0);
+    let day = elevation.max(0.0).powf(0.45);
+    let warmth = (1.0 - elevation.max(0.0)).powf(2.0);
+
+    for (_, material) in materials.iter_mut() {
+        let u = &mut material.extension.uniform;
+        u.sun = sun;
+        u.sun_color = Vec3::new(
+            1.0,
+            0.97 - warmth * 0.30,
+            0.92 - warmth * 0.62,
+        ) * (0.15 + day * 1.5);
+        u.sky_color = Vec3::new(0.42, 0.52, 0.72) * (0.06 + day * 0.95);
+        u.ground_color = Vec3::new(0.26, 0.28, 0.24) * (0.05 + day * 0.7);
+    }
 }
 
 /// Asks for the world's cloud cover now and then. The map message is large and

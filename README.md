@@ -171,39 +171,54 @@ plane is 1000; past that they are simply clipped away.
 ### Clouds
 
 DF reports a cloud *kind* per world tile rather than a coverage number —
-cumulus, stratus, cirrus and fog — and those kinds differ mostly in how they
-occupy height. That maps onto a 3D density texture built from value noise and
-shaped per layer, in the proportions a real sky gives them: stratus is a
-near-total sheet an eighth as deep as it is broad, cumulus fills a third of the
-column but only patches of the ground plane, cirrus is thin and stretched.
+cumulus, stratus, cirrus and fog — and the kinds differ mostly in how they
+occupy height. Each shapes a field of spherical puffs: cumulus fills a third of
+the column but only patches of sky, stratus is a near-total sheet a fraction as
+deep as it is broad, cirrus is thin and drawn out along the wind.
 
-A `FogVolume` raymarches that texture, so the clouds are volume rather than a
-picture on the sky. Two details cost time:
+Those puffs feed two consumers, so the clouds you see and the shadows they throw
+describe the same sky: the visible geometry, and a 3D density texture the
+terrain shader marches toward the sun.
 
-- **The deck cannot follow the camera vertically.** Doing so puts the viewer
-  inside the volume, and everything fogs to grey. Its altitude is pinned to the
-  terrain.
-- **Cloud undersides need a lot of ambient.** Inside a cloud the shadow map
-  reports full occlusion, so the volumetric ambient is the only light there is.
-  At the physical default they render black.
+**Clouds are geometry, not volumetric fog.** Bevy's volumetric fog was the first
+attempt and cannot work for cloud bodies — `volumetric_fog.wgsl` attenuates its
+own ambient by Beer's law:
 
-Bevy's volumetric fog lights fog and never shadows scene geometry, so the
-clouds would float over a fully lit landscape. `cloud_shadow.wgsl` is a
-`MaterialExtension` on the terrain that marches the same density volume from
-each fragment toward the sun and dims the surface by what it passes through.
-Two things about it are worth knowing:
+```wgsl
+var accumulated_color = exp(-ray_length_view * (absorption + scattering))
+    * ambient_color * ambient_intensity;
+```
+
+The thicker the cloud, the *less* fill light it gets, so cloud interiors render
+black and no `ambient_intensity` rescues them. That plugin is for light shafts,
+where the medium is thin.
+
+`cloud.wgsl` shades the puffs instead, with the two things that make a cloud
+read: light wrapping well past the terminator, and light bleeding through where
+the cloud is thin (vertex red carries how deep in the body a point sits, green
+how far up the cloud). It is a fragment-only `MaterialExtension` — a custom
+vertex shader breaks the depth prepass, which fails with
+`Location[7] ... is not provided by the previous stage outputs`.
+
+Still cartoonish; the puff distribution wants more work.
+
+**Cloud shadows.** Bevy's volumetric fog never shadows scene geometry, so
+`cloud_shadow.wgsl` extends the terrain material to march the density volume
+from each fragment toward the sun. Three things cost time:
 
 - Material bindings live in bind group **3** in this version of Bevy, not 2 —
   group 2 is the mesh. Hardcoding 2 leaves the bindings out of the pipeline
   layout, and the shader fails validation with no other clue.
 - The 3D density texture must always be bound. Leaving it `None` drops its
-  binding from the layout with the same failure.
+  binding from the layout with the identical failure.
 - The march wraps horizontally rather than clipping at the deck's bounds.
-  Clipping puts a straight box edge across the ground where the sun ray leaves
+  Clipping draws a straight box edge across the ground where the sun ray leaves
   the volume.
 
-`DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4` forces a sky for testing;
-`DWARF_EYE_CLOUD_DENSITY` tunes how solid it reads.
+The deck holds a fixed altitude above the terrain. Following the camera
+vertically puts the viewer inside it, and everything greys out.
+
+`DWARF_EYE_CLOUDS=cumulus=0.8,cirrus=0.4` forces a sky for testing.
 
 ### Driving the world for testing
 
