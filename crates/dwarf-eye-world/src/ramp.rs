@@ -67,14 +67,21 @@ pub fn levels(mask: u8) -> [[u32; 3]; 3] {
     ]
 }
 
-/// A level as a height in world units, from the floor slab to a full z-level.
+/// A level as a fraction of the climb, 0 at the foot of the slope and 1 at its
+/// top.
+fn fraction(level: u32) -> f32 {
+    level.min(HEIGHT).saturating_sub(1) as f32 / (HEIGHT - 1) as f32
+}
+
+/// A level as a height in world units, measured from the tile's own base.
 ///
-/// vox-uristi fills `level` of `HEIGHT` voxel layers; here the same range is
-/// stretched so an unraised corner sits exactly on the floor slabs beside it
-/// and a saturated one reaches the wall above.
+/// vox-uristi fills `level` of `HEIGHT` voxel layers; here the same range rides
+/// on top of the floor slab, so an unraised corner sits exactly on the slabs
+/// beside it and a raised one lands on the surface of the slab a level up
+/// rather than on the level boundary a slab's thickness below it. Without the
+/// offset every ramp ends in a lip.
 fn height(level: u32, floor: f32) -> f32 {
-    let t = level.min(HEIGHT).saturating_sub(1) as f32 / (HEIGHT - 1) as f32;
-    (floor + t * (1.0 - floor)) * Z_SCALE
+    (floor + fraction(level)) * Z_SCALE
 }
 
 /// Whether a mask leans on nothing, and so has no slope to build.
@@ -134,26 +141,31 @@ pub fn sprite_names(family: &str) -> Vec<String> {
     names
 }
 
-/// The ramp sprite sheet a tiletype's material draws from.
+/// The ramp sprite sheet a tiletype's material draws from, or `None` for a
+/// slope that wears the flat ground beside it instead.
 ///
-/// DF also ships six sand sheets, but a sand ramp still reports `SOIL`, so
-/// nothing in the tiletype distinguishes them.
-pub fn family_for(material: TiletypeMaterial) -> &'static str {
+/// DF bakes a shadow into its ramp art. On stone that reads as relief and the
+/// sheet is worth having; on `GRASS_RAMP` and `SOIL_RAMP` it is a deep shadow
+/// that makes a sunlit hillside read as a pit, so those slopes take the ground
+/// texture and the shading the renderer's own light gives them. Ice has no
+/// ramp sheet at all — DF ships none — and a stone one would freeze it grey,
+/// so it takes its floor as well.
+///
+/// DF also ships six sand sheets, unreachable for the same reason the flat
+/// sand floors are: a sand ramp reports `SOIL`, and only the tile's material
+/// index — which the tiletype does not carry — tells beige from black.
+pub fn family_for(material: TiletypeMaterial) -> Option<&'static str> {
     use TiletypeMaterial as M;
     match material {
-        M::GrassLight | M::GrassDark | M::GrassDry | M::GrassDead | M::Plant | M::Mushroom => {
-            "GRASS_RAMP"
-        }
         M::Stone
         | M::Mineral
         | M::LavaStone
         | M::Feature
         | M::Construction
-        | M::FrozenLiquid
         | M::Hfs
         | M::Root
-        | M::TreeMaterial => "STONE_RAMP",
-        _ => "SOIL_RAMP",
+        | M::TreeMaterial => Some("STONE_RAMP"),
+        _ => None,
     }
 }
 
@@ -255,20 +267,42 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
     }
 
     // Skirts, walked so each side's points run counter-clockwise seen from
-    // outside the tile. Each column repeats the texel above it, so the face
-    // reads as the same ground rather than as a white wall.
+    // outside the tile.
+    //
+    // The face is the cut edge of the ground, so it carries the ground on
+    // past the lip: along the edge it samples what the surface samples, and
+    // downward it walks *into* the tile, a texel of texture per texel of
+    // drop. Repeating the edge texel down each column instead — which is what
+    // giving both ends of a column the same UV does — paints the whole skirt
+    // in vertical stripes.
     let side = shade(white, 0.72);
-    let sides: [(u8, [(usize, usize); 3], [f32; 3]); 4] = [
-        (N, [(0, 0), (0, 1), (0, 2)], [0.0, 0.0, -1.0]),
-        (S, [(2, 2), (2, 1), (2, 0)], [0.0, 0.0, 1.0]),
-        (W, [(2, 0), (1, 0), (0, 0)], [-1.0, 0.0, 0.0]),
-        (E, [(0, 2), (1, 2), (2, 2)], [1.0, 0.0, 0.0]),
+    let (du, dv) = (uv.u1 - uv.u0, uv.v1 - uv.v0);
+    /// One edge of the tile: its wall bit, the three grid points along it, the
+    /// way the face looks, and the way a drop walks into the texture.
+    struct Side {
+        bit: u8,
+        points: [(usize, usize); 3],
+        normal: [f32; 3],
+        inward: [f32; 2],
+    }
+    let side_of = |bit, points, normal, inward| Side { bit, points, normal, inward };
+    let sides = [
+        side_of(N, [(0, 0), (0, 1), (0, 2)], [0.0, 0.0, -1.0], [0.0, dv]),
+        side_of(S, [(2, 2), (2, 1), (2, 0)], [0.0, 0.0, 1.0], [0.0, -dv]),
+        side_of(W, [(2, 0), (1, 0), (0, 0)], [-1.0, 0.0, 0.0], [du, 0.0]),
+        side_of(E, [(0, 2), (1, 2), (2, 2)], [1.0, 0.0, 0.0], [-du, 0.0]),
     ];
-    for (bit, points, normal) in sides {
+    for Side { bit, points, normal, inward } in sides {
         if mask & bit != 0 {
             // A wall stands here; the skirt would be buried inside it.
             continue;
         }
+        // The UV a drop of `y` lands on, one tile of texture per z-level and
+        // held at the far edge for the slab's own thickness beyond that.
+        let below = |uv: [f32; 2], y: f32| {
+            let t = (y / Z_SCALE).clamp(0.0, 1.0);
+            [uv[0] + inward[0] * t, uv[1] + inward[1] * t]
+        };
         for pair in points.windows(2) {
             let (a, uv_a) = vertex(pair[0].0, pair[0].1);
             let (b, uv_b) = vertex(pair[1].0, pair[1].1);
@@ -276,7 +310,7 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
                 [[a[0], 0.0, a[2]], a, b, [b[0], 0.0, b[2]]],
                 normal,
                 side,
-                [uv_a, uv_a, uv_b, uv_b],
+                [below(uv_a, a[1]), uv_a, uv_b, below(uv_b, b[1])],
             );
         }
     }
@@ -293,8 +327,6 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
 /// place either way.
 pub fn slopes(mask: u8) -> [[f32; 3]; 3] {
     let levels = levels(mask);
-    let fraction =
-        |level: u32| level.min(HEIGHT).saturating_sub(1) as f32 / (HEIGHT - 1) as f32;
     std::array::from_fn(|row| std::array::from_fn(|col| fraction(levels[row][col])))
 }
 
@@ -347,15 +379,82 @@ mod tests {
         assert_eq!(l[2], [OPEN, OPEN, OPEN]);
     }
 
+    /// The floor slab this crate's tiles are, as a fraction of a z-level.
+    const FLOOR: f32 = 0.12;
+
     #[test]
     fn every_mask_builds_a_closed_surface() {
         let uv = Rect { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 };
         for mask in 1..=u8::MAX {
-            let mesh = build_ramp(uv, mask, 0.12);
+            let mesh = build_ramp(uv, mask, FLOOR);
             assert!(mesh.triangle_count() >= 8, "mask {mask} lost its surface");
             for p in &mesh.positions {
-                assert!(p[1] >= 0.0 && p[1] <= Z_SCALE, "mask {mask} left the tile");
+                let top = (FLOOR + 1.0) * Z_SCALE;
+                assert!(p[1] >= 0.0 && p[1] <= top, "mask {mask} left the tile");
             }
         }
+    }
+
+    #[test]
+    fn a_slope_runs_from_one_floor_surface_to_the_next() {
+        // The low edge lies on the slab beside it and the high edge on the
+        // slab a level up — not on the level boundary a slab below that,
+        // which is the lip. Walk mode reads the same two heights out of
+        // `slopes`, so a mismatch here is a step underfoot.
+        let uv = Rect { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 };
+        let mesh = build_ramp(uv, N, FLOOR);
+        let ys: Vec<f32> = mesh.positions.iter().map(|p| p[1]).collect();
+        let low = ys.iter().cloned().filter(|y| *y > 0.0).fold(f32::MAX, f32::min);
+        let high = ys.iter().cloned().fold(f32::MIN, f32::max);
+        assert!((low - FLOOR * Z_SCALE).abs() < 1e-6, "low edge at {low}");
+        assert!(
+            (high - (Z_SCALE + FLOOR * Z_SCALE)).abs() < 1e-6,
+            "high edge at {high}"
+        );
+    }
+
+    #[test]
+    fn corner_heights_follow_the_fractions_walk_mode_reads() {
+        let uv = Rect { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 };
+        for mask in 1..=u8::MAX {
+            let slopes = slopes(mask);
+            let mesh = build_ramp(uv, mask, FLOOR);
+            // The surface's nine grid points, found by position on the tile.
+            for (row, col) in [(0, 0), (0, 2), (2, 0), (2, 2), (1, 1)] {
+                let (x, z) = (col as f32 * 0.5, row as f32 * 0.5);
+                let want = FLOOR * Z_SCALE + slopes[row][col] * Z_SCALE;
+                let found = mesh
+                    .positions
+                    .iter()
+                    .find(|p| p[0] == x && p[2] == z && p[1] > 0.0)
+                    .unwrap_or_else(|| panic!("mask {mask} has no vertex at {row},{col}"));
+                assert!(
+                    (found[1] - want).abs() < 1e-6,
+                    "mask {mask} corner {row},{col} at {} wants {want}",
+                    found[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_skirt_walks_into_the_tile_as_it_drops() {
+        // Both ends of a skirt column sampling one texel is the stripe bug.
+        let uv = Rect { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 };
+        let mesh = build_ramp(uv, N, FLOOR);
+        // The south skirt: outward normal +z, its top edge on the slab.
+        let skirt: Vec<usize> = (0..mesh.positions.len())
+            .filter(|&i| mesh.normals[i] == [0.0, 0.0, 1.0])
+            .collect();
+        assert!(!skirt.is_empty(), "the south side lost its skirt");
+        let spread = skirt
+            .iter()
+            .map(|&i| mesh.uvs[i][1])
+            .fold(f32::MIN, f32::max)
+            - skirt
+                .iter()
+                .map(|&i| mesh.uvs[i][1])
+                .fold(f32::MAX, f32::min);
+        assert!(spread > 0.0, "every skirt column repeats one texel");
     }
 }

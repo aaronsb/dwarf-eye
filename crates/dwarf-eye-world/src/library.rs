@@ -128,7 +128,10 @@ fn ground_under(material: TiletypeMaterial) -> &'static str {
             "GRASS_5"
         }
         M::Stone | M::Mineral | M::LavaStone | M::Feature | M::Construction => "STONE_FLOOR_5",
-        M::FrozenLiquid => "FROZEN_FLOOR_5",
+        // DF's natural ice floor is `ROUGH_ICE_FLOOR`, on the `FLOOR_ICE`
+        // page. There is no `FROZEN_*` sprite at all, so asking for one left
+        // every ice ramp and boulder standing on nothing.
+        M::FrozenLiquid => "ROUGH_ICE_FLOOR",
         _ => "DIRT_FLOOR_5",
     }
 }
@@ -288,7 +291,9 @@ impl TileLibrary {
                     family,
                     candidates,
                     beneath,
-                    ramp: (mode == RenderMode::Ramp).then(|| ramp::family_for(t.material())),
+                    ramp: (mode == RenderMode::Ramp)
+                        .then(|| ramp::family_for(t.material()))
+                        .flatten(),
                     dirs: raws::direction_mask(t.direction()),
                     links: crate::skeleton::links_from_direction(t.direction()),
                     mode,
@@ -419,15 +424,13 @@ impl TileLibrary {
                 tint,
             })
         } else {
-            let family = info.ramp?;
-            // DF bakes a deep shadow into its grass and soil ramp sprites, so
-            // on a sunlit hillside those slopes read as pits. Ground slopes
-            // wear the flat ground texture beside them instead; stone keeps
-            // DF's sprite, greyed to a pattern at pack time.
-            let uv = if family == "STONE_RAMP" {
-                self.ramp_uv.get(&ramp::sprite_name(family, mask)).copied()
-            } else {
-                info.beneath.and_then(|ground| self.under_uv.get(ground).copied())
+            // A slope with a sheet of its own wears DF's sprite for this wall
+            // set, greyed to a pattern at pack time. The rest — soil, grass,
+            // ice, everything whose sheet bakes in a shadow or does not exist
+            // — wear the flat ground beside them, lit by the renderer.
+            let uv = match info.ramp {
+                Some(family) => self.ramp_uv.get(&ramp::sprite_name(family, mask)).copied(),
+                None => info.beneath.and_then(|ground| self.under_uv.get(ground).copied()),
             };
             uv.map(|(rect, tint)| Model {
                 mesh: Arc::new(ramp::build_ramp(rect, mask, FLOOR_HEIGHT)),
