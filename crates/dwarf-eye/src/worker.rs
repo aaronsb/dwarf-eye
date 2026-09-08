@@ -20,10 +20,16 @@ pub enum Command {
     Fetch { center: (i32, i32, i32), radius: i32, depth: i32, opts: MeshOptions, force: bool },
     /// Remesh what is already loaded, without going back to DFHack.
     Remesh { opts: MeshOptions },
+    /// Read the game's calendar.
+    Clock,
+    /// Run a DFHack console command, for driving the world while testing.
+    Run { command: String, args: Vec<String> },
     Shutdown,
 }
 
 pub enum Event {
+    /// Dwarf Fortress's calendar, polled while the world runs.
+    Clock { year: i32, tick: i32 },
     /// The packed ground texture, sent once before any geometry.
     Atlas { width: u32, height: u32, pixels: Vec<u8> },
     Connected { world_name: String, save: String, center: (i32, i32, i32), size: (i32, i32, i32) },
@@ -57,6 +63,10 @@ impl Bridge {
 
 fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
     let mut df = Session::connect_local()?;
+    // The window we last asked for. DFHack answers with only the blocks it
+    // thinks changed, so any chunk we prune has to be re-requested outright or
+    // it never comes back.
+    let mut last_window: Option<(i32, i32, i32, i32, i32, i32)> = None;
 
     // Dwarf Fortress's own sprites, indexed by tiletype and species.
     let tiletypes: rfr::TiletypeList = df.client.call_empty(methods::GET_TILETYPE_LIST)?;
@@ -107,10 +117,28 @@ fn run(commands: Receiver<Command>, events: &Sender<Event>) -> Result<()> {
         match command {
             Command::Shutdown => return Ok(()),
             Command::Remesh { opts } => remesh_all(&df, library.as_mut(), opts, events)?,
+            Command::Run { command, args } => {
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                match df.client.run_command(&command, &borrowed) {
+                    Ok(()) => events.send(Event::Status(format!("ran `{command}`")))?,
+                    Err(e) => events.send(Event::Status(format!("`{command}` failed: {e}")))?,
+                }
+            }
+            Command::Clock => {
+                let map: rfr::WorldMap = df.client.call_empty(methods::GET_WORLD_MAP_CENTER)?;
+                events.send(Event::Clock { year: map.cur_year(), tick: map.cur_year_tick() })?;
+            }
             Command::Fetch { center, radius, depth, opts, force } => {
                 let bounds =
                     BlockBounds::under_ceiling(center.0, center.1, center.2, radius, depth);
-                let fetched = df.fetch(bounds, force)?;
+                let window = (
+                    bounds.min_x, bounds.max_x, bounds.min_y,
+                    bounds.max_y, bounds.min_z, bounds.max_z,
+                );
+                let moved = last_window != Some(window);
+                last_window = Some(window);
+
+                let fetched = df.fetch(bounds, force || moved)?;
 
                 // Retire chunks the camera has left behind before remeshing, so
                 // the loaded set stays proportional to the view and not to how

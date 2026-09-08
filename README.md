@@ -31,6 +31,8 @@ cargo run --release -p dwarf-eye
 | wheel | move speed |
 | `[` `]` | lower / raise the cut plane |
 | `H` | show or hide undiscovered tiles |
+| `,` `.` | step the game clock an hour (six with shift) |
+| `1` `2` `3` | weather: clear / rain / snow |
 
 `DWARF_EYE_Z_OFFSET` moves the starting cut plane relative to the player
 (default +16, high enough to clear a tree canopy); `-8` starts it below ground,
@@ -147,6 +149,41 @@ Three things about the environment sheets are not obvious:
 - **A shrub owns its whole tile.** DFHack reports no floor under a shrub,
   sapling or boulder, so each one has ground synthesised beneath it from its
   material class. Without that, every crop row is a hole with sky behind it.
+
+### Sky
+
+The sun follows Dwarf Fortress's own clock. DF runs 1200 ticks to a day, 28 days
+to a month, 12 months to a year, and `cur_year_tick` is the only clock it
+exposes — dawn puts the sun due east, noon overhead, dusk due west, with the
+year's swing giving winter light its low angle.
+
+Sky colour comes from Bevy's Bruneton atmosphere (Rayleigh and Mie scattering),
+raymarched rather than sampled from lookup textures. The sun is a real
+32-arcminute disk, and the same sky lights the scene through an environment map,
+which is what makes shade under a tree read as sky-blue rather than black.
+Light shafts need no deferred pipeline — a `VolumetricLight` on the sun and a
+`VolumetricFog` on the camera are enough.
+
+Stars are one mesh of emissive quads on a sphere, spun by the clock and faded by
+the sun's elevation. They sit at 620 units because the camera's default far
+plane is 1000; past that they are simply clipped away.
+
+### Driving the world for testing
+
+DFHack's `RunCommand` is method id 1 and needs no binding, which makes the whole
+console reachable:
+
+| | |
+|---|---|
+| `weather clear \| rain \| snow` | sets the weather; bare `weather` prints a 5x5 map |
+| `lua <expr>` | evaluates Lua, so `df.global.cur_year_tick` is readable and writable |
+
+In the viewer, `,` and `.` step the game clock by an hour (six with shift), and
+`1` `2` `3` set the weather.
+
+`GetWorldMap` returns a `Cloud` per world tile — 16641 of them on a 129x129
+world — each carrying front, cumulus, cirrus, stratus and fog. Nothing reads
+them yet.
 
 ### Colour
 

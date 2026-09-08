@@ -4,6 +4,8 @@
 //! Start Dwarf Fortress with DFHack, load a fort or an adventurer, then run this.
 
 mod camera;
+mod sky;
+mod stars;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
@@ -12,7 +14,16 @@ use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
+use bevy::camera::Exposure;
+use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
+use bevy::light::{
+    Atmosphere, AtmosphereEnvironmentMapLight, FogVolume, SunDisk, VolumetricFog,
+    VolumetricLight, atmosphere::ScatteringMedium, light_consts::lux,
+};
+use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
+use bevy::post_process::bloom::Bloom;
 use camera::FlyCamera;
+use sky::Clock;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
@@ -43,14 +54,19 @@ fn main() {
         .init_resource::<ChunkEntities>()
         .init_resource::<Status>()
         .init_resource::<NeedsFetch>()
+        .init_resource::<Clock>()
         .insert_non_send(Bridge::spawn())
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, stars::setup))
         .add_systems(
             Update,
             (
                 drain_worker,
                 handle_input,
                 camera::fly,
+                sky::drive_sun,
+                stars::drive,
+                follow_camera_with_fog,
+                poll_clock,
                 request_blocks,
                 update_hud,
             ),
@@ -100,6 +116,13 @@ struct Hud;
 #[derive(Component)]
 struct ChunkTag(#[allow(dead_code)] ChunkKey);
 
+/// Edge length of the volume that light shafts are marched through.
+const FOG_VOLUME_SIZE: f32 = 320.0;
+
+/// Keeps the fog volume centred on the viewer.
+#[derive(Component)]
+struct FogFollowsCamera;
+
 /// Reused by every chunk, since colour lives in the vertex data.
 #[derive(Resource)]
 struct TerrainMaterial(Handle<StandardMaterial>);
@@ -107,17 +130,58 @@ struct TerrainMaterial(Handle<StandardMaterial>);
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
+    // A physically-based atmosphere, so the sky colour follows the sun rather
+    // than being painted on.
+    commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::earth(256, 256))));
+
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 40.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
-        AmbientLight { brightness: 260.0, ..default() },
+        AtmosphereSettings {
+            // Raymarching integrates the sky directly, which removes the seams
+            // the lookup textures leave and sharpens volumetric shadows.
+            rendering_method: AtmosphereMode::Raymarched,
+            sky_max_samples: 32,
+            ..default()
+        },
+        // RAW_SUNLIGHT is pre-scattering, so the exposure has to be raised to
+        // bring the scene back into range.
+        Exposure { ev100: 13.0 },
+        Tonemapping::AcesFitted,
+        // A dark sky gradient bands badly at 8 bits; dithering breaks up the
+        // steps that otherwise read as seams.
+        DebandDither::Enabled,
+        Bloom::NATURAL,
+        // Lets the sky light the scene, which is what makes dusk read as dusk.
+        // Sky-driven ambient. Raised above the physical default because the
+        // scene has no bounce lighting to fill its shadows.
+        AtmosphereEnvironmentMapLight { intensity: 2.6, size: UVec2::splat(1024), ..default() },
+        // Light shafts. This needs no deferred pipeline — a volumetric light
+        // and a fog volume are enough.
+        VolumetricFog { ambient_intensity: 0.15, ..default() },
         FlyCamera::default(),
     ));
 
     commands.spawn((
-        DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
+        DirectionalLight {
+            illuminance: lux::RAW_SUNLIGHT,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        // A real 32-arcminute disk, so it reads as the sun rather than a glare.
+        SunDisk::EARTH,
+        VolumetricLight,
         Transform::from_xyz(60.0, 120.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // The volume light shafts are drawn in. It follows the camera, since only
+    // what is near the viewer is worth marching.
+    commands.spawn((
+        FogVolume { density_factor: 0.018, ..default() },
+        Transform::from_scale(Vec3::splat(FOG_VOLUME_SIZE)),
+        FogFollowsCamera,
     ));
 
     commands.insert_resource(TerrainMaterial(materials.add(StandardMaterial {
@@ -147,10 +211,14 @@ fn drain_worker(
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
     mut settings: ResMut<ViewSettings>,
+    mut clock: ResMut<Clock>,
     mut camera: Query<&mut Transform, With<FlyCamera>>,
 ) {
     for event in bridge.rx.try_iter() {
         match event {
+            Event::Clock { year, tick } => {
+                *clock = Clock { year, tick };
+            }
             Event::Atlas { width, height, pixels } => {
                 let mut image = Image::new(
                     Extent3d { width, height, depth_or_array_layers: 1 },
@@ -243,9 +311,36 @@ fn to_bevy_mesh(data: MeshData) -> Mesh {
 fn handle_input(
     keys: Res<ButtonInput<KeyCode>>,
     bridge: NonSend<Bridge>,
+    clock: Res<Clock>,
     mut settings: ResMut<ViewSettings>,
     mut needs_fetch: ResMut<NeedsFetch>,
 ) {
+    // Drive the game's own clock and weather, so lighting can be tested without
+    // waiting for the world.
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let step = if shift { sky::TICKS_PER_DAY / 4 } else { sky::TICKS_PER_DAY / 24 };
+    let nudge = keys.just_pressed(KeyCode::Period) as i32 - keys.just_pressed(KeyCode::Comma) as i32;
+    if nudge != 0 {
+        let target = clock.tick + nudge * step;
+        let _ = bridge.tx.send(Command::Run {
+            command: "lua".into(),
+            args: vec![format!("df.global.cur_year_tick = {}", target.max(0))],
+        });
+    }
+
+    for (key, weather) in [
+        (KeyCode::Digit1, "clear"),
+        (KeyCode::Digit2, "rain"),
+        (KeyCode::Digit3, "snow"),
+    ] {
+        if keys.just_pressed(key) {
+            let _ = bridge.tx.send(Command::Run {
+                command: "weather".into(),
+                args: vec![weather.into()],
+            });
+        }
+    }
+
     let mut changed = false;
 
     if keys.just_pressed(KeyCode::BracketLeft) {
@@ -319,8 +414,28 @@ fn request_blocks(
     });
 }
 
+/// Recentres the fog volume on the camera.
+fn follow_camera_with_fog(
+    camera: Query<&Transform, (With<FlyCamera>, Without<FogFollowsCamera>)>,
+    mut fog: Query<&mut Transform, With<FogFollowsCamera>>,
+) {
+    let (Ok(view), Ok(mut volume)) = (camera.single(), fog.single_mut()) else { return };
+    volume.translation = view.translation;
+}
+
+/// Asks for the game's calendar a few times a second.
+fn poll_clock(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
+    *next -= time.delta_secs();
+    if *next > 0.0 {
+        return;
+    }
+    *next = 0.5;
+    let _ = bridge.tx.send(Command::Clock);
+}
+
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
+    clock: Res<Clock>,
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
@@ -337,15 +452,18 @@ fn update_hud(
     };
 
     text.0 = format!(
-        "{}\n{}\n\
+        "{}\n{}\n{}  {}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          chunks  {}   triangles {}   {:.0} fps\n\
          z-ceiling {ceiling}   hidden tiles {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
-         [ ]  lower/raise the cut plane      H  toggle undiscovered tiles",
+         [ ]  cut plane    H  undiscovered tiles\n\
+         , .  step the game clock (shift: six hours)    1 2 3  clear / rain / snow",
         status.world,
         status.detail,
+        clock.describe(),
+        if clock.is_daylight() { "daylight" } else { "night" },
         transform.translation.x,
         transform.translation.z,
         transform.translation.y / Z_SCALE,

@@ -114,6 +114,19 @@ impl Client {
         O::decode(&bytes[..]).with_context(|| format!("decoding reply from {}", method.name))
     }
 
+    /// Runs a DFHack console command, as if typed into its terminal.
+    ///
+    /// This is method id 1 by protocol definition, so it needs no binding.
+    pub fn run_command(&mut self, command: &str, arguments: &[&str]) -> Result<()> {
+        let request = dfproto::CoreRunCommandRequest {
+            command: command.to_string(),
+            arguments: arguments.iter().map(|a| a.to_string()).collect(),
+        };
+        self.raw_call(wire::ID_RUN_COMMAND, &request.encode_to_vec())
+            .with_context(|| format!("running `{command}`"))?;
+        Ok(())
+    }
+
     /// Calls a method that takes no arguments.
     pub fn call_empty<O: Message + Default>(&mut self, method: Method) -> Result<O> {
         self.call(method, &dfproto::EmptyMessage {})
