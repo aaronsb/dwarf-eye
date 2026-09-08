@@ -289,6 +289,15 @@ on the next connect. A chunk the game sends again replaces the cached one.
 Columns whose lowest cached chunk is sparse hold canopy with no ground under it
 and are dropped on restore.
 
+Crowns are drawn at two resolutions. Near the camera a tree is cut into four
+voxels per tile with alpha-masked leaves, its plants and its hanging strands;
+beyond that it is the same tree at one voxel per tile, on one opaque material,
+with the undergrowth dropped. The swap happens where a near leaf voxel stops
+covering two pixels, which depends on the window's height and the lens: about 7
+blocks into a 720-tall window, 11 into a 1190-tall one. `DWARF_EYE_LOD_NEAR`
+sets that distance in blocks, and `DWARF_EYE_OCCLUSION=0` turns off the GPU
+occlusion culling the camera otherwise asks for.
+
 Past the window, DFHack's region maps (one sample per 48 tiles for the world
 tiles around the player) and the world map (one per 768, interpolated) become a
 coarse heightfield out to the horizon. A block mask marks every block whose fine

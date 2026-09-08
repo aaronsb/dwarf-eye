@@ -523,23 +523,32 @@ pub fn params(
     params
 }
 
-/// Grows and voxelises one tree with the shared generator, so the game and the
-/// tree lab produce the same tree from the same parameters and seed.
-pub fn grow(
+/// Grows one tree with the shared generator, so the game and the tree lab
+/// produce the same tree from the same parameters and seed.
+///
+/// The skeleton is where the shape is decided and where the time goes; cutting
+/// it into voxels is [`rasterise`], and a tree is cut once per detail band.
+pub fn skeleton(
     env: &Envelope,
     growth: TreeGrowth,
     habit: Habit,
     library: &mut TileLibrary,
     world_origin: (i32, i32, i32),
-) -> trees::VoxelTree {
+) -> trees::Skeleton {
     use crate::canopy::timing::PHASES;
     let params = params(env, growth, habit, library);
     let bounds = envelope(env);
     let started = std::time::Instant::now();
-    let skeleton = trees::grow(&params, seed(env, world_origin), Some(&bounds));
+    let grown = trees::grow(&params, seed(env, world_origin), Some(&bounds));
     PHASES.skeleton.since(started);
+    grown
+}
+
+/// Cuts a grown tree into voxels at a band's own resolution.
+pub fn rasterise(skeleton: &trees::Skeleton, detail: i32) -> trees::VoxelTree {
+    use crate::canopy::timing::PHASES;
     let started = std::time::Instant::now();
-    let voxels = trees::rasterise(&skeleton, DETAIL as u32);
+    let voxels = trees::rasterise(skeleton, detail.max(1) as u32);
     PHASES.rasterise.since(started);
     voxels
 }

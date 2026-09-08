@@ -32,6 +32,14 @@ Cutout materials are `AlphaMode::Mask(0.5)`, double sided with no culling,
 roughness 0.97, and `diffuse_transmission` from `shadow.rs:leaf_transmission`
 (default 0.1, `DWARF_EYE_LEAF_LIGHT`) so a backlit leaf glows.
 
+A fifth material, `CanopyMaterials::leaf`, carries the same leaf shading with no
+texture and `AlphaMode::Opaque`, back faces culled. It is what the mid canopy
+band wears (`docs/architecture/lod/README.md`): past the band edge a hole in the
+cutout is under a pixel, so the mask buys nothing and costs a masked pass, a
+discard in the depth prepass and the overdraw behind every hole.
+`canopy.rs:Band::coats` is where a band's four meshes are matched to materials,
+and it is the one place that says the mid band wears no cutout.
+
 ## Invariants and gotchas
 
 - The holes are the point: sun and sky come through the crown at texel scale,

@@ -23,13 +23,17 @@
 //! chunk's voxel volume, because a tile's worth of plant at the volume's
 //! resolution is a blob; they are meshed by the growth crate at its own
 //! resolution and stamped in.
+//!
+//! Every chunk is built twice, once per [`Band`]: the near band is all of the
+//! above, the mid band is the same trees rasterised at a quarter of the voxel
+//! resolution, with no plants, no tufts and no strands. The two rise as far
+//! apart on screen as [`near_band`] says, and Bevy swaps between them.
 
 use crate::factory::{self, Class, Extent, Style, Treatment};
 use crate::library::TileLibrary;
 use crate::mesh::{MeshData, MeshOptions, Z_SCALE};
 use crate::tree::{DETAIL, Envelope, Habit};
 use crate::world::{BLOCK, Chunk, Voxel, World};
-use dwarf_eye_art::raws::TreeGrowth;
 use dwarf_eye_trees as trees;
 use dwarf_eye_trees::{Kind, TreeMesh};
 use std::collections::HashMap;
@@ -58,6 +62,120 @@ const REACH: i32 = 2;
 /// Z-levels above the top of a loaded column that its chunk still draws, so a
 /// crown is never shorn off at the ceiling of what has been sent.
 const OVERHEAD: i32 = 24;
+
+/// Sub-voxels per tile the mid band cuts a tree into: a quarter of [`DETAIL`],
+/// so a crown holds a sixty-fourth of the near band's cells and its merged
+/// faces are whole tiles across.
+pub const MID_DETAIL: i32 = DETAIL / 4;
+
+/// How finely one chunk's crowns are cut, and what rides along with them.
+///
+/// The near band is the full tree, its plants and its hanging strands. The mid
+/// band is the same tree at [`MID_DETAIL`] and nothing else: at that distance a
+/// tuft is under a pixel, and the strands and cutout leaves cost a masked pass
+/// to draw air.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Band {
+    Near,
+    Mid,
+}
+
+/// The bands a chunk is built in, nearest first.
+///
+/// The list is the whole of the ordering: a coarser stage — a canonical crown
+/// per species, a green box — is one more entry here, one more mesh per chunk
+/// and one more handover distance, with nothing else to restructure.
+pub const BANDS: [Band; 2] = [Band::Near, Band::Mid];
+
+impl Band {
+    pub fn detail(self) -> i32 {
+        match self {
+            Band::Near => DETAIL,
+            Band::Mid => MID_DETAIL,
+        }
+    }
+
+    /// Whether this band carries the ground cover: standing plants, tufts and
+    /// the strands a weeping crown hangs.
+    fn undergrowth(self) -> bool {
+        self == Band::Near
+    }
+
+    /// Which of [`CanopyMeshes`]'s four meshes a surface goes into.
+    ///
+    /// The near band splits by material, since each wants its own cutout. The
+    /// mid band puts everything in the first, because one mesh on one material
+    /// is one entity and one draw call per chunk, and a chunk that far off has
+    /// no bark grain or leaf holes left to tell apart.
+    fn slot(self, surface: Surface) -> usize {
+        match self {
+            Band::Near => surface.slot(),
+            Band::Mid => 0,
+        }
+    }
+
+    /// What each of [`CanopyMeshes`]'s four meshes is drawn with.
+    ///
+    /// The mid band's leaves are opaque: a cutout costs a masked pass, a
+    /// discard in the depth prepass and the overdraw behind every hole, and at
+    /// that distance the holes are under a pixel. Only its first slot is ever
+    /// filled.
+    pub fn coats(self) -> [Coat; 4] {
+        match self {
+            Band::Near => [
+                Coat::Bark,
+                Coat::Cutout(Surface::Broadleaf),
+                Coat::Cutout(Surface::Needle),
+                Coat::Strip,
+            ],
+            Band::Mid => [Coat::Leaf; 4],
+        }
+    }
+}
+
+/// What a canopy mesh is drawn with: bark, an alpha-masked leaf cutout, the
+/// leaflet strip a strand hangs from, or plain opaque foliage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Coat {
+    Bark,
+    Cutout(Surface),
+    Strip,
+    Leaf,
+}
+
+impl Coat {
+    /// Whether this coat is alpha masked, so it costs a discard wherever it is
+    /// drawn.
+    pub fn masked(self) -> bool {
+        matches!(self, Coat::Cutout(_) | Coat::Strip)
+    }
+}
+
+/// Pixels a near-band leaf voxel must still cover for the near band to be worth
+/// drawing. Below this the cutout is sampling noise, so the coarse crown reads
+/// the same and costs a fraction.
+const MIN_LEAF_PIXELS: f32 = 2.0;
+
+/// Where the near band ends, in tiles, for a camera of this vertical field of
+/// view drawing into a viewport this many pixels tall.
+///
+/// A near leaf voxel is one tile over [`DETAIL`] on a side. A length `L` at
+/// distance `d` covers `L * h / (2 d tan(fov/2))` pixels of a viewport `h`
+/// pixels tall, so the distance at which it falls to [`MIN_LEAF_PIXELS`] is
+/// `L * h / (2 * MIN_LEAF_PIXELS * tan(fov/2))`. Projected size, not raw
+/// distance: a taller window or a narrower lens pushes the band out.
+pub fn near_band(fov_y: f32, viewport_height: f32) -> f32 {
+    let leaf = 1.0 / DETAIL as f32;
+    leaf * viewport_height / (2.0 * MIN_LEAF_PIXELS * (fov_y * 0.5).tan())
+}
+
+/// [`near_band`], with `DWARF_EYE_LOD_NEAR` overriding it in blocks.
+pub fn near_band_override(fov_y: f32, viewport_height: f32) -> f32 {
+    match std::env::var("DWARF_EYE_LOD_NEAR").ok().and_then(|v| v.parse::<f32>().ok()) {
+        Some(blocks) => blocks * BLOCK as f32,
+        None => near_band(fov_y, viewport_height),
+    }
+}
 
 /// Which of the canopy materials a face wants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,7 +212,10 @@ fn to_linear(rgb: [u8; 3]) -> [f32; 3] {
 
 /// A tree, grown and voxelised, in global voxel coordinates.
 pub struct TreeVoxels {
-    /// Corner of the volume, in voxels: tile times `DETAIL`.
+    /// Sub-voxels per tile this copy was cut at, which is what its coordinates
+    /// are in. A chunk may only absorb a tree cut at its own band's detail.
+    detail: i32,
+    /// Corner of the volume, in voxels: tile times `detail`.
     gx: i32,
     gy: i32,
     gz: i32,
@@ -143,35 +264,35 @@ impl TreeVoxels {
 
 }
 
-/// Grows one tree with the shared generator and lays its voxels out in render
-/// space.
+/// Lays one rasterised tree's voxels out in render space.
 ///
 /// The generator works in tiles with the trunk's base at its own origin, so all
 /// that happens here is an offset onto the tile the trunk stands on, and the
-/// colours it chose interned into a small palette.
+/// colours it chose interned into a small palette. `band` says which detail the
+/// tree was cut at and whether its strands come with it.
 fn voxelise(
+    grown: &trees::VoxelTree,
     env: &Envelope,
-    library: &mut TileLibrary,
-    growth: TreeGrowth,
     habit: Habit,
-    world_origin: (i32, i32, i32),
+    band: Band,
 ) -> TreeVoxels {
-    let grown = crate::tree::grow(env, growth, habit, library, world_origin);
     let started = std::time::Instant::now();
+    let detail = band.detail();
     let leaf_surface =
         if habit == Habit::Conifer { Surface::Needle } else { Surface::Broadleaf };
 
     // The generator's origin is the centre of the base tile, at its floor.
     let anchor = [
-        env.base.0 * DETAIL + DETAIL / 2,
-        env.base.2 * DETAIL,
-        env.base.1 * DETAIL + DETAIL / 2,
+        env.base.0 * detail + detail / 2,
+        env.base.2 * detail,
+        env.base.1 * detail + detail / 2,
     ];
     let world = crate::tree::anchor(env);
 
     let Some((lo, hi)) = grown.bounds() else {
         timing::PHASES.voxelise.since(started);
         return TreeVoxels {
+            detail,
             gx: anchor[0],
             gy: anchor[1],
             gz: anchor[2],
@@ -187,6 +308,7 @@ fn voxelise(
     };
     let (nx, ny, nz) = (hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1);
     let mut volume = TreeVoxels {
+        detail,
         gx: anchor[0] + lo.x,
         gy: anchor[1] + lo.y,
         gz: anchor[2] + lo.z,
@@ -195,7 +317,7 @@ fn voxelise(
         nz,
         cells: vec![0u8; (nx * ny * nz) as usize],
         tones: Vec::new(),
-        streamers: strands(&grown, world),
+        streamers: if band.undergrowth() { strands(grown, world) } else { TreeMesh::default() },
         leaf_voxels: 0,
         bark_voxels: 0,
     };
@@ -397,10 +519,16 @@ fn face_shade(normal: [f32; 3]) -> f32 {
     }
 }
 
+/// A tree's origin tile and the detail its copy was cut at.
+type TreeKey = ((i32, i32, i32), i32);
+
 /// Trees that have been grown, kept so a chunk never regrows one.
+///
+/// Keyed by origin and by the detail the copy was cut at: the two bands are the
+/// same tree sampled twice, and both are wanted for as long as the chunk is.
 #[derive(Default)]
 pub struct Forest {
-    trees: HashMap<(i32, i32, i32), Option<Arc<TreeVoxels>>>,
+    trees: HashMap<TreeKey, Option<Arc<TreeVoxels>>>,
     /// Standing plants, by the absolute tile each one stands on.
     plants: HashMap<(i32, i32, i32), Option<Arc<Plant>>>,
 }
@@ -429,11 +557,12 @@ impl CanopyMeshes {
         [&self.bark, &self.broadleaf, &self.needle, &self.streamers].into_iter()
     }
 
-    fn slot(&mut self, surface: Surface) -> &mut MeshData {
-        match surface {
-            Surface::Bark => &mut self.bark,
-            Surface::Broadleaf => &mut self.broadleaf,
-            Surface::Needle => &mut self.needle,
+    fn at(&mut self, slot: usize) -> &mut MeshData {
+        match slot {
+            0 => &mut self.bark,
+            1 => &mut self.broadleaf,
+            2 => &mut self.needle,
+            _ => &mut self.streamers,
         }
     }
 }
@@ -458,7 +587,7 @@ impl Forest {
         if keys.is_empty() {
             return;
         }
-        self.trees.retain(|origin, _| {
+        self.trees.retain(|(origin, _), _| {
             !keys.iter().any(|&(bx, by, z)| {
                 (origin.0.div_euclid(BLOCK) - bx).abs() <= 1
                     && (origin.1.div_euclid(BLOCK) - by).abs() <= 1
@@ -471,20 +600,22 @@ impl Forest {
         self.plants.values().filter(|p| p.is_some()).count()
     }
 
+    /// Trees grown, counted once each rather than once per band.
     pub fn tree_count(&self) -> usize {
-        self.trees.values().filter(|t| t.is_some()).count()
+        self.trees.iter().filter(|((_, d), t)| *d == DETAIL && t.is_some()).count()
     }
 
-    /// Leaf and bark voxels across every tree grown, each counted once however
-    /// many chunks it reaches.
+    /// Leaf and bark voxels across every tree grown at near detail, each counted
+    /// once however many chunks it reaches.
     pub fn voxel_counts(&self) -> (usize, usize) {
         self.trees
-            .values()
-            .flatten()
+            .iter()
+            .filter(|((_, d), _)| *d == DETAIL)
+            .filter_map(|(_, t)| t.as_ref())
             .fold((0, 0), |(l, b), t| (l + t.leaf_voxels, b + t.bark_voxels))
     }
 
-    /// Builds one chunk's tree geometry.
+    /// Builds one chunk's tree geometry for one band.
     pub fn build_chunk(
         &mut self,
         world: &World,
@@ -492,6 +623,7 @@ impl Forest {
         opts: MeshOptions,
         library: &mut TileLibrary,
         world_origin: (i32, i32, i32),
+        band: Band,
     ) -> CanopyMeshes {
         self.build_budgeted(
             world,
@@ -499,6 +631,7 @@ impl Forest {
             opts,
             library,
             world_origin,
+            band,
             &mut CanopyBudget::default(),
         )
     }
@@ -512,6 +645,7 @@ impl Forest {
         opts: MeshOptions,
         library: &mut TileLibrary,
         world_origin: (i32, i32, i32),
+        band: Band,
         budget: &mut CanopyBudget,
     ) -> CanopyMeshes {
         let mut meshes = CanopyMeshes::default();
@@ -529,14 +663,16 @@ impl Forest {
         let (cx, cy) = (chunk.block_x, chunk.block_y);
         let above = if world.chunk(cx, cy, chunk.z + 1).is_some() { 0 } else { OVERHEAD };
 
-        self.sow(chunk, opts, library, world_origin, &mut meshes, budget);
+        if band.undergrowth() {
+            self.sow(chunk, opts, library, world_origin, &mut meshes, budget);
+        }
         if origins.is_empty() {
             return meshes;
         }
 
-        let mut volume = Volume::new(chunk, above);
+        let mut volume = Volume::new(chunk, above, band);
         for (origin, species) in origins {
-            let grown = self.tree(world, library, origin, species, world_origin);
+            let grown = self.tree(world, library, origin, species, world_origin, band);
             let Some(grown) = grown else { continue };
             budget.trees += 1;
             let started = std::time::Instant::now();
@@ -651,6 +787,11 @@ impl Forest {
         found
     }
 
+    /// One tree at one band's detail, grown on first sight and kept.
+    ///
+    /// Both bands are cut from a single growth: the skeleton is the expensive
+    /// half and the mid band is the same tree, only sampled coarsely, so
+    /// rasterising twice costs a fraction of growing twice.
     fn tree(
         &mut self,
         world: &World,
@@ -658,18 +799,32 @@ impl Forest {
         origin: (i32, i32, i32),
         species: i32,
         world_origin: (i32, i32, i32),
+        band: Band,
     ) -> Option<Arc<TreeVoxels>> {
-        if let Some(found) = self.trees.get(&origin) {
+        if let Some(found) = self.trees.get(&(origin, band.detail())) {
             return found.clone();
         }
         let started = std::time::Instant::now();
         let read = Envelope::read(world, library, origin, species);
         timing::PHASES.envelope.since(started);
-        let built = read.map(|env| {
-            let growth = library.growth(species);
-            let habit = env.habit(growth);
-            let grown = voxelise(&env, library, growth, habit, world_origin);
-            if std::env::var("DWARF_EYE_TREE_LOG").is_ok() {
+        let Some(env) = read else {
+            for band in [Band::Near, Band::Mid] {
+                self.trees.insert((origin, band.detail()), None);
+            }
+            return None;
+        };
+
+        let growth = library.growth(species);
+        let habit = env.habit(growth);
+        let skeleton = crate::tree::skeleton(&env, growth, habit, library, world_origin);
+        let mut wanted = None;
+        for cut in [Band::Near, Band::Mid] {
+            let rastered = crate::tree::rasterise(&skeleton, cut.detail());
+            let grown = Arc::new(voxelise(&rastered, &env, habit, cut));
+            if cut == band {
+                wanted = Some(Arc::clone(&grown));
+            }
+            if cut == Band::Near && std::env::var("DWARF_EYE_TREE_LOG").is_ok() {
                 let (bx, by) = (env.base.0.div_euclid(BLOCK), env.base.1.div_euclid(BLOCK));
                 let mut loaded = env.z1;
                 while world.chunk(bx, by, loaded + 1).is_some() {
@@ -690,10 +845,9 @@ impl Forest {
                     crate::tree::cap_radius(&env),
                 );
             }
-            Arc::new(grown)
-        });
-        self.trees.insert(origin, built.clone());
-        built
+            self.trees.insert((origin, cut.detail()), Some(grown));
+        }
+        wanted
     }
 }
 
@@ -776,6 +930,9 @@ fn hang(
 /// One chunk's slice of whatever trees reach it, with a voxel of halo so faces
 /// at its edge can be culled against what the neighbour holds.
 struct Volume {
+    band: Band,
+    /// Sub-voxels per tile, the band's own detail.
+    detail: i32,
     nx: i32,
     ny: i32,
     cells: Vec<u8>,
@@ -789,9 +946,12 @@ impl Volume {
     /// nothing is loaded over it. A crown reaching past the top of its column
     /// would otherwise have no chunk to be drawn in and would end flat at the
     /// loaded ceiling.
-    fn new(chunk: &Chunk, above: i32) -> Self {
-        let (nx, ny) = (BLOCK * DETAIL, DETAIL * (1 + above.max(0)));
+    fn new(chunk: &Chunk, above: i32, band: Band) -> Self {
+        let detail = band.detail();
+        let (nx, ny) = (BLOCK * detail, detail * (1 + above.max(0)));
         Self {
+            band,
+            detail,
             nx,
             ny,
             cells: vec![0u8; ((nx + 2) * (ny + 2) * (nx + 2)) as usize],
@@ -814,8 +974,9 @@ impl Volume {
 
     /// Copies the part of one tree that lands in this chunk.
     fn absorb(&mut self, tree: &TreeVoxels) {
+        debug_assert_eq!(tree.detail, self.detail, "a tree cut for another band");
         let (ox, oy, oz) = self.origin;
-        let (bx, by, bz) = (ox * DETAIL, oz * DETAIL, oy * DETAIL);
+        let (bx, by, bz) = (ox * self.detail, oz * self.detail, oy * self.detail);
         let mut map: Vec<Option<u8>> = vec![None; tree.tones.len()];
         for i in -1..=self.nx {
             for j in -1..=self.ny {
@@ -869,7 +1030,7 @@ impl Volume {
 /// Turns the volume's surface into quads, merging coplanar runs of one shade
 /// and sorting them into the mesh for the material each shade wants.
 fn emit(volume: &Volume, out: &mut CanopyMeshes, budget: &mut CanopyBudget) {
-    let d = DETAIL as f32;
+    let d = volume.detail as f32;
     let (ox, oy, oz) = volume.origin;
     let mut mask: Vec<u8> = Vec::new();
 
@@ -938,7 +1099,7 @@ fn emit(volume: &Volume, out: &mut CanopyMeshes, budget: &mut CanopyBudget) {
                     let rgba =
                         [tone.color[0] * lit, tone.color[1] * lit, tone.color[2] * lit, 1.0];
                     push_face(
-                        out.slot(tone.surface),
+                        out.at(volume.band.slot(tone.surface)),
                         face,
                         ox,
                         oy,
@@ -1059,8 +1220,62 @@ mod tests {
     }
 
     #[test]
+    fn the_near_band_ends_where_a_leaf_voxel_is_two_pixels() {
+        // Bevy's default lens, into a 1080-tall window: a quarter-tile leaf
+        // voxel covers two pixels at this distance and less beyond it.
+        let (fov, height) = (std::f32::consts::FRAC_PI_4, 1080.0);
+        let n = near_band(fov, height);
+        let pixels = |d: f32| (1.0 / DETAIL as f32) * height / (2.0 * d * (fov * 0.5).tan());
+        assert!((pixels(n) - MIN_LEAF_PIXELS).abs() < 1e-3, "{n} tiles is not the two-pixel range");
+        assert!(pixels(n * 2.0) < MIN_LEAF_PIXELS);
+
+        // A taller window resolves the same voxel further out, in proportion;
+        // a wider lens pulls the band in.
+        assert!((near_band(fov, height * 2.0) - n * 2.0).abs() < 1e-2);
+        assert!(near_band(std::f32::consts::FRAC_PI_2, height) < n);
+    }
+
+    #[test]
+    fn the_mid_band_is_a_quarter_of_the_near_one_and_wears_no_cutout() {
+        assert_eq!(Band::Mid.detail() * 4, Band::Near.detail());
+        assert!(!Band::Mid.undergrowth(), "the mid band drops plants, tufts and strands");
+        assert!(
+            !Band::Mid.coats().iter().any(|c| c.masked()),
+            "a mid mesh asked for a masked material"
+        );
+        // One mesh, so one entity and one draw call for a chunk's whole crown.
+        for surface in [Surface::Bark, Surface::Broadleaf, Surface::Needle] {
+            assert_eq!(Band::Mid.slot(surface), 0);
+        }
+        assert_eq!(Band::Near.coats().iter().filter(|c| c.masked()).count(), 3);
+    }
+
+    #[test]
+    fn the_mid_cut_holds_a_fraction_of_the_voxels() {
+        let skeleton = trees::grow(&trees::oak(), 11, None);
+        let near = trees::rasterise(&skeleton, DETAIL as u32).counts();
+        let mid = trees::rasterise(&skeleton, MID_DETAIL as u32).counts();
+        assert!(mid.leaf > 0, "the coarse cut lost the crown");
+        assert!(mid.leaf * 8 < near.leaf, "near {} mid {}", near.leaf, mid.leaf);
+    }
+
+    #[test]
+    fn a_tree_is_cached_once_per_band() {
+        // The cache key carries the detail, so the coarse copy of a tree never
+        // stands in for the fine one at the origin they share.
+        let mut forest = Forest::default();
+        let origin = (4, 5, 6);
+        for band in [Band::Near, Band::Mid] {
+            forest.trees.insert((origin, band.detail()), None);
+        }
+        assert_eq!(forest.trees.len(), 2);
+        forest.retire_near(&[(0, 0, 6)]);
+        assert!(forest.trees.is_empty(), "retiring a tree has to take both its cuts");
+    }
+
+    #[test]
     fn a_shade_is_interned_once_per_surface() {
-        let mut volume = Volume::new(&test_chunk(0, 0, 0), 0);
+        let mut volume = Volume::new(&test_chunk(0, 0, 0), 0, Band::Near);
         let bark = Tone { color: [0.4, 0.3, 0.2], surface: Surface::Bark };
         let leaf = Tone { surface: Surface::Broadleaf, ..bark };
         assert_eq!(volume.intern(bark), volume.intern(bark));

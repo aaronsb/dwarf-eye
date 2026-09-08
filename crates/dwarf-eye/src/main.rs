@@ -22,6 +22,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
 use bevy::camera::Exposure;
+use bevy::camera::visibility::VisibilityRange;
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::light::{
@@ -37,7 +38,10 @@ use shadow::{
 };
 use sky::Clock;
 use dwarf_eye_trees as trees;
-use dwarf_eye_world::canopy::CanopyMeshes;
+use bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport;
+use bevy::render::occlusion_culling::OcclusionCulling;
+use bevy::render::{RenderApp, RenderStartup};
+use dwarf_eye_world::canopy::{BANDS, Band, CanopyMeshes, Coat, Surface};
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
@@ -90,6 +94,7 @@ fn main() {
         .add_plugins(capture::CapturePlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
+        .init_resource::<Bands>()
         .init_resource::<ChunkEntities>()
         .init_resource::<PendingChunks>()
         .init_resource::<Status>()
@@ -102,6 +107,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                size_bands,
                 drain_worker,
                 upload_chunks,
                 handle_input,
@@ -124,7 +130,31 @@ fn main() {
                 (walk::receive, walk::walk).chain().run_if(walk::walking),
             ),
         )
+        .add_plugins(report_culling)
         .run();
+}
+
+/// Says in the log whether this device can actually do the occlusion culling
+/// the camera asks for: the two-phase pass needs GPU preprocessing with
+/// culling, and Bevy quietly ignores `OcclusionCulling` where that is missing.
+fn report_culling(app: &mut App) {
+    let Some(render) = app.get_sub_app_mut(RenderApp) else { return };
+    render.add_systems(
+        RenderStartup,
+        |support: Res<GpuPreprocessingSupport>| {
+            info!(
+                "GPU preprocessing {}; occlusion culling {}",
+                if support.is_available() { "available" } else { "unavailable" },
+                if !support.is_culling_supported() {
+                    "unsupported on this device"
+                } else if occlusion_culling() {
+                    "on"
+                } else {
+                    "off (DWARF_EYE_OCCLUSION=0)"
+                }
+            );
+        },
+    );
 }
 
 #[derive(Resource)]
@@ -151,16 +181,113 @@ impl ViewSettings {
     }
 }
 
+/// Where the near canopy band gives way to the mid one, in tiles.
+///
+/// Recomputed from the camera's lens and the window's height, since both
+/// decide how many pixels a leaf voxel covers.
+#[derive(Resource, Default)]
+struct Bands {
+    near: f32,
+}
+
+/// How much of the near band's range the crossfade takes, so one band dithers
+/// into the other rather than popping.
+const CROSSFADE: f32 = 0.15;
+
+/// Where the mid band stops: the camera's own far plane, which no chunk
+/// retention ever reaches.
+const BAND_FAR: f32 = 40000.0;
+
+/// Where one band hands over to the next, in tiles, nearest first.
+///
+/// One edge per handover, so `canopy::BANDS` and this list grow together: a
+/// coarser stage is one more edge and one more mesh, never a new shape.
+fn band_edges(near: f32) -> Vec<f32> {
+    vec![near]
+}
+
+/// One range per band, nearest first. Each band's end margin is the next one's
+/// start margin, which is what Bevy crossfades across; the last runs to the far
+/// plane.
+fn band_ranges(near: f32) -> Vec<VisibilityRange> {
+    let edges = band_edges(near);
+    let fade = |at: f32| at..at * (1.0 + CROSSFADE);
+    (0..=edges.len())
+        .map(|stage| VisibilityRange {
+            start_margin: if stage == 0 { 0.0..0.0 } else { fade(edges[stage - 1]) },
+            end_margin: match edges.get(stage) {
+                Some(&at) => fade(at),
+                None => BAND_FAR..BAND_FAR,
+            },
+            // Chunk meshes hold world-space vertices at an identity transform,
+            // so the range has to measure from the mesh's own bounds, not its
+            // origin.
+            use_aabb: true,
+        })
+        .collect()
+}
+
+/// Which band a canopy entity belongs to, by its place in `canopy::BANDS`, so a
+/// resized window can rewrite its range.
+#[derive(Component, Clone, Copy, PartialEq)]
+struct CanopyBand(usize);
+
+fn occlusion_culling() -> bool {
+    std::env::var("DWARF_EYE_OCCLUSION").map(|v| v != "0").unwrap_or(true)
+}
+
 #[derive(Resource, Default)]
 struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 
-/// What one chunk put on the GPU: its terrain, one entity per canopy material,
-/// and what they cost together.
+/// What one chunk put on the GPU: its terrain, one entity per canopy material
+/// per band, and what each band costs.
+///
+/// Only one band draws at a time — `VisibilityRange` swaps them — so the two
+/// triangle counts are alternatives, not a sum.
 struct Spawned {
     terrain: Option<Entity>,
     water: Option<Entity>,
-    canopy: [Option<Entity>; 4],
+    /// One entry per canopy band, nearest first.
+    bands: Vec<Stage>,
+    /// Terrain and water, which every band draws.
+    base: usize,
+    /// Middle of the chunk, for saying which band is drawing.
+    centre: Vec3,
+}
+
+/// One chunk's crown at one detail band: its entities and what they cost.
+struct Stage {
+    entities: [Option<Entity>; 4],
     triangles: usize,
+}
+
+impl Spawned {
+    fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        [self.terrain, self.water]
+            .into_iter()
+            .chain(self.bands.iter().flat_map(|s| s.entities))
+            .flatten()
+    }
+
+    fn held(&self) -> usize {
+        self.base + self.bands.iter().map(|s| s.triangles).sum::<usize>()
+    }
+
+    /// What this chunk draws with the camera here: one band, never two.
+    fn drawn(&self, eye: Vec3, edges: &[f32]) -> usize {
+        let away = self.centre.distance(eye);
+        let stage = edges.iter().position(|&edge| away < edge).unwrap_or(edges.len());
+        self.base + self.bands.get(stage).map(|s| s.triangles).unwrap_or(0)
+    }
+}
+
+/// What the loaded chunks draw from where the camera stands.
+///
+/// The band each chunk is in is read off its middle, which is what Bevy's own
+/// range check does with the mesh's bounds.
+fn drawn_triangles(entities: &ChunkEntities, near: f32, eye: Vec3) -> usize {
+    let edges = band_edges(near);
+    entities.0.values().map(|s| s.drawn(eye, &edges)).sum()
 }
 
 /// Meshes that have arrived from the worker and not yet reached the GPU.
@@ -168,7 +295,7 @@ struct Spawned {
 /// chunks never stalls a frame. A later mesh for the same chunk replaces an
 /// earlier one still waiting.
 #[derive(Resource, Default)]
-struct PendingChunks(HashMap<ChunkKey, (MeshData, CanopyMeshes)>);
+struct PendingChunks(HashMap<ChunkKey, (MeshData, Vec<CanopyMeshes>)>);
 
 /// Chunk meshes uploaded per frame.
 const UPLOAD_BUDGET: usize = 24;
@@ -222,17 +349,23 @@ pub struct CanopyMaterials {
     pub broadleaf: Handle<TerrainMat>,
     pub needle: Handle<TerrainMat>,
     pub streamers: Handle<TerrainMat>,
+    /// The mid band's whole crown, bark and all: the leaf shading with no
+    /// cutout, so it draws opaque, writes depth in the prepass and never
+    /// discards.
+    pub leaf: Handle<TerrainMat>,
 }
 
 impl CanopyMaterials {
-    /// In the order [`CanopyMeshes`] hands its meshes over.
-    fn each(&self) -> [Handle<TerrainMat>; 4] {
-        [
-            self.bark.clone(),
-            self.broadleaf.clone(),
-            self.needle.clone(),
-            self.streamers.clone(),
-        ]
+    /// One material per mesh, in the order [`CanopyMeshes`] hands them over,
+    /// as the band asks for them.
+    fn each(&self, band: Band) -> [Handle<TerrainMat>; 4] {
+        band.coats().map(|coat| match coat {
+            Coat::Bark | Coat::Cutout(Surface::Bark) => self.bark.clone(),
+            Coat::Cutout(Surface::Needle) => self.needle.clone(),
+            Coat::Cutout(Surface::Broadleaf) => self.broadleaf.clone(),
+            Coat::Strip => self.streamers.clone(),
+            Coat::Leaf => self.leaf.clone(),
+        })
     }
 }
 
@@ -255,7 +388,7 @@ fn setup(
     // than being painted on.
     commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::earth(256, 256))));
 
-    commands.spawn((
+    let camera = commands.spawn((
         Camera3d::default(),
         // Far enough to take in the outer terrain.
         Projection::Perspective(PerspectiveProjection { far: 40000.0, ..default() }),
@@ -283,7 +416,14 @@ fn setup(
         // The cloud volume reads scene depth to stop its march at terrain.
         DepthPrepass,
         FlyCamera::default(),
-    ));
+    )).id();
+    // Two-phase GPU occlusion culling, which rides on that depth prepass: a
+    // forest hides most of itself behind its own front row, and this drops
+    // those meshes before their vertices are transformed.
+    // DWARF_EYE_OCCLUSION=0 leaves it off, for measuring what it is worth.
+    if occlusion_culling() {
+        commands.entity(camera).insert(OcclusionCulling);
+    }
 
     commands.spawn((
         DirectionalLight {
@@ -386,11 +526,23 @@ fn setup(
     bark.base.base_color_texture = Some(bark_texture);
     bark.base.alpha_mode = AlphaMode::Opaque;
     bark.base.perceptual_roughness = 0.95;
+    // The mid band's leaves: the cutout's shading without its mask, so a crown
+    // a long way off is a solid crown rather than a masked one.
+    let mut solid_leaf = cutout(broadleaf.clone());
+    solid_leaf.base.base_color_texture = None;
+    // The cutout's own texels are a light grey, around 224 of 255, so dropping
+    // the texture would leave the mid band a shade brighter than the near one
+    // right where the two meet.
+    solid_leaf.base.base_color = Color::srgb(0.88, 0.88, 0.88);
+    solid_leaf.base.alpha_mode = AlphaMode::Opaque;
+    solid_leaf.base.double_sided = false;
+    solid_leaf.base.cull_mode = Some(bevy::render::render_resource::Face::Back);
     commands.insert_resource(CanopyMaterials {
         bark: materials.add(bark),
         broadleaf: materials.add(cutout(broadleaf)),
         needle: materials.add(cutout(needle)),
         streamers: materials.add(cutout(strip)),
+        leaf: materials.add(solid_leaf),
     });
     commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });
 
@@ -497,8 +649,8 @@ fn drain_worker(
                 mask.dirty = true;
             }
             Event::Chunks(batch) => {
-                for (key, terrain, crown) in batch {
-                    pending.0.insert(key, (terrain, crown));
+                for (key, terrain, crowns) in batch {
+                    pending.0.insert(key, (terrain, crowns));
                 }
             }
             Event::Status(text) => status.detail = text,
@@ -508,6 +660,41 @@ fn drain_worker(
             }
         }
     }
+}
+
+/// Sizes the canopy bands from the lens and the window, and rewrites the
+/// ranges already on the GPU when either changes.
+///
+/// The rule is projected size, not distance: the near band ends where a
+/// near-detail leaf voxel stops covering two pixels
+/// (`dwarf_eye_world::canopy::near_band`), so a taller window or a longer lens
+/// pushes it out. `DWARF_EYE_LOD_NEAR` overrides it, in blocks.
+fn size_bands(
+    mut bands: ResMut<Bands>,
+    windows: Query<&Window>,
+    camera: Query<&Projection, With<FlyCamera>>,
+    mut ranged: Query<(&CanopyBand, &mut VisibilityRange)>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let fov = match camera.single() {
+        Ok(Projection::Perspective(p)) => p.fov,
+        _ => PerspectiveProjection::default().fov,
+    };
+    let near = dwarf_eye_world::canopy::near_band_override(fov, window.resolution.height());
+    if (near - bands.near).abs() < 0.5 {
+        return;
+    }
+    bands.near = near;
+    let ranges = band_ranges(near);
+    for (band, mut range) in &mut ranged {
+        if let Some(wanted) = ranges.get(band.0) {
+            *range = wanted.clone();
+        }
+    }
+    info!(
+        "canopy bands: near out to {near:.0} tiles ({:.1} blocks), mid beyond",
+        near / BLOCK as f32
+    );
 }
 
 /// Moves a budget of pending meshes onto the GPU, nearest the camera first.
@@ -520,6 +707,7 @@ fn upload_chunks(
     canopy_materials: Res<CanopyMaterials>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
+    bands: Res<Bands>,
     camera: Query<&Transform, With<FlyCamera>>,
 ) {
     if pending.0.is_empty() {
@@ -537,47 +725,61 @@ fn upload_chunks(
     };
     keys.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
 
+    let ranges = band_ranges(bands.near);
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
-        let Some((mut data, crown)) = pending.0.remove(&key) else { continue };
+        let Some((mut data, crowns)) = pending.0.remove(&key) else { continue };
         // Water rides in with the terrain and splits off here: its own entity,
         // its own translucent material.
         let pool = data.take_water();
         if let Some(old) = entities.0.remove(&key) {
-            for entity in [old.terrain, old.water]
-                .into_iter()
-                .chain(old.canopy)
-                .flatten()
-            {
+            for entity in old.entities() {
                 commands.entity(entity).despawn();
             }
         }
-        if data.is_empty() && pool.is_empty() && crown.is_empty() {
+        if data.is_empty() && pool.is_empty() && crowns.iter().all(CanopyMeshes::is_empty) {
             continue;
         }
-        let triangles = data.triangle_count() + pool.triangle_count() + crown.triangle_count();
-        let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>| {
+        let base = data.triangle_count() + pool.triangle_count();
+        let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>, stage: Option<usize>| {
             (!mesh.is_empty()).then(|| {
-                commands
-                    .spawn((
-                        Mesh3d(meshes.add(to_bevy_mesh(mesh))),
-                        MeshMaterial3d(material),
-                        Transform::IDENTITY,
-                        ChunkTag(key),
-                    ))
-                    .id()
+                let mut entity = commands.spawn((
+                    Mesh3d(meshes.add(to_bevy_mesh(mesh))),
+                    MeshMaterial3d(material),
+                    Transform::IDENTITY,
+                    ChunkTag(key),
+                ));
+                // Terrain and water carry no range at all: they are drawn
+                // wherever they are retained, and the bands beyond this one are
+                // the heightfield's job, not theirs.
+                if let Some(stage) = stage {
+                    entity.insert((ranges[stage].clone(), CanopyBand(stage)));
+                }
+                entity.id()
             })
         };
-        let terrain = spawn(data, material.0.clone());
-        let water = spawn(pool, water_material.0.clone());
-        let crowns = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
-        let materials = canopy_materials.each();
-        let mut canopy = [None; 4];
-        for (slot, (mesh, material)) in crowns.into_iter().zip(materials).enumerate() {
-            canopy[slot] = spawn(mesh, material);
+        let terrain = spawn(data, material.0.clone(), None);
+        let water = spawn(pool, water_material.0.clone(), None);
+        let mut spawned_bands = Vec::with_capacity(crowns.len());
+        for (stage, crown) in crowns.into_iter().enumerate() {
+            let Some(&band) = BANDS.get(stage) else { continue };
+            let triangles = crown.triangle_count();
+            let meshes_of = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
+            let mut entities = [None; 4];
+            for (slot, (mesh, material)) in
+                meshes_of.into_iter().zip(canopy_materials.each(band)).enumerate()
+            {
+                entities[slot] = spawn(mesh, material, Some(stage));
+            }
+            spawned_bands.push(Stage { entities, triangles });
         }
-        entities.0.insert(key, Spawned { terrain, water, canopy, triangles });
+        let centre = Vec3::new(
+            (key.0 * BLOCK + BLOCK / 2) as f32,
+            key.2 as f32 * Z_SCALE,
+            (key.1 * BLOCK + BLOCK / 2) as f32,
+        );
+        entities.0.insert(key, Spawned { terrain, water, bands: spawned_bands, base, centre });
     }
-    status.triangles = entities.0.values().map(|s| s.triangles).sum();
+    status.triangles = entities.0.values().map(Spawned::held).sum();
 }
 
 /// Texels per world tile for the tree surfaces. Dwarf Fortress's art is 32 to
@@ -797,6 +999,7 @@ fn update_hud(
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
+    bands: Res<Bands>,
     rays: Res<god_rays::GodRays>,
     walk: Res<walk::WalkMode>,
     camera: Query<(&Transform, &FlyCamera)>,
@@ -815,7 +1018,7 @@ fn update_hud(
         "{}\n{}\n{}  {}\n\
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          {}\n\
-         chunks  {}   triangles {}   {:.0} fps\n\
+         chunks  {}   triangles {} of {} held   {:.0} fps\n\
          z-ceiling {ceiling}   hidden tiles {}   sky {}   light shafts {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
@@ -832,6 +1035,7 @@ fn update_hud(
         fly.speed,
         if walk.active { walk.line.as_str() } else { "fly     tab to walk with the character" },
         entities.0.len(),
+        drawn_triangles(&entities, bands.near, transform.translation),
         status.triangles,
         diagnostics
             .get(&FrameTimeDiagnosticsPlugin::FPS)
