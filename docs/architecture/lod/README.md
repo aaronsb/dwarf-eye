@@ -68,6 +68,11 @@ box against a depth pyramid before transforming its vertices
 (`main.rs:setup`). `DWARF_EYE_OCCLUSION=0` turns it off, which is how its worth
 was measured.
 
+Bevy ignores `OcclusionCulling` on a device whose GPU preprocessing cannot
+cull, and says nothing about it, so `main.rs:report_culling` reads
+`GpuPreprocessingSupport` in the render app and logs one line at startup:
+`GPU preprocessing available; occlusion culling on`.
+
 Fine terrain stays at full detail however far away, out to
 `worker.rs:RETAIN_RADIUS` 40 blocks horizontally. What remains of issue #10 is
 the terrain mid tier: a surface-only 4-tile heightfield coloured from the top
