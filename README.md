@@ -19,7 +19,12 @@ address, so a local client needs no configuration.
 Start Dwarf Fortress, load a fort or an adventurer, then:
 
 ```sh
-cargo run --release -p dwarf-eye
+make run                      # or: cargo run --release -p dwarf-eye
+make run CLOUDS=cumulus=0.6   # with a forced sky
+make lab                      # the tree generator bench, no game needed
+make shot                     # screenshot of the viewer into shots/
+make budget                   # where the triangles go
+make test                     # unit tests
 ```
 
 | Key | |
