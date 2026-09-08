@@ -5,10 +5,11 @@ use crate::factory::{self, Plan};
 use crate::mesh::MeshData;
 use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
 use crate::ramp;
+use crate::wall;
 use anyhow::Result;
 use dfhack_remote::rfr::{PlantRawList, TiletypeList, TiletypeMaterial, TiletypeShape};
 use dwarf_eye_art::atlas::{Atlas, Rect};
-use dwarf_eye_art::{Art, find_install, raws};
+use dwarf_eye_art::{Art, Sprite, find_install, raws};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -22,6 +23,18 @@ pub struct Model {
     pub mesh: Arc<MeshData>,
     /// True when the sprite was near-grey and should be multiplied by the
     /// tile's material colour.
+    pub tint: bool,
+}
+
+/// Where a wall's faces sample the atlas.
+///
+/// The top is DF's own picture of the tile for this set of neighbouring walls;
+/// the sides share one strip cut from the same sheet, because DF draws none.
+#[derive(Clone, Copy)]
+pub struct WallSkin {
+    pub top: Rect,
+    pub side: Rect,
+    /// True when the sheet is a near-grey pattern for the material to colour.
     pub tint: bool,
 }
 
@@ -253,6 +266,13 @@ pub struct TileLibrary {
     /// Species index -> the tones its leaves and its wood are painted in.
     leaf_tones: HashMap<i32, Vec<[u8; 3]>>,
     bark_tones: HashMap<i32, Vec<[u8; 3]>>,
+    /// Tiletype -> which of DF's wall sheets it draws from.
+    walls: HashMap<i32, &'static str>,
+    /// (wall family, neighbour mask) -> the top face for that set.
+    wall_top: HashMap<(&'static str, u8), Rect>,
+    /// Wall family -> the strip its four sides share, and whether the sheet is
+    /// a pattern the material colours.
+    wall_side: HashMap<&'static str, (Rect, bool)>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
@@ -275,6 +295,7 @@ impl TileLibrary {
 
         let mut tiles = HashMap::new();
         let mut built = HashSet::new();
+        let mut walls = HashMap::new();
         for t in &tiletypes.tiletype_list {
             let name = t.name();
             let entity = factory::Tile {
@@ -286,6 +307,14 @@ impl TileLibrary {
             };
             if factory::built(factory::classify(entity, factory::Near::default())) {
                 built.insert(t.id);
+            }
+            // A wall is a cube the mesher draws itself, not a model: DF's wall
+            // sheets are pictures of a tile seen from above, and voxelising one
+            // would throw away what makes it worth having.
+            if matches!(t.shape(), TiletypeShape::Wall | TiletypeShape::Fortification) {
+                if let Some(family) = wall::family_for(t.material(), t.special(), name) {
+                    walls.insert(t.id, family);
+                }
             }
             let Some(mode) = mode_for(t.shape(), name) else { continue };
             let generic = matches!(mode, RenderMode::Billboard);
@@ -357,6 +386,9 @@ impl TileLibrary {
             leaf_uv: HashMap::new(),
             leaf_tones: HashMap::new(),
             bark_tones: HashMap::new(),
+            walls,
+            wall_top: HashMap::new(),
+            wall_side: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
             built,
@@ -365,6 +397,7 @@ impl TileLibrary {
         library.pack_ground();
         library.pack_under();
         library.pack_ramps();
+        library.pack_walls();
         Ok(library)
     }
 
@@ -566,6 +599,94 @@ impl TileLibrary {
                 }
             }
         }
+    }
+
+    /// One wall sprite, taking the first spelling the sheet answers to.
+    fn wall_sprite(&mut self, family: &str, mask: u8) -> Option<Sprite> {
+        wall::sprite_names(family, mask).into_iter().find_map(|name| {
+            // The raws parser eats a trailing direction group, so a lookup has
+            // to be spelled the way the index was filled.
+            let key = raws::parse_part(&name);
+            self.art.tree_sprite("", &key.family, key.dirs).cloned()
+        })
+    }
+
+    /// Packs DF's wall sheets: one top face per neighbour set, one side strip.
+    ///
+    /// Sixteen cells per family, and the families are knowable from the
+    /// tiletype list, so the whole set is finished before the first frame like
+    /// the ground and the ramps are.
+    fn pack_walls(&mut self) {
+        let wanted: Vec<&'static str> = {
+            let mut v: Vec<_> = self.walls.values().copied().collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        for family in wanted {
+            // The fully connected sprite is the only one that covers the tile,
+            // so it is both the backdrop the others are drawn over and the
+            // stock the side strip is cut from.
+            let Some(base) = self.wall_sprite(family, wall::ALL) else {
+                self.misses.insert(family.to_string());
+                continue;
+            };
+            let pattern = base.saturation() < PATTERN_SATURATION;
+            let backdrop = wall::backdrop(&base);
+            // DF leaves the middle of an enclosed wall dark, which reads as a
+            // hole once the tile has a top face to stand on.
+            let solid = wall::fill_hole(&base);
+
+            let strip = wall::side_strip(&base, backdrop);
+            if let Some(rect) = self.atlas.insert(atlas_key(family, 0, "SIDE"), &strip, None) {
+                self.wall_side.insert(family, (rect, pattern));
+            }
+
+            for mask in wall::masks() {
+                let Some(sprite) = self.wall_sprite(family, mask) else {
+                    self.misses.insert(wall::sprite_names(family, mask)[1].clone());
+                    continue;
+                };
+                let top = wall::opaque(&wall::over(&sprite, &solid), backdrop);
+                if let Some(rect) = self.atlas.insert(atlas_key(family, mask, "TOP"), &top, None) {
+                    self.wall_top.insert((family, mask), rect);
+                }
+            }
+        }
+    }
+
+    /// Whether a tiletype draws from one of DF's wall sheets.
+    pub fn is_wall(&self, tile: i32) -> bool {
+        self.walls.contains_key(&tile)
+    }
+
+    /// Where a wall's faces sample the atlas, for a set of neighbouring walls.
+    pub fn wall_skin(&self, tile: i32, mask: u8) -> Option<WallSkin> {
+        let family = *self.walls.get(&tile)?;
+        let (side, tint) = *self.wall_side.get(family)?;
+        let top = *self.wall_top.get(&(family, wall::variant(mask)))?;
+        Some(WallSkin { top, side, tint })
+    }
+
+    /// How many atlas cells the wall sheets took.
+    pub fn wall_cells(&self) -> usize {
+        self.wall_top.len() + self.wall_side.len()
+    }
+
+    /// Per-family wall packing result: family, whether it is tinted by the
+    /// tile's material, and how many of its sixteen cells landed.
+    pub fn wall_report(&self) -> Vec<(&'static str, bool, usize)> {
+        let mut rows: Vec<_> = self
+            .wall_side
+            .iter()
+            .map(|(family, (_, tint))| {
+                let cells = 1 + self.wall_top.keys().filter(|(f, _)| f == family).count();
+                (*family, *tint, cells)
+            })
+            .collect();
+        rows.sort();
+        rows
     }
 
     /// The packed ground texture, for the renderer to upload.

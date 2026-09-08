@@ -40,6 +40,7 @@ every run).
 | [atlas.md](atlas.md) | packing, padding, mipmaps, texel density |
 | [canopy.md](canopy.md) | procedural leaf, bark and streamer surfaces in world space |
 | [ramps.md](ramps.md) | DF's ramp sheets and how a slope wears one |
+| [walls.md](walls.md) | the environment wall sheets, the neighbour variants, and the derived side face |
 
 ## Invariants and gotchas
 
@@ -58,6 +59,9 @@ every run).
 - A sprite below `library.rs:PATTERN_SATURATION` 0.22 is a pattern to tint with
   the tile's material colour; above it, the sprite carries its own colour
   (`dwarf-eye-art:Sprite::saturation`).
+- Ground sprites are flattened by cutting alpha at half opacity; wall sprites
+  are blended, because DF's wall art is a four-level dither and the alpha
+  channel carries as much of the rock as the colour does ([walls.md](walls.md)).
 - No DF install means no sprites, not a failure: the worker reports it and the
   map draws as plain blocks (`worker.rs:run`).
 - `cargo run --release -p dwarf-eye-world --example coverage` reports which
@@ -65,5 +69,5 @@ every run).
 
 ## Related issues
 
-#13 (wall textures from the environment sheets), #3 (ramp sheets and skirts),
-#7 (ground cover).
+#3 (ramp sheets and skirts), #7 (ground cover), #26 (a texture library of our
+own on the same grey-base-plus-tint rule), #13 (closed, walls).

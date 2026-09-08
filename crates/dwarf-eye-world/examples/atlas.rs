@@ -12,7 +12,16 @@ fn main() -> Result<()> {
     let lib = TileLibrary::load(&tiletypes, &plants)?;
     let atlas = lib.atlas();
 
-    println!("atlas {}x{}, {} cells used", atlas.width, atlas.height, atlas.capacity_used());
+    println!(
+        "atlas {}x{}, {} cells used, {} of them walls",
+        atlas.width,
+        atlas.height,
+        atlas.capacity_used(),
+        lib.wall_cells()
+    );
+    for (family, tint, cells) in lib.wall_report() {
+        println!("  {family:<22} {cells:>2} cells {}", if tint { "tinted" } else { "own colour" });
+    }
     let path = std::env::args().nth(1).unwrap_or_else(|| "atlas.png".into());
     image::save_buffer(
         &path,

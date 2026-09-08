@@ -12,6 +12,7 @@ pub mod palette;
 pub mod ramp;
 pub mod session;
 pub mod tree;
+pub mod wall;
 pub mod water;
 pub mod skeleton;
 pub mod world;

@@ -38,7 +38,7 @@ a brightness wobble so a hillside of one material is not a painted plane
 
 | `Solid` | Geometry |
 |---|---|
-| `Cube`, `Fortification` | full cuboid, faces culled by `occluded` |
+| `Cube`, `Fortification` | full cuboid, faces culled by `occluded`; a wall samples the atlas, the neighbour variant on its lid and a derived face on its sides (`MeshData::textured_cuboid`), anything else keeps its vertex colour |
 | `Floor` | slab `FLOOR_HEIGHT` 0.12 thick, rim faces only at a drop |
 | `Ramp` | wedge from the ramp sheet, or a half-height block with no sprite |
 | `Stair` | two stacked boxes |
@@ -60,13 +60,13 @@ a brightness wobble so a hillside of one material is not a painted plane
 - A trunk with more trunk above it drops its top cap (`model.rs:Caps`). This is
   what keeps a forest affordable.
 - Terrain ramps carry no direction, so the high side comes from whichever of
-  `ramp.rs:NEIGHBOURS` is a wall.
+  `ramp.rs:NEIGHBOURS` is a wall. A wall's own sprite is picked the same way,
+  from `wall.rs:NEIGHBOURS`, rather than from DF's `Tiletype::direction`
+  ([../textures/walls.md](../textures/walls.md)).
 - Magma still draws as an opaque box with vertex alpha the material ignores.
   Greedy-merging terrain cubes is the rest of issue #16; the merge already
   exists for crowns in `canopy.rs:emit` and in `dwarf-eye-trees::mesh`.
 - Natural ground is stepped terraces, not a heightfield. Issue #6.
-- Walls draw flat-coloured. `SoilWall` alone was 73,666 tiles in one view, which
-  is issue #13.
 
 ## Water
 
@@ -94,5 +94,5 @@ with depth, so a shore is nearly clear and open water is not.
 ## Related issues
 
 #5 (registry lookups in place of the scattered checks), #6 (smoothed
-heightfield), #13 (wall textures), #16 (magma transparency and greedy meshing),
-#10 (mid LOD), #29 (closed, this water).
+heightfield), #16 (magma transparency and greedy meshing), #10 (mid LOD),
+#29 (closed, this water), #13 (closed, textured walls).
