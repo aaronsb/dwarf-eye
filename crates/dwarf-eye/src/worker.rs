@@ -9,7 +9,7 @@ use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::canopy::{CanopyMeshes, Forest};
-use dwarf_eye_world::{BlockBounds, MeshData, MeshOptions, Session, build_chunk};
+use dwarf_eye_world::{BLOCK, BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -316,7 +316,19 @@ fn collect(
 
     // Chunks stay as the character travels, so the map paints in. Only what
     // is far behind the camera is retired.
-    let keep = BlockBounds::under_ceiling(center.0, center.1, center.2, RETAIN_RADIUS, RETAIN_DEPTH);
+    // Retire only what is far away horizontally. Never clip vertically: the
+    // camera's height is not a reason to lose the crowns above it, and a
+    // dropped chunk does not come back, since DFHack's unforced pass sends
+    // only blocks that changed on its side.
+    let (bx, by) = (center.0.div_euclid(BLOCK), center.1.div_euclid(BLOCK));
+    let keep = BlockBounds {
+        min_x: bx - RETAIN_RADIUS,
+        max_x: bx + RETAIN_RADIUS + 1,
+        min_y: by - RETAIN_RADIUS,
+        max_y: by + RETAIN_RADIUS + 1,
+        min_z: i32::MIN / 2,
+        max_z: i32::MAX / 2,
+    };
     let dropped = df.world.retain_within(keep);
     if !dropped.is_empty() {
         events.send(Event::Chunks(
@@ -383,7 +395,6 @@ fn grounded_blocks(world: &dwarf_eye_world::World) -> Vec<(i32, i32)> {
 /// How far from the camera chunks are kept, in blocks and levels. Wide, so a
 /// walk leaves the land behind it standing.
 const RETAIN_RADIUS: i32 = 40;
-const RETAIN_DEPTH: i32 = 120;
 
 /// Remeshes the chunks that arrived and every loaded neighbour of theirs.
 fn remesh_touched(
