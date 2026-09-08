@@ -436,14 +436,26 @@ impl TileLibrary {
             v.dedup();
             v
         };
+
         for family in wanted {
+            // A ramp follows the colour rule of the ground it runs into. DF's
+            // grass ramps are already green; its stone ramps are a pattern
+            // shaded in a blue nobody's granite is.
+            let tinted = self.tiles.values().any(|t| {
+                t.ramp == Some(family)
+                    && t.beneath
+                        .and_then(|g| self.under_uv.get(g))
+                        .is_some_and(|(_, pattern)| *pattern)
+            });
+
             for name in ramp::sprite_names(family) {
                 let key = raws::parse_part(&name);
                 let Some(sprite) = self.art.tree_sprite("", &key.family, key.dirs).cloned() else {
                     self.misses.insert(name);
                     continue;
                 };
-                let pattern = sprite.saturation() < PATTERN_SATURATION;
+                let sprite = if tinted { ramp::neutralise(&sprite) } else { sprite };
+                let pattern = tinted || sprite.saturation() < PATTERN_SATURATION;
                 let backdrop = sprite_mean(&sprite);
                 if let Some(rect) = self.atlas.insert(atlas_key(&name, 0, ""), &sprite, backdrop) {
                     self.ramp_uv.insert(name, (rect, pattern));

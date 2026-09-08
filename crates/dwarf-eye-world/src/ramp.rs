@@ -17,6 +17,7 @@
 
 use crate::mesh::{MeshData, Z_SCALE};
 use dfhack_remote::rfr::TiletypeMaterial;
+use dwarf_eye_art::Sprite;
 use dwarf_eye_art::atlas::Rect;
 
 /// Neighbour bits, clockwise from north. North is -y in DF, -z in world space.
@@ -156,6 +157,26 @@ pub fn family_for(material: TiletypeMaterial) -> &'static str {
     }
 }
 
+/// Turns a ramp sprite into a shading pattern for the tile's own material.
+///
+/// DF paints a stone slope's shadow in a deep blue that reads as water on a
+/// sunlit hillside, and paints every stone the same. Where the ground beside
+/// the ramp is a pattern the material colours, the ramp becomes one too: its
+/// shading survives as brightness, its hue does not. The strongest channel
+/// stands in for that brightness, so a shadow that was darkened by hue-shifting
+/// does not collapse to black.
+pub fn neutralise(sprite: &Sprite) -> Sprite {
+    let pixels = sprite
+        .pixels
+        .iter()
+        .map(|p| {
+            let value = p[0].max(p[1]).max(p[2]);
+            [value, value, value, p[3]]
+        })
+        .collect();
+    Sprite { width: sprite.width, height: sprite.height, pixels }
+}
+
 fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
     [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
 }
@@ -234,7 +255,8 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
     }
 
     // Skirts, walked so each side's points run counter-clockwise seen from
-    // outside the tile.
+    // outside the tile. Each column repeats the texel above it, so the face
+    // reads as the same ground rather than as a white wall.
     let side = shade(white, 0.72);
     let sides: [(u8, [(usize, usize); 3], [f32; 3]); 4] = [
         (N, [(0, 0), (0, 1), (0, 2)], [0.0, 0.0, -1.0]),
@@ -248,12 +270,13 @@ pub fn build_ramp(uv: Rect, mask: u8, floor: f32) -> MeshData {
             continue;
         }
         for pair in points.windows(2) {
-            let (a, _) = vertex(pair[0].0, pair[0].1);
-            let (b, _) = vertex(pair[1].0, pair[1].1);
-            mesh.push_quad(
+            let (a, uv_a) = vertex(pair[0].0, pair[0].1);
+            let (b, uv_b) = vertex(pair[1].0, pair[1].1);
+            mesh.push_textured_quad(
                 [[a[0], 0.0, a[2]], a, b, [b[0], 0.0, b[2]]],
                 normal,
                 side,
+                [uv_a, uv_a, uv_b, uv_b],
             );
         }
     }
