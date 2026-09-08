@@ -408,6 +408,21 @@ fn collect(
         ))?;
     }
 
+    // A column reopening is rare and worth saying out loud: it is ground the
+    // viewer had written off coming back.
+    for &((bx, by), z) in &df.last_pass.reopened {
+        bevy::log::info!("floors: column {bx},{by} reopened, ground seen at level {z}");
+    }
+    if df.last_pass.probe_requests > 0 {
+        bevy::log::info!(
+            "floors: probed {} blocks under {} floors in {} requests; kept {:?}",
+            df.last_pass.probed,
+            df.last_pass.floors,
+            df.last_pass.probe_requests,
+            df.last_pass.probe_kept,
+        );
+    }
+
     if !arrived.is_empty() || !dropped.is_empty() {
         events.send(Event::Coverage(grounded_blocks(&df.world)))?;
     }
