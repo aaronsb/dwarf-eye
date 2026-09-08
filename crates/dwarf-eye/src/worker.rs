@@ -142,12 +142,16 @@ fn run(
     bevy::log::info!("startup: sprite library ready at {:.1}s", started.elapsed().as_secs_f32());
 
     // Land from earlier sessions comes back before the first fetch.
+    let (cached_files, cached_bytes) = df.cache_size();
     let restored = df.restore_cache();
     bevy::log::info!(
-        "{} chunks restored from {} (at {:.1}s)",
+        "{} chunks restored from {} (at {:.1}s); cache held {cached_files} chunks, {} MB, \
+         {} column floors known",
         restored.len(),
         df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default(),
-        started.elapsed().as_secs_f32()
+        started.elapsed().as_secs_f32(),
+        cached_bytes / 1_000_000,
+        df.floor_count(),
     );
     if !restored.is_empty() {
         events.send(Event::Coverage(grounded_blocks(&df.world)))?;
@@ -156,16 +160,24 @@ fn run(
             restored.len(),
             df.cache_dir().map(|p| p.display().to_string()).unwrap_or_default()
         )))?;
-        remesh_all(
+        let cost = remesh_all(
             &df,
             library.as_mut(),
             &mut forest,
             MeshOptions { z_ceiling: i32::MAX, show_hidden: true },
             events,
         )?;
+        bevy::log::info!(
+            "startup: restored chunks meshed at {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
+        log_depths("restored", &depth_histogram(&df.world, &cost));
+    } else {
+        bevy::log::info!(
+            "startup: restored chunks meshed at {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
     }
-
-    bevy::log::info!("startup: restored chunks meshed at {:.1}s", started.elapsed().as_secs_f32());
     bevy::log::info!("startup: {}", dwarf_eye_world::canopy::timing::report());
     let mut first_pass = true;
 
@@ -183,7 +195,7 @@ fn run(
         match command {
             Command::Shutdown => return Ok(()),
             Command::Remesh { opts } => {
-                remesh_all(&df, library.as_mut(), &mut forest, opts, events)?
+                remesh_all(&df, library.as_mut(), &mut forest, opts, events)?;
             }
             Command::Run { command, args } => {
                 let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -224,12 +236,16 @@ fn run(
                 let pass_started = std::time::Instant::now();
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
-                if let Err(err) = collect(
+                let cost = match collect(
                     &mut df, center, opts, force, &mut last_window, &mut horizon_sent,
                     library.as_mut(), &mut forest, events,
                 ) {
-                    events.send(Event::Status(format!("waiting for the map: {err:#}")))?;
-                }
+                    Ok(cost) => cost,
+                    Err(err) => {
+                        events.send(Event::Status(format!("waiting for the map: {err:#}")))?;
+                        Default::default()
+                    }
+                };
                 if first_pass {
                     first_pass = false;
                     bevy::log::info!(
@@ -238,9 +254,22 @@ fn run(
                         started.elapsed().as_secs_f32()
                     );
                     bevy::log::info!(
+                        "startup: pass asked for {} blocks of a {}-block box, {} came back; \
+                         {} column floors stood at the start of it, {} after, sitting {} to {} \
+                         levels under the character",
+                        df.last_pass.asked,
+                        df.last_pass.whole_box,
+                        df.last_pass.arrived,
+                        df.last_pass.floors,
+                        df.floor_count(),
+                        df.floor_depths().0,
+                        df.floor_depths().1,
+                    );
+                    bevy::log::info!(
                         "startup: {}",
                         dwarf_eye_world::canopy::timing::report()
                     );
+                    log_depths("loaded", &depth_histogram(&df.world, &cost));
                 }
             }
         }
@@ -338,11 +367,12 @@ fn collect(
     mut library: Option<&mut TileLibrary>,
     forest: &mut Forest,
     events: &Sender<Event>,
-) -> Result<()> {
+) -> Result<std::collections::HashMap<ChunkKey, usize>> {
     // The game's window follows the character; a move changes what every
     // local coordinate means, so the next request must be a full one.
     let window_moved = df.refresh_window()?;
     let view = df.view_center()?;
+    df.watch_from(view);
     let bounds = df.window_bounds(view.2 - COLLECT_BELOW, view.2 + COLLECT_ABOVE);
     let window = (
         bounds.min_x, bounds.max_x, bounds.min_y,
@@ -381,6 +411,7 @@ fn collect(
     if !arrived.is_empty() || !dropped.is_empty() {
         events.send(Event::Coverage(grounded_blocks(&df.world)))?;
     }
+    let mut cost = std::collections::HashMap::new();
     if !arrived.is_empty() {
         df.persist(&arrived);
         events.send(Event::Status(format!(
@@ -393,7 +424,7 @@ fn collect(
         // A block that has just arrived can lengthen a tree whose top we could
         // not see, so those trees are grown again rather than reused.
         forest.retire_near(&arrived);
-        remesh_touched(df, library.as_deref_mut(), forest, opts, events, &arrived)?;
+        cost = remesh_touched(df, library.as_deref_mut(), forest, opts, events, &arrived)?;
     }
 
     // The outer terrain needs the map's own surface to meet it, so it waits
@@ -405,7 +436,72 @@ fn collect(
             Err(e) => events.send(Event::Status(format!("no horizon: {e:#}")))?,
         }
     }
-    Ok(())
+    Ok(cost)
+}
+
+/// What the loaded map holds at one level under its column's surface.
+#[derive(Default, Clone, Copy)]
+struct Depth {
+    blocks: usize,
+    solid: usize,
+    hidden: usize,
+    triangles: usize,
+}
+
+/// The loaded map by depth under its own surface, deepest row last.
+///
+/// A column's surface is the highest level in it holding anything solid.
+/// Everything under that is what a fixed fetch depth pays for — fetched,
+/// cached, meshed — so the histogram is here to make the bill legible.
+fn depth_histogram(
+    world: &dwarf_eye_world::World,
+    triangles: &std::collections::HashMap<ChunkKey, usize>,
+) -> Vec<(i32, Depth)> {
+    let mut surface: std::collections::HashMap<(i32, i32), i32> = std::collections::HashMap::new();
+    for chunk in world.chunks() {
+        if chunk.voxels.iter().any(|v| !v.solid.is_empty()) {
+            let top = surface.entry((chunk.block_x, chunk.block_y)).or_insert(chunk.z);
+            *top = (*top).max(chunk.z);
+        }
+    }
+
+    let mut rows: std::collections::BTreeMap<i32, Depth> = std::collections::BTreeMap::new();
+    for chunk in world.chunks() {
+        let Some(&top) = surface.get(&(chunk.block_x, chunk.block_y)) else { continue };
+        let row = rows.entry(chunk.z - top).or_default();
+        row.blocks += 1;
+        row.solid += chunk.voxels.iter().filter(|v| !v.solid.is_empty()).count();
+        row.hidden += chunk.voxels.iter().filter(|v| v.hidden).count();
+        row.triangles +=
+            triangles.get(&(chunk.block_x, chunk.block_y, chunk.z)).copied().unwrap_or(0);
+    }
+    rows.into_iter().rev().collect()
+}
+
+/// Prints the histogram, shallowest first, with the deep tail summed.
+fn log_depths(what: &str, rows: &[(i32, Depth)]) {
+    const SHOWN: usize = 12;
+    let line = |depth: &str, d: Depth| {
+        bevy::log::info!(
+            "startup: {what} {depth}: {} blocks, {} solid, {} hidden, {} triangles",
+            d.blocks,
+            d.solid,
+            d.hidden,
+            d.triangles
+        );
+    };
+    for &(z, d) in rows.iter().take(SHOWN) {
+        line(&format!("{z:+}"), d);
+    }
+    if rows.len() > SHOWN {
+        let rest = rows[SHOWN..].iter().fold(Depth::default(), |a, (_, d)| Depth {
+            blocks: a.blocks + d.blocks,
+            solid: a.solid + d.solid,
+            hidden: a.hidden + d.hidden,
+            triangles: a.triangles + d.triangles,
+        });
+        line(&format!("{}..{}", rows[SHOWN].0, rows.last().map(|r| r.0).unwrap_or(0)), rest);
+    }
 }
 
 /// Blocks whose lowest loaded chunk is mostly solid: the fine data there
@@ -443,8 +539,9 @@ fn remesh_touched(
     opts: MeshOptions,
     events: &Sender<Event>,
     arrived: &[(i32, i32, i32)],
-) -> Result<()> {
+) -> Result<std::collections::HashMap<ChunkKey, usize>> {
     const BATCH: usize = 48;
+    let mut cost = std::collections::HashMap::new();
     let mut keys: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
     for &(x, y, z) in arrived {
         for (dx, dy, dz) in [(0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
@@ -459,6 +556,7 @@ fn remesh_touched(
             Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib, df.origin()),
             None => CanopyMeshes::default(),
         };
+        cost.insert(key, mesh.triangle_count() + crown.triangle_count());
         batch.push((key, mesh, crown));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
@@ -468,18 +566,20 @@ fn remesh_touched(
     if !batch.is_empty() {
         events.send(Event::Chunks(batch))?;
     }
-    Ok(())
+    Ok(cost)
 }
 
+/// Meshes every loaded chunk, returning what each cost in triangles.
 fn remesh_all(
     df: &Session,
     mut library: Option<&mut TileLibrary>,
     forest: &mut Forest,
     opts: MeshOptions,
     events: &Sender<Event>,
-) -> Result<()> {
+) -> Result<std::collections::HashMap<ChunkKey, usize>> {
     const BATCH: usize = 48;
     let mut batch = Vec::with_capacity(BATCH);
+    let mut cost = std::collections::HashMap::new();
 
     for chunk in df.world.chunks() {
         let key = (chunk.block_x, chunk.block_y, chunk.z);
@@ -488,6 +588,7 @@ fn remesh_all(
             Some(lib) => forest.build_chunk(&df.world, chunk, opts, lib, df.origin()),
             None => CanopyMeshes::default(),
         };
+        cost.insert(key, mesh.triangle_count() + crown.triangle_count());
         batch.push((key, mesh, crown));
         if batch.len() == BATCH {
             events.send(Event::Chunks(std::mem::take(&mut batch)))?;
@@ -497,5 +598,5 @@ fn remesh_all(
     if !batch.is_empty() {
         events.send(Event::Chunks(batch))?;
     }
-    Ok(())
+    Ok(cost)
 }

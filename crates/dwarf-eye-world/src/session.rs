@@ -9,13 +9,29 @@
 
 use crate::cache::Cache;
 use crate::palette::Palette;
-use crate::world::{BLOCK, BlockBounds, World};
+use crate::world::{BLOCK, BlockBounds, TILES_PER_BLOCK, World};
 use anyhow::Result;
 use dfhack_remote::{Client, methods, rfr};
+use std::collections::HashMap;
 
 /// Tiles per unit of `MapInfo::block_pos`: DF positions the window in
 /// 48-tile region tiles.
 pub const REGION_TILE: i32 = 48;
+
+/// How far under a column's floor blocks are still asked for. One level, so
+/// the block that proved the floor has a neighbour beneath it to cull against.
+const UNDER_FLOOR: i32 = 1;
+
+/// What one collection pass cost, and what it would have cost asking for the
+/// whole box the way a fixed depth does.
+#[derive(Default, Clone, Copy)]
+pub struct Pass {
+    pub asked: i32,
+    pub whole_box: i32,
+    pub arrived: usize,
+    /// Column floors still standing when the pass began.
+    pub floors: usize,
+}
 
 pub struct Session {
     pub client: Client,
@@ -26,6 +42,19 @@ pub struct Session {
     origin: (i32, i32, i32),
     /// Chunks from earlier sessions, and where new ones are written.
     cache: Option<Cache>,
+    /// Where each block column turns to unrevealed rock: the highest level
+    /// whose whole block came back hidden. Absolute block column and level.
+    ///
+    /// Dwarf Fortress hands out the rock under a map whether or not anyone has
+    /// seen it, and a window is 81 columns wide, so asking for a fixed depth
+    /// under the character fetched, cached and meshed thousands of blocks of
+    /// solid dark. A column is asked about top down and stops here instead.
+    floors: HashMap<(i32, i32), i32>,
+    /// Where the character is, in render tiles and level, so a column they
+    /// descend into is probed afresh.
+    viewer: (i32, i32, i32),
+    /// What the last pass cost.
+    pub last_pass: Pass,
 }
 
 /// Absolute position of a window's corner: tiles in x/y, z-level in z.
@@ -44,7 +73,37 @@ impl Session {
         let world = World::new(Palette::new(tiletypes, materials));
         let origin = window_origin(&map_info);
         let cache = Cache::open(map_info.world_name_english(), map_info.save_name()).ok();
-        Ok(Self { client, world, map_info, version, origin, cache })
+        let floors = cache.as_ref().map(Cache::load_floors).unwrap_or_default();
+        Ok(Self {
+            client,
+            world,
+            map_info,
+            version,
+            origin,
+            cache,
+            floors,
+            viewer: (0, 0, 0),
+            last_pass: Pass::default(),
+        })
+    }
+
+    /// Tells the session where the character is, in render tiles and level, so
+    /// a column they have gone down into is asked about again.
+    pub fn watch_from(&mut self, at: (i32, i32, i32)) {
+        self.viewer = at;
+    }
+
+    /// How many columns have a known floor.
+    pub fn floor_count(&self) -> usize {
+        self.floors.len()
+    }
+
+    /// The shallowest and deepest known floor, in levels under the character.
+    pub fn floor_depths(&self) -> (i32, i32) {
+        let here = self.viewer.2 + self.origin.2;
+        self.floors.values().fold((0, 0), |(lo, hi), &floor| {
+            ((lo).min(floor - here), (hi).max(floor - here))
+        })
     }
 
     /// Absolute key of a render-space chunk key.
@@ -67,6 +126,11 @@ impl Session {
     /// ground under it, from a fetch that did not reach down far enough. Those
     /// are left out and their files removed, so they are fetched afresh when
     /// the window returns.
+    ///
+    /// Chunks below a column's floor are dropped as well. They are unrevealed
+    /// rock, cached by an earlier build that asked for a fixed depth, and they
+    /// cost the whole of a restore: fetched, stored, restored and meshed for
+    /// something nobody has seen.
     pub fn restore_cache(&mut self) -> Vec<(i32, i32, i32)> {
         let Some(cache) = &self.cache else { return Vec::new() };
         let Ok(mut entries) = cache.load_all() else { return Vec::new() };
@@ -88,6 +152,14 @@ impl Session {
                 cache.remove(absolute);
                 continue;
             }
+            // Wholly unrevealed rock, cached by a build that asked for a fixed
+            // depth under the character. The test is the chunk's own tiles
+            // rather than the floor file, so nothing anyone has actually seen
+            // can be thrown away by a stale sidecar.
+            if voxels.len() == TILES_PER_BLOCK && voxels.iter().all(|v| v.hidden) {
+                cache.remove(absolute);
+                continue;
+            }
             let key = self.relative(absolute);
             if self.world.restore(key, voxels) {
                 keys.push(key);
@@ -100,10 +172,21 @@ impl Session {
     pub fn persist(&self, keys: &[(i32, i32, i32)]) {
         let Some(cache) = &self.cache else { return };
         for &key in keys {
-            if let Some(chunk) = self.world.chunk(key.0, key.1, key.2) {
-                let _ = cache.store(self.absolute(key), chunk);
+            let Some(chunk) = self.world.chunk(key.0, key.1, key.2) else { continue };
+            // A block nobody has seen into is not land worth keeping: it is
+            // the same rock every world has under it, and it is what let the
+            // cache grow to thirty times the size of the map anyone has walked.
+            if chunk.voxels.len() == TILES_PER_BLOCK && chunk.voxels.iter().all(|v| v.hidden) {
+                continue;
             }
+            let _ = cache.store(self.absolute(key), chunk);
         }
+        cache.store_floors(&self.floors);
+    }
+
+    /// How many chunk files the cache holds, and what they weigh.
+    pub fn cache_size(&self) -> (usize, u64) {
+        self.cache.as_ref().map(Cache::size).unwrap_or((0, 0))
     }
 
     /// Re-reads where the window sits. True when it has moved since the last
@@ -159,6 +242,12 @@ impl Session {
     ///
     /// With `force` unset the server sends only blocks that changed since the
     /// last request on this connection.
+    ///
+    /// Slabs descend rather than rise, and a column drops out of the request
+    /// as soon as a block of it comes back wholly hidden: that is the floor of
+    /// what anyone has seen, and everything under it is rock the game would
+    /// hand over and the renderer would then have to carry. A forced pass, or
+    /// the character going down into a column, opens it again.
     pub fn fetch(&mut self, bounds: BlockBounds, force: bool) -> Result<Vec<(i32, i32, i32)>> {
         let (sx, sy, sz) = self.shift();
         let shift_blocks = (sx.div_euclid(BLOCK), sy.div_euclid(BLOCK), sz);
@@ -173,31 +262,135 @@ impl Session {
         if local.min_x >= local.max_x || local.min_y >= local.max_y || local.min_z >= local.max_z {
             return Ok(Vec::new());
         }
+        // A column the character has walked down into is one whose floor was
+        // only ever the limit of what they had seen from above.
+        //
+        // A forced pass does not throw the floors away, or every step the
+        // character takes would pay for the descent again. It re-reads them
+        // instead: the block that proved a floor comes back with everything
+        // else, and if it has been revealed since, the column reopens.
+        // Only where the character is: a floor high on a hillside is over
+        // their head and means nothing, and standing on the ground already
+        // puts them a level or two over the rock nobody has seen into. What
+        // counts is going down into the unseen part of the column they are in.
+        let here = (
+            self.viewer.0.div_euclid(BLOCK) + self.origin.0 / BLOCK,
+            self.viewer.1.div_euclid(BLOCK) + self.origin.1 / BLOCK,
+            self.viewer.2 + self.origin.2,
+        );
+        self.floors.retain(|&(bx, by), &mut floor| {
+            (bx - here.0).abs() > 1 || (by - here.1).abs() > 1 || here.2 > floor
+        });
+        let kept = self.floors.len();
 
         // DFHack refuses any reply over 64 MiB with a link failure, and a
-        // busy block can run tens of kilobytes, so requests go up in slabs.
+        // busy block can run tens of kilobytes, so requests go down in slabs.
         const MAX_BLOCKS_PER_REQUEST: i32 = 500;
-        let footprint = (local.max_x - local.min_x) * (local.max_y - local.min_y);
-        let levels_per_slab = (MAX_BLOCKS_PER_REQUEST / footprint.max(1)).max(1);
-
         let mut arrived = Vec::new();
-        let mut z = local.min_z;
-        while z < local.max_z {
-            let top = (z + levels_per_slab).min(local.max_z);
+        let mut asked = 0;
+        let mut top = local.max_z;
+        while top > local.min_z {
+            // Only the columns that still have something to show, and only as
+            // wide a box as they need. A request is a box, so a column deeper
+            // than its neighbours drags them down with it; the box narrowing
+            // as the slabs descend is what keeps that cheap.
+            let Some(wide) = self.open_box(&local, top - 1, shift_blocks) else { break };
+            let footprint = (wide.max_x - wide.min_x) * (wide.max_y - wide.min_y);
+            let levels = (MAX_BLOCKS_PER_REQUEST / footprint.max(1)).max(1);
+            let bottom = (top - levels).max(local.min_z);
             let request = rfr::BlockRequest {
-                blocks_needed: Some(footprint * (top - z)),
-                min_x: Some(local.min_x),
-                max_x: Some(local.max_x),
-                min_y: Some(local.min_y),
-                max_y: Some(local.max_y),
-                min_z: Some(z),
+                blocks_needed: Some(footprint * (top - bottom)),
+                min_x: Some(wide.min_x),
+                max_x: Some(wide.max_x),
+                min_y: Some(wide.min_y),
+                max_y: Some(wide.max_y),
+                min_z: Some(bottom),
                 max_z: Some(top),
                 force_reload: Some(force),
             };
+            asked += footprint * (top - bottom);
             let list: rfr::BlockList = self.client.call(methods::GET_BLOCK_LIST, &request)?;
-            arrived.extend(self.world.absorb(list, shift_blocks));
-            z = top;
+            let keys = self.world.absorb(list, shift_blocks);
+            self.read_floors(&keys);
+            arrived.extend(keys);
+            top = bottom;
         }
+        self.last_pass = Pass {
+            asked,
+            whole_box: (local.max_x - local.min_x)
+                * (local.max_y - local.min_y)
+                * (local.max_z - local.min_z),
+            arrived: arrived.len(),
+            floors: kept,
+        };
         Ok(arrived)
+    }
+
+    /// The box of columns still worth asking about at a level, in local block
+    /// coordinates. `None` when every column has bottomed out.
+    fn open_box(
+        &self,
+        local: &BlockBounds,
+        z: i32,
+        shift: (i32, i32, i32),
+    ) -> Option<BlockBounds> {
+        let mut open: Option<BlockBounds> = None;
+        for bx in local.min_x..local.max_x {
+            for by in local.min_y..local.max_y {
+                let column = (bx + shift.0 + self.origin.0 / BLOCK, by + shift.1 + self.origin.1 / BLOCK);
+                if let Some(&floor) = self.floors.get(&column) {
+                    if z + shift.2 + self.origin.2 < floor - UNDER_FLOOR {
+                        continue;
+                    }
+                }
+                open = Some(match open {
+                    None => BlockBounds { min_x: bx, max_x: bx + 1, min_y: by, max_y: by + 1, min_z: z, max_z: z + 1 },
+                    Some(b) => BlockBounds {
+                        min_x: b.min_x.min(bx),
+                        max_x: b.max_x.max(bx + 1),
+                        min_y: b.min_y.min(by),
+                        max_y: b.max_y.max(by + 1),
+                        ..b
+                    },
+                });
+            }
+        }
+        open
+    }
+
+    /// Notes which of the blocks that just arrived are wholly unrevealed, and
+    /// reopens a column whose ground has been dug or lit since.
+    fn read_floors(&mut self, keys: &[(i32, i32, i32)]) {
+        let mut columns: HashMap<(i32, i32), Vec<(i32, bool)>> = HashMap::new();
+        for &key in keys {
+            let Some(chunk) = self.world.chunk(key.0, key.1, key.2) else { continue };
+            let absolute = self.absolute(key);
+            let blind =
+                chunk.voxels.len() == TILES_PER_BLOCK && chunk.voxels.iter().all(|v| v.hidden);
+            columns.entry((absolute.0, absolute.1)).or_default().push((absolute.2, blind));
+        }
+        for (column, mut levels) in columns {
+            levels.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            match levels.iter().find(|(_, blind)| *blind) {
+                // Top down, the first block nobody has seen into. This pass is
+                // the fresher answer, so it replaces whatever was known.
+                Some(&(z, _)) => {
+                    self.floors.insert(column, z);
+                }
+                // Nothing blind. If the level that was the floor has itself
+                // come back visible, the ground there has been opened since,
+                // and the next pass goes looking for the new floor. Visible
+                // blocks above the floor are just the ground, every pass.
+                None => {
+                    if self
+                        .floors
+                        .get(&column)
+                        .is_some_and(|&floor| levels.iter().any(|&(z, _)| z <= floor))
+                    {
+                        self.floors.remove(&column);
+                    }
+                }
+            }
+        }
     }
 }
