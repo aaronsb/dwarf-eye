@@ -3,3 +3,7 @@ target/
 # Agent worktrees
 .claude/worktrees/
 shots/
+
+# in-app F12 shots land in the working directory
+dwarf-eye-*.png
+shots/
