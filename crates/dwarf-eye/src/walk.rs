@@ -36,7 +36,9 @@ use anyhow::Result;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use dwarf_eye_world::mesh::{FLOOR_HEIGHT, Z_SCALE};
-use dwarf_eye_world::{BLOCK, BlockBounds, Session, Solid, World, ramp};
+use dwarf_eye_world::{
+    BLOCK, BlockBounds, Ground as GroundMode, MeshOptions, Session, Solid, Surface, World, ramp,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -273,6 +275,13 @@ pub struct Ground {
     /// Solids for `z-1..=z+1` over a `2 * GROUND_RADIUS + 1` square, level-major
     /// then row-major. `None` where that chunk is not loaded.
     solids: Vec<Option<Solid>>,
+    /// The smoothed ground over the same square, in tiles east and south of
+    /// its lower corner. `None` in stepped mode.
+    surface: Option<Surface>,
+    /// The render-frame level the sheet was read at, so a height off it can be
+    /// turned back into a height over the square's own level whatever the
+    /// render origin has done since.
+    level: i32,
 }
 
 impl Ground {
@@ -292,10 +301,43 @@ impl Ground {
                 }
             }
         }
+        // The eye rides exactly what the mesher drew, so it is built by the
+        // same code over the same square (`heightfield.rs:Surface::over`).
+        let surface = GroundMode::current().smooth().then(|| {
+            Surface::over(
+                world,
+                (center.0 - r, center.1 - r, center.2),
+                2 * r + 1,
+                MeshOptions { z_ceiling: i32::MAX, show_hidden: true },
+            )
+        });
         Self {
             center: IVec3::new(center.0 + origin.0, center.1 + origin.1, center.2 + origin.2),
             solids,
+            surface,
+            level: center.2,
         }
+    }
+
+    /// The smoothed ground under a tile, `u` east and `v` south inside it, as
+    /// a height over that tile's own base. `None` where the sheet has nothing
+    /// there, or where what it has belongs to a different level.
+    ///
+    /// The sheet is read at one level and folds the levels either side of it
+    /// into that plane, so a height off it belongs to whichever cell it lands
+    /// inside — which is the test.
+    fn smooth(&self, tile: IVec3, u: f32, v: f32) -> Option<f32> {
+        let d = tile - self.center;
+        let r = GROUND_RADIUS;
+        if d.x.abs() > r || d.y.abs() > r {
+            return None;
+        }
+        // `Surface` works in the render frame it was read in; the square keeps
+        // only offsets, so ask it in its own coordinates.
+        let (x, y) = ((d.x + r) as f32 + u, (d.y + r) as f32 + v);
+        let base = (self.level + d.z) as f32 * Z_SCALE;
+        let height = self.surface.as_ref()?.at(x, y)? - base;
+        (0.0..=Z_SCALE).contains(&height).then_some(height)
     }
 
     fn get(&self, tile: IVec3) -> Option<Solid> {
@@ -554,6 +596,16 @@ impl WalkMode {
     /// on, and that floor is a thin slab resting in the bottom of the cell,
     /// not the cell's base itself.
     fn footing(&self, tile: IVec3, solid: Option<Solid>, u: f32, v: f32) -> f32 {
+        // Natural ground is one smoothed sheet, and the eye rides the sheet
+        // the mesher drew rather than the slab underneath it. A ramp inside it
+        // is part of the sheet: its corner field is where the sheet's samples
+        // came from, so the two cannot disagree. A staircase is not ground and
+        // keeps its own footing.
+        if solid != Some(Solid::Stair)
+            && let Some(h) = self.ground.as_ref().and_then(|g| g.smooth(tile, u, v))
+        {
+            return h;
+        }
         match solid {
             // A ramp is a slope, not a step, so the height comes from where on
             // the tile the eye actually is. Its low edge meets the floor slabs
@@ -1266,7 +1318,8 @@ mod tests {
     #[test]
     fn the_ground_square_addresses_its_own_tiles() {
         let solids = vec![None; (3 * (2 * GROUND_RADIUS + 1) * (2 * GROUND_RADIUS + 1)) as usize];
-        let mut ground = Ground { center: IVec3::new(100, 200, 30), solids };
+        let mut ground =
+            Ground { center: IVec3::new(100, 200, 30), solids, surface: None, level: 30 };
         let span = 2 * GROUND_RADIUS + 1;
         // One tile east and one level down, by hand.
         // Level z-1 is the first of the three, so its plane starts at zero.

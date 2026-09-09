@@ -13,6 +13,7 @@
 //! own pitch) to the edge of the region details. Past that a level is under a
 //! pixel and `mod.rs` goes back to a smooth grid off the world map.
 
+use crate::heightfield::Ground;
 use crate::mesh::{FLOOR_HEIGHT, MeshData, Z_SCALE};
 
 use super::field::Field;
@@ -95,10 +96,32 @@ impl Terrain<'_> {
         BANDS.iter().find(|(_, outer)| r < *outer).map(|(pitch, _)| *pitch)
     }
 
+    /// The survey, relieved, at a cell's centre, in levels above the window's
+    /// own floor and not yet rounded to one.
+    pub(crate) fn survey_surface(&self, cx: i32, cz: i32) -> f32 {
+        let cell = self.field.relieved(cx + self.window.origin.0, cz + self.window.origin.1);
+        cell.surface() - self.window.origin.2 as f32
+    }
+
     /// The survey, relieved and quantised, at a cell's centre.
     pub(crate) fn survey_level(&self, cx: i32, cz: i32) -> i32 {
-        let cell = self.field.relieved(cx + self.window.origin.0, cz + self.window.origin.1);
-        (cell.surface() - self.window.origin.2 as f32).round() as i32
+        self.survey_surface(cx, cz).round() as i32
+    }
+
+    /// The un-quantised survey at a cell **corner**: the mean of the four cell
+    /// centres that meet there.
+    ///
+    /// Two cells of one pitch either side of a corner average the same four
+    /// centres, so they agree on it and the smooth band is one sheet. Where
+    /// the pitch changes, or a stitched cell is next door, they do not, and
+    /// `emit_cell` hangs a skirt over the join instead.
+    fn corner_top(&self, x: i32, z: i32, pitch: i32) -> f32 {
+        let h = pitch / 2;
+        let total: f32 = [(-h, -h), (h, -h), (-h, h), (h, h)]
+            .into_iter()
+            .map(|(dx, dz)| self.survey_surface(x + dx, z + dz))
+            .sum();
+        total * 0.25 * Z_SCALE + FLOOR_HEIGHT
     }
 
     /// The z-level a coarse cell stands at.
@@ -220,6 +243,60 @@ impl Terrain<'_> {
         } else {
             (self.skins.uv(ground), self.skins.tint(ground, top))
         };
+        let riser = self.skins.side_tint(side, riser_color(&cell, top));
+        let riser_uv = self.skins.side_uv(side);
+
+        // Smooth mode: the fine tier is a heightfield, so the coarse band is
+        // one too. The cell's four corners come from the un-quantised survey
+        // and neighbouring cells of one pitch share them, so the band is a
+        // sheet with no risers in it. Only the joins it cannot share — a
+        // change of pitch, a stitched cell, the fine rim, the world grid —
+        // still want a skirt.
+        if Ground::current().smooth() {
+            let corner = |x, z| self.corner_top(x, z, pitch);
+            let (nw, ne, sw, se) = (
+                corner(x0, z0),
+                corner(x0 + pitch, z0),
+                corner(x0, z0 + pitch),
+                corner(x0 + pitch, z0 + pitch),
+            );
+            mesh.push_textured_quad(
+                [[fx0, nw, fz0], [fx0, sw, fz1], [fx1, se, fz1], [fx1, ne, fz0]],
+                [0.0, 1.0, 0.0],
+                top_color,
+                [top_uv; 4],
+            );
+            for (dx, dz) in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)] {
+                let (nx, nz) = (cx + dx, cz + dz);
+                let neighbour = self.pitch_at(nx, nz);
+                let hang = if neighbour.is_none() {
+                    OUTER_SKIRT
+                } else if self.fine.covers(nx, nz) {
+                    FINE_SKIRT
+                } else if neighbour != Some(pitch)
+                    || stitch::touches_fine(
+                        self.fine,
+                        cell_origin(nx, pitch),
+                        cell_origin(nz, pitch),
+                        pitch,
+                    )
+                {
+                    RISER_SKIRT
+                } else {
+                    // Same pitch: the corners are shared and there is no crack.
+                    continue;
+                };
+                let (a, b) = match (dx, dz) {
+                    (_, d) if d < 0 => (([fx1, ne, fz0]), ([fx0, nw, fz0])),
+                    (_, d) if d > 0 => (([fx0, sw, fz1]), ([fx1, se, fz1])),
+                    (d, _) if d < 0 => (([fx0, nw, fz0]), ([fx0, sw, fz1])),
+                    _ => (([fx1, se, fz1]), ([fx1, ne, fz0])),
+                };
+                push_skirt(mesh, a, b, hang, riser, riser_uv);
+            }
+            return;
+        }
+
         mesh.push_textured_quad(
             [[fx0, y, fz0], [fx0, y, fz1], [fx1, y, fz1], [fx1, y, fz0]],
             [0.0, 1.0, 0.0],
@@ -227,8 +304,6 @@ impl Terrain<'_> {
             [top_uv; 4],
         );
 
-        let riser = self.skins.side_tint(side, riser_color(&cell, top));
-        let riser_uv = self.skins.side_uv(side);
         for (dx, dz) in [(pitch, 0), (-pitch, 0), (0, pitch), (0, -pitch)] {
             let (nx, nz) = (cx + dx, cz + dz);
             // At the rim of the fine map, hang a short skirt whatever the
@@ -245,6 +320,26 @@ impl Terrain<'_> {
             push_riser(mesh, [fx0, fx1], [bottom, y], [fz0, fz1], (dx, dz), riser, riser_uv);
         }
     }
+}
+
+/// A skirt under one edge of a smooth cell, hanging `drop` below the two
+/// corners it runs between. `a` to `b` walks the edge counter-clockwise seen
+/// from above, so the quad faces outward.
+fn push_skirt(
+    mesh: &mut MeshData,
+    a: [f32; 3],
+    b: [f32; 3],
+    drop: f32,
+    color: [f32; 4],
+    uv: [f32; 2],
+) {
+    let normal = stitch::outward([a[0], a[2]], [b[0], b[2]]);
+    mesh.push_textured_quad(
+        [b, [b[0], b[1] - drop, b[2]], [a[0], a[1] - drop, a[2]], a],
+        normal,
+        color,
+        [uv; 4],
+    );
 }
 
 /// One vertical face of a terrace step, on the side of the cell the drop is

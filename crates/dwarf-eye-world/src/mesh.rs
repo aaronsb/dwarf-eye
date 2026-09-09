@@ -2,6 +2,7 @@
 //! copy the four output arrays into its own mesh type.
 
 use crate::factory::{Extent, Style};
+use crate::heightfield::{Ground, Surface, grounded};
 use crate::library::TileLibrary;
 use crate::model::{Caps, RenderMode};
 use crate::palette::{Rgb, Solid};
@@ -278,7 +279,7 @@ pub(crate) fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
 /// rock salt is `[255, 192, 203]`, and a floor of it in-game reads as grey
 /// stone, not pink. Damping keeps one stone distinguishable from another
 /// without painting the ground in raw material colour.
-fn damp(rgb: [f32; 3], keep: f32) -> [f32; 3] {
+pub(crate) fn damp(rgb: [f32; 3], keep: f32) -> [f32; 3] {
     let luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
     [
         luma + (rgb[0] - luma) * keep,
@@ -300,7 +301,7 @@ fn strip_foot(side: Rect, height: f32) -> Rect {
 
 /// A deterministic per-tile brightness wobble, so a hillside of one material
 /// does not read as a single painted plane.
-fn jitter(x: i32, y: i32, z: i32) -> f32 {
+pub(crate) fn jitter(x: i32, y: i32, z: i32) -> f32 {
     let mut h = (x as u32).wrapping_mul(0x9E3779B1)
         ^ (y as u32).wrapping_mul(0x85EBCA77)
         ^ (z as u32).wrapping_mul(0xC2B2AE3D);
@@ -346,6 +347,8 @@ pub struct Budget {
     pub ground_under: usize,
     pub cubes: usize,
     pub floors: usize,
+    /// The smoothed ground sheet and its rim (`heightfield.rs`).
+    pub surface: usize,
     pub foliage: usize,
     pub liquids: usize,
     pub buildings: usize,
@@ -367,6 +370,7 @@ fn build_furnishings(
     chunk: &Chunk,
     opts: MeshOptions,
     library: Option<&TileLibrary>,
+    surface: Option<&Surface>,
     mesh: &mut MeshData,
     budget: &mut Budget,
 ) {
@@ -400,7 +404,14 @@ fn build_furnishings(
                     });
                     let before = mesh.indices.len();
                     let colour = to_linear(built.color, 1.0);
-                    let top = fy + height * Z_SCALE;
+                    // Grounding: the lid rides the ground at the tile's centre
+                    // and the box stretches down to the tile's lowest corner,
+                    // so a workshop on a slope shows a skirt rather than a
+                    // gap. Never raised (`heightfield.rs:grounded`).
+                    let stepped = fy + FLOOR_HEIGHT;
+                    let standing = grounded(stepped, surface.and_then(|s| s.height(lx, ly)));
+                    let fy = grounded(stepped, surface.and_then(|s| s.low(lx, ly)));
+                    let top = standing + height * Z_SCALE;
                     // The sides are the material — DF draws no side of a chair
                     // and inventing one would be a lie — and the lid is DF's
                     // own picture of the thing, seen from above, which is the
@@ -445,9 +456,12 @@ fn build_furnishings(
             // a box for nothing.
             if let Some(pile) = chunk.pile(lx, ly) {
                 let before = mesh.indices.len();
+                let stepped = fy + FLOOR_HEIGHT;
+                let lid = grounded(stepped, surface.and_then(|s| s.height(lx, ly)));
+                let base = grounded(stepped, surface.and_then(|s| s.low(lx, ly)));
                 mesh.cuboid(
-                    [fx + 0.1, fy, fz + 0.1],
-                    [fx + 0.9, fy + crate::factory::PILE_HEIGHT * Z_SCALE, fz + 0.9],
+                    [fx + 0.1, base, fz + 0.1],
+                    [fx + 0.9, lid + crate::factory::PILE_HEIGHT * Z_SCALE, fz + 0.9],
                     to_linear(pile.color, 1.0),
                     Faces { bottom: true, ..Default::default() },
                 );
@@ -471,8 +485,21 @@ pub fn build_chunk_budgeted(
     world: &World,
     chunk: &Chunk,
     opts: MeshOptions,
+    library: Option<&mut TileLibrary>,
+    budget: &mut Budget,
+) -> MeshData {
+    build_chunk_in(world, chunk, opts, library, budget, Ground::current())
+}
+
+/// The build pass, with the surface model named rather than read from the
+/// environment, so both can be meshed side by side in a test.
+pub fn build_chunk_in(
+    world: &World,
+    chunk: &Chunk,
+    opts: MeshOptions,
     mut library: Option<&mut TileLibrary>,
     budget: &mut Budget,
+    ground: Ground,
 ) -> MeshData {
     let mut mesh = MeshData::default();
     let tally = |mesh: &MeshData, before: usize, slot: &mut usize| {
@@ -482,6 +509,10 @@ pub fn build_chunk_budgeted(
         return mesh;
     }
     let style = Style::current();
+    // The ground of every natural tile in this chunk as one smoothed sheet.
+    // Read once: the tile loop asks per tile whether it is covered, and the
+    // sheet itself is emitted after the loop.
+    let surface = ground.smooth().then(|| Surface::build(world, chunk, opts));
     let (ox, oy, oz) = chunk.origin();
 
     for ly in 0..BLOCK {
@@ -535,6 +566,10 @@ pub fn build_chunk_budgeted(
 
             let color = shade(to_linear(voxel.color, 1.0), jitter(x, y, z));
 
+            // The heightfield draws this tile's ground: no slab, no wedge and
+            // no top face here (`heightfield.rs:Surface::emit`).
+            let covered = surface.as_ref().is_some_and(|s| s.covers(lx, ly));
+
             // A sprite-derived model, when this tiletype has one.
             if let Some(lib) = library.as_deref_mut() {
                 // The factory decides who draws a tile. What it grows — a
@@ -546,7 +581,7 @@ pub fn build_chunk_budgeted(
                         // A standing plant occupies its tile outright: DF
                         // reports no floor under it, so it keeps the ground the
                         // billboard used to stand on.
-                        if plan.extent == Extent::Tile {
+                        if plan.extent == Extent::Tile && !covered {
                             if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
                                 let before = mesh.indices.len();
                                 let wobble = jitter(x, y, z);
@@ -585,6 +620,11 @@ pub fn build_chunk_budgeted(
                     // Terrain ramps carry no direction, so the slope comes from
                     // whichever neighbour is a wall.
                     if lib.mode(voxel.tile_id) == Some(RenderMode::Ramp) {
+                        // A natural slope is the heightfield's; a constructed
+                        // one keeps DF's wedge.
+                        if covered {
+                            continue;
+                        }
                         let mut high = 0u8;
                         for (bit, dx, dy) in crate::ramp::NEIGHBOURS {
                             if world.voxel(x + dx, y + dy, z).is_some_and(|n| {
@@ -610,7 +650,7 @@ pub fn build_chunk_budgeted(
 
                     // A shrub or boulder fills its tile outright, with no floor
                     // tile of its own, so give it ground to stand on.
-                    if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
+                    if let Some(ground) = lib.ground_beneath(voxel.tile_id).filter(|_| !covered) {
                         let wobble = jitter(x, y, z);
                         let tint = if ground.tint {
                             let base = damp([color[0], color[1], color[2]], 0.35);
@@ -625,6 +665,9 @@ pub fn build_chunk_budgeted(
                         tally(&mesh, before, &mut budget.ground_under);
                     }
 
+                    if covered && lib.mode(voxel.tile_id) == Some(RenderMode::FlatTile) {
+                        continue;
+                    }
                     if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, caps) {
                         let wobble = jitter(x, y, z);
                         // A near-grey sprite is a pattern; the tile's material
@@ -736,7 +779,7 @@ pub fn build_chunk_budgeted(
                         None => mesh.cuboid(lo, hi, color, full),
                     }
                 }
-                Solid::Floor => {
+                Solid::Floor if !covered => {
                     let rims = rim_faces();
                     mesh.cuboid(
                         [fx, fy, fz],
@@ -745,6 +788,7 @@ pub fn build_chunk_budgeted(
                         Faces { top: false, ..rims },
                     );
                 }
+                Solid::Floor => {}
                 Solid::Ramp => {
                     // A half-height block reads as a slope well enough until the
                     // ramp's facing direction is wired up.
@@ -795,7 +839,11 @@ pub fn build_chunk_budgeted(
         }
     }
 
-    build_furnishings(chunk, opts, library.as_deref(), &mut mesh, budget);
+    if let Some(surface) = surface.as_ref() {
+        budget.surface += surface.emit(world, chunk, opts, library.as_deref_mut(), &mut mesh);
+    }
+
+    build_furnishings(chunk, opts, library.as_deref(), surface.as_ref(), &mut mesh, budget);
 
     // Water is a sheet across tiles rather than a box inside one, and it is
     // meshed whatever else a tile is drawing: a pool's rim tiles are ramps, and

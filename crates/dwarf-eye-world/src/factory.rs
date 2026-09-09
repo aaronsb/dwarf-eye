@@ -89,6 +89,92 @@ pub enum Class {
     Other,
 }
 
+/// What one tile of terrain does to the ground surface.
+///
+/// The heightfield draws [`Footing::Ground`] and [`Footing::Slope`] as one
+/// smoothed sheet; [`Footing::Cliff`] is where that sheet stops and holds its
+/// height, and [`Footing::Tile`] is everything that keeps the geometry the
+/// sprite library has always given it — constructed floors, stairs, buildings,
+/// a tree's own wood.
+///
+/// Decided from the tiletype alone, so it is cached with the rest of the plan
+/// and a mesher pays one lookup. Whether a *particular* cliff has a ramp
+/// against it is the mesher's question, not this one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Footing {
+    /// Natural ground: soil, sand, grass, a natural stone floor, and the tile
+    /// a shrub or a boulder stands in, which DF reports with no floor of its
+    /// own.
+    Ground,
+    /// A natural ramp: the slope that connects two levels of natural ground.
+    Slope,
+    /// A natural wall the ground stops against.
+    Cliff,
+    /// Keeps its tile geometry.
+    #[default]
+    Tile,
+}
+
+/// Whether a material is ground that formed rather than ground someone laid.
+fn natural(material: TiletypeMaterial) -> bool {
+    use TiletypeMaterial as M;
+    matches!(
+        material,
+        M::Soil
+            | M::Stone
+            | M::Feature
+            | M::LavaStone
+            | M::Mineral
+            | M::FrozenLiquid
+            | M::GrassLight
+            | M::GrassDark
+            | M::GrassDry
+            | M::GrassDead
+            | M::Plant
+            | M::Mushroom
+            | M::Ashes
+            | M::Driftwood
+            | M::Pool
+            | M::Brook
+            | M::River
+            | M::Hfs
+    )
+}
+
+/// Whether somebody worked this tile: smoothed it, carved a track into it,
+/// ploughed it. Worked ground is built work as far as the surface goes.
+fn worked(special: TiletypeSpecial) -> bool {
+    matches!(
+        special,
+        TiletypeSpecial::Smooth
+            | TiletypeSpecial::SmoothDead
+            | TiletypeSpecial::Track
+            | TiletypeSpecial::Furrowed
+    )
+}
+
+/// What a tile does to the ground surface.
+pub fn footing(tile: Tile, class: Class) -> Footing {
+    use TiletypeShape as S;
+    // A tree's wood, built work, a building's tile: all of them draw
+    // themselves, and none of them is ground.
+    if matches!(class, Class::Tree | Class::Built | Class::Building(_) | Class::Unit | Class::ItemPile)
+        || !natural(tile.material)
+        || worked(tile.special)
+    {
+        return Footing::Tile;
+    }
+    match tile.shape {
+        S::Floor | S::Pebbles | S::BrookTop | S::BrookBed => Footing::Ground,
+        // A plant or a boulder fills its tile outright and DF reports no floor
+        // under it, so the ground it stands on is the heightfield's to draw.
+        S::Shrub | S::Sapling | S::Boulder => Footing::Ground,
+        S::Ramp => Footing::Slope,
+        S::Wall | S::Fortification => Footing::Cliff,
+        _ => Footing::Tile,
+    }
+}
+
 /// How much of the map an entity may fill.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Extent {
@@ -547,6 +633,8 @@ pub fn classify_items(items: u8) -> Class {
 pub struct Plan {
     pub class: Class,
     pub extent: Extent,
+    /// What this tile does to the ground surface.
+    pub footing: Footing,
 }
 
 impl Plan {
@@ -577,7 +665,8 @@ impl Plan {
 
 /// The plan for one tile: what it is and how much room it has.
 pub fn plan(tile: Tile, near: Near) -> Plan {
-    Plan { class: classify(tile, near), extent: extent(tile) }
+    let class = classify(tile, near);
+    Plan { class, extent: extent(tile), footing: footing(tile, class) }
 }
 
 /// A plant's seed: the absolute tile it stands on, and what it is.

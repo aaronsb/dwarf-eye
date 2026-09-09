@@ -31,8 +31,9 @@
 //! them.
 
 use crate::factory::{self, Class, Extent, Style, Treatment};
+use crate::heightfield::{self, Ground};
 use crate::library::TileLibrary;
-use crate::mesh::{MeshData, MeshOptions, Z_SCALE};
+use crate::mesh::{FLOOR_HEIGHT, MeshData, MeshOptions, Z_SCALE};
 use crate::tree::{DETAIL, Envelope, Habit};
 use crate::world::{BLOCK, Chunk, Voxel, World};
 use dwarf_eye_trees as trees;
@@ -727,7 +728,12 @@ impl Forest {
         let above = if world.chunk(cx, cy, chunk.z + 1).is_some() { 0 } else { OVERHEAD };
 
         if band.undergrowth() {
-            self.sow(chunk, opts, library, world_origin, &mut meshes, budget);
+            // A plant stands on the ground, and under the smooth model the
+            // ground is a sheet rather than the tile's own slab.
+            let surface = Ground::current()
+                .smooth()
+                .then(|| heightfield::Surface::build(world, chunk, opts));
+            self.sow(chunk, opts, library, world_origin, surface.as_ref(), &mut meshes, budget);
         }
         if origins.is_empty() {
             return meshes;
@@ -761,12 +767,14 @@ impl Forest {
     ///
     /// A standing plant never leaves its tile, so a chunk's plants are exactly
     /// the ones its own tiles hold: no halo to scan, and nothing to slice.
+    #[allow(clippy::too_many_arguments)]
     fn sow(
         &mut self,
         chunk: &Chunk,
         opts: MeshOptions,
         library: &mut TileLibrary,
         world_origin: (i32, i32, i32),
+        surface: Option<&heightfield::Surface>,
         meshes: &mut CanopyMeshes,
         budget: &mut CanopyBudget,
     ) {
@@ -789,7 +797,14 @@ impl Forest {
                 let Some(plant) = self.plant(library, plan.class, voxel, at, world_origin) else {
                     continue;
                 };
-                let offset = [at.0 as f32, at.2 as f32 * Z_SCALE, at.1 as f32];
+                // Grounding: a plant fills one tile, so its base drops to the
+                // ground at that tile's centre and is never lifted off the
+                // slab it stood on (`heightfield.rs:grounded`).
+                let base = heightfield::grounded(
+                    at.2 as f32 * Z_SCALE + FLOOR_HEIGHT,
+                    surface.and_then(|s| s.height(lx, ly)),
+                ) - FLOOR_HEIGHT;
+                let offset = [at.0 as f32, base, at.1 as f32];
                 meshes.bark.stamp(&plant.bark, offset, [1.0; 3]);
                 meshes.broadleaf.stamp(&plant.leaf, offset, [1.0; 3]);
                 budget.plants += 1;

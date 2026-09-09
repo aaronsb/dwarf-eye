@@ -212,10 +212,15 @@ impl Terrain<'_> {
         // tile below it. Covers the crack where two cells of different pitch
         // disagree, and the strata the fine map shows where its edge is on a
         // slope.
+        // In smooth mode the cells around this one are a sheet at whatever
+        // height the survey gives their corners, and this one still holds a
+        // whole level — the boundary snap. So the whole outline gets a skirt,
+        // not only the stretches the fine map set.
+        let everywhere = crate::heightfield::Ground::current().smooth();
         for i in 0..n {
             let a = perimeter.points[i];
             let b = perimeter.points[(i + 1) % n];
-            if !a.fine && !b.fine {
+            if !everywhere && !a.fine && !b.fine {
                 continue;
             }
             mesh.push_textured_quad(
@@ -238,7 +243,7 @@ const SKIRT: f32 = 1.5;
 
 /// The outward horizontal normal of an outline segment walked counter-clockwise
 /// seen from above: turn the direction of travel to its right.
-fn outward([ax, az]: [f32; 2], [bx, bz]: [f32; 2]) -> [f32; 3] {
+pub(super) fn outward([ax, az]: [f32; 2], [bx, bz]: [f32; 2]) -> [f32; 3] {
     let (dx, dz) = (bx - ax, bz - az);
     let len = (dx * dx + dz * dz).sqrt().max(1e-6);
     [-dz / len, 0.0, dx / len]
