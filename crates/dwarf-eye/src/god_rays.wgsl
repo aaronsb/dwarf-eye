@@ -102,8 +102,13 @@ fn brightest_light() -> u32 {
     return best;
 }
 
-// Whether the sun's shadow map sees a point. Outside the cascades the map has
+// Whether the light's shadow map sees a point. Outside the cascades the map has
 // nothing to say, so the point counts as lit rather than as a black disc.
+//
+// The moon carries no cascades at all (`main.rs`: a second shadow pass for
+// light the scene barely resolves is not worth it), so `num_cascades` is zero
+// and a moonlit night gets the medium's own glow toward the moon rather than
+// shafts cut by the trees. The phase function still shapes it.
 fn sun_visibility(light_id: u32, p: vec3<f32>, view_z: f32) -> f32 {
     let light = &lights.directional_lights[light_id];
     let cascade_index = get_cascade_index(light_id, view_z);

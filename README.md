@@ -74,6 +74,7 @@ the vegetation and lighting work is done.
 | `[` `]` | lower / raise the cut plane |
 | `H` | show or hide undiscovered tiles |
 | `G` | light shafts on or off |
+| `F` | haze: the derived level, then 0, 0.2, 0.5, 0.8 forced |
 | `,` `.` | step the game clock an hour (six with shift) |
 | `1` `2` `3` | weather: clear / rain / snow |
 

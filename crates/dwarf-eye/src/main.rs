@@ -1631,11 +1631,12 @@ fn update_hud(
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          {}\n\
          chunks  {}   triangles {} of {} held   {:.0} fps\n\
-         z-ceiling {ceiling}   hidden tiles {}   sky {}   falling {}   light shafts {}\n\
+         z-ceiling {ceiling}   hidden tiles {}   sky {}   falling {}   light shafts {}   \
+         haze: {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
          tab  fly / walk sync (walk: WASD steps the character, QE on stairs)\n\
-         [ ]  cut plane    H  undiscovered tiles    G  light shafts\n\
+         [ ]  cut plane    H  undiscovered tiles    G  light shafts    F  haze level\n\
          , .  step the game clock (shift: six hours)    1 2 3  clear / rain / snow",
         status.world,
         status.detail,
@@ -1657,6 +1658,7 @@ fn update_hud(
         weather.describe(),
         precip.describe(),
         if rays.enabled { "on" } else { "off" },
+        rays.haze.describe(rays.derived),
     );
 }
 

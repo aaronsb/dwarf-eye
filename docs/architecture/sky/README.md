@@ -2,8 +2,8 @@
 
 Status: landed (`crates/dwarf-eye/src/{sky.rs,stars.rs,clouds.rs,shadow.rs,god_rays.rs,noise.rs,precipitation.rs}`,
 `crates/dwarf-eye-world/src/weather.rs`); night lighting in flight (issue #14);
-the rest of the weather inventory in flight (issue #32); haze calibration
-planned (issue #18).
+the rest of the weather inventory in flight (issue #32); the haze model
+landed, its two region inputs still to be carried by the worker (issue #18).
 
 ## What it does
 
@@ -31,7 +31,8 @@ flowchart TD
   N --> V[cloud volume: drawn sky]
   N --> B[bake_shadow: CPU sun march]
   B --> T[terrain materials]
-  WE --> G[god_rays.rs: haze density]
+  WE --> G[god_rays.rs: Humidity::density]
+  R --> G
   S --> G
 ```
 
@@ -42,7 +43,7 @@ flowchart TD
 | [clock.md](clock.md) | DF's calendar, fortress and adventure counters |
 | [sun-and-stars.md](sun-and-stars.md) | sun direction, atmosphere, star field, night |
 | [clouds.md](clouds.md) | the cloud volume and its baked shadows |
-| [weather.md](weather.md) | the weather probe, precipitation, snow, wet ground, haze and god rays |
+| [weather.md](weather.md) | the weather probe, precipitation, snow, wet ground, the humidity model and god rays |
 
 ## Invariants and gotchas
 
@@ -60,6 +61,6 @@ flowchart TD
 
 ## Related issues
 
-#14 (night lighting and emissives), #32 (the weather inventory), #18 (haze from
-DF's humidity inputs), #4 (the clock poll queues behind a heavy map pass), #19
-(closed, adventure-mode clock).
+#14 (night lighting and emissives), #32 (the weather inventory), #18 (region
+rainfall and temperature onto `WeatherReport`), #4 (the clock poll queues behind
+a heavy map pass), #19 (closed, adventure-mode clock).
