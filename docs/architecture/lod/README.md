@@ -66,14 +66,14 @@ Canopy bands, all built from the same growth and spawned together. A band *is*
 a stage of `factory::chain(Class::Tree, ..)`: its resolution, its cut, what
 rides with it and where it ends are all read off that stage
 (`canopy.rs:Band::stage`). The edge is where that band's own leaf voxel falls to
-two pixels (`factory::Stage::edge`, through `canopy.rs:Band::edge`); the
+the leaf-pixel threshold (`factory::Stage::edge`, through `canopy.rs:Band::edge`); the
 crossfade is that edge widened to the distance the dither needs
 (`main.rs:band_fades`). The tile figures are Bevy's 45-degree lens into a
 720-tall window:
 
 | Band | Voxels per tile | Ends at | Crossfade | Carries | Meshes per chunk | Material |
 |---|---|---|---|---|---|---|
-| near | 4 (`tree.rs:DETAIL`) | N, 109 tiles | 95..124 | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
+| near | 4 (`tree.rs:DETAIL`) | N, 73 tiles | 63..83 | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
 | close | 3 (`canopy.rs:CLOSE_DETAIL`) | 4N/3, 145 tiles | 128..165 | trees and strands | up to 4 | the same four |
 | mid | 2 (`canopy.rs:MID_DETAIL`) | 2N, 217 tiles | 181..261 | trees and strands | up to 4 | the same four |
 | far | 1 (`canopy.rs:FAR_DETAIL`) | far plane | — | trees only | 1 | one opaque leaf material, bark included |
@@ -136,14 +136,15 @@ viewport `h` pixels tall, so the band ends at
 
     N = L * h / (2 * MIN_LEAF_PIXELS * tan(fov/2))
 
-with `MIN_LEAF_PIXELS` 2 (`canopy.rs:near_band`). At Bevy's default 45-degree
-lens that is 109 tiles (6.8 blocks) into a 720-tall window and 180 tiles (11.3
+with `MIN_LEAF_PIXELS` 3, `DWARF_EYE_LEAF_PIXELS` overriding (`canopy.rs:near_band`,
+`leaf_pixels`). At Bevy's default 45-degree lens that is 73 tiles (4.6 blocks)
+into a 720-tall window and 120 tiles (7.5
 blocks) into a 1190-tall one: a taller window or a longer lens pushes the band
 out, which is the point of measuring in pixels. `DWARF_EYE_LOD_NEAR` overrides
 it, in blocks.
 
 Every later hand-off is the same rule on that band's own leaf voxel, which is
-`DETAIL / detail` times as wide and so stays two pixels that many times further
+`DETAIL / detail` times as wide and so stays at the threshold that many times further
 out (`canopy.rs:Band::edge`): the close band reaches 4N/3, the mid band's
 half-tile voxel 2N, 217 tiles at 720, and the far band runs from there to the
 camera's far plane.

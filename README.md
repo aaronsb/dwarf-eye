@@ -348,8 +348,10 @@ cut into four voxels per tile with alpha-masked leaves, its plants and its
 hanging strands; the middle band halves that and keeps the cutout, so sun and
 sky still come through; the far band is one voxel per tile on one opaque
 material, one mesh for a chunk's whole crown. Each edge sits where that band's
-leaf voxel stops covering two pixels, which depends on the window's height and
-the lens: about 109 tiles for the near band in a 720-tall window.
+leaf voxel stops covering three pixels, which depends on the window's height
+and the lens: about 73 tiles for the near band in a 720-tall window.
+`DWARF_EYE_LEAF_PIXELS` is the one dial that scales every band, window and
+horizon alike.
 `DWARF_EYE_LOD_NEAR` sets that first distance in blocks, and
 `DWARF_EYE_OCCLUSION=0` turns off the GPU occlusion culling the camera otherwise
 asks for.

@@ -266,8 +266,20 @@ impl Coat {
 
 /// Pixels a near-band leaf voxel must still cover for the near band to be worth
 /// drawing. Below this the cutout is sampling noise, so the coarse crown reads
-/// the same and costs a fraction.
-const MIN_LEAF_PIXELS: f32 = 2.0;
+/// the same and costs a fraction. Three pixels keeps full detail to about 73
+/// tiles in a 720-tall window; two took it to 109 and cost roughly twice the
+/// drawn triangles across every band, since each later edge scales with it.
+pub const MIN_LEAF_PIXELS: f32 = 3.0;
+
+/// [`MIN_LEAF_PIXELS`], with `DWARF_EYE_LEAF_PIXELS` overriding it: the one
+/// dial that scales every tree band, window and horizon alike.
+pub fn leaf_pixels() -> f32 {
+    std::env::var("DWARF_EYE_LEAF_PIXELS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|p| *p > 0.0)
+        .unwrap_or(MIN_LEAF_PIXELS)
+}
 
 /// Where the near band ends, in tiles, for a camera of this vertical field of
 /// view drawing into a viewport this many pixels tall.
@@ -279,7 +291,7 @@ const MIN_LEAF_PIXELS: f32 = 2.0;
 /// distance: a taller window or a narrower lens pushes the band out.
 pub fn near_band(fov_y: f32, viewport_height: f32) -> f32 {
     let leaf = 1.0 / DETAIL as f32;
-    leaf * viewport_height / (2.0 * MIN_LEAF_PIXELS * (fov_y * 0.5).tan())
+    leaf * viewport_height / (2.0 * leaf_pixels() * (fov_y * 0.5).tan())
 }
 
 /// [`near_band`], with `DWARF_EYE_LOD_NEAR` overriding it in blocks.
@@ -1476,13 +1488,13 @@ mod tests {
     }
 
     #[test]
-    fn the_near_band_ends_where_a_leaf_voxel_is_two_pixels() {
+    fn the_near_band_ends_where_a_leaf_voxel_is_the_threshold() {
         // Bevy's default lens, into a 1080-tall window: a quarter-tile leaf
-        // voxel covers two pixels at this distance and less beyond it.
+        // voxel covers MIN_LEAF_PIXELS at this distance and less beyond it.
         let (fov, height) = (std::f32::consts::FRAC_PI_4, 1080.0);
         let n = near_band(fov, height);
         let pixels = |d: f32| (1.0 / DETAIL as f32) * height / (2.0 * d * (fov * 0.5).tan());
-        assert!((pixels(n) - MIN_LEAF_PIXELS).abs() < 1e-3, "{n} tiles is not the two-pixel range");
+        assert!((pixels(n) - MIN_LEAF_PIXELS).abs() < 1e-3, "{n} tiles is not the threshold range");
         assert!(pixels(n * 2.0) < MIN_LEAF_PIXELS);
 
         // A taller window resolves the same voxel further out, in proportion;

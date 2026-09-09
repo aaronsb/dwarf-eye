@@ -250,7 +250,7 @@ the swapping the way it does for the canopy bands:
 | crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(8 N, 150)` | 872 | a blob |
 | box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | — | a blob |
 
-`N` is the canopy's own near band (`canopy::near_band`, 109 tiles into a
+`N` is the canopy's own near band (`canopy::near_band`, 73 tiles at the default threshold into a
 720-tall window), so a longer lens or a taller window pushes the whole chain
 out. The first four edges are the window's, to the bit
 (`main.rs:the_horizon_hands_over_where_the_window_does`), and every one of them

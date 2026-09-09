@@ -1301,7 +1301,7 @@ fn drain_worker(
 /// ranges already on the GPU when either changes.
 ///
 /// The rule is projected size, not distance: each band ends where its own leaf
-/// voxel stops covering two pixels (`dwarf_eye_world::canopy::near_band` and
+/// voxel stops covering `canopy::leaf_pixels()` pixels (`dwarf_eye_world::canopy::near_band` and
 /// `Band::edge`), so a taller window or a longer lens pushes them all out.
 /// `DWARF_EYE_LOD_NEAR` overrides the near edge, in blocks.
 fn size_bands(
