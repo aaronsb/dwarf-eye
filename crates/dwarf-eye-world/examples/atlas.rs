@@ -23,6 +23,12 @@ fn main() -> Result<()> {
     for (family, tint, cells) in lib.wall_report() {
         println!("  {family:<22} {cells:>2} cells {}", if tint { "tinted" } else { "own colour" });
     }
+    let (ramp_cells, sand_ramp_cells) = lib.ramp_cells();
+    println!(
+        "ramps: {ramp_cells} cells, {sand_ramp_cells} of them the five sand hues; \
+         sand floors: {} cells",
+        lib.sand_floor_cells()
+    );
     let path = std::env::args().nth(1).unwrap_or_else(|| "atlas.png".into());
     image::save_buffer(
         &path,

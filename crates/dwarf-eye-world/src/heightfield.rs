@@ -437,11 +437,14 @@ fn color_shade(color: [f32; 4], factor: f32) -> [f32; 4] {
 /// packed to stand under a boulder or a shrub.
 fn ground_uv(library: &mut TileLibrary, voxel: crate::world::Voxel) -> Option<(Rect, bool)> {
     let model = match library.mode(voxel.tile_id)? {
-        RenderMode::FlatTile => {
-            library.model(voxel.tile_id, voxel.mat_index, Caps { top: true, bottom: true })
-        }
+        RenderMode::FlatTile => library.model(
+            voxel.tile_id,
+            voxel.mat_index,
+            voxel.sand,
+            Caps { top: true, bottom: true },
+        ),
         // Mask zero is the flat slab of the ramp's own ground family.
-        RenderMode::Ramp => library.ramp(voxel.tile_id, 0),
+        RenderMode::Ramp => library.ramp(voxel.tile_id, 0, voxel.sand),
         RenderMode::Billboard => library.ground_beneath(voxel.tile_id),
         _ => None,
     }?;

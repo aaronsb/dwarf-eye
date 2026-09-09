@@ -16,6 +16,7 @@
 //! the sprite that matches a mask always agrees with the geometry built from it.
 
 use crate::mesh::{MeshData, Z_SCALE};
+use crate::palette::SandHue;
 use dfhack_remote::rfr::TiletypeMaterial;
 use dwarf_eye_art::Sprite;
 use dwarf_eye_art::atlas::Rect;
@@ -166,6 +167,21 @@ pub fn family_for(material: TiletypeMaterial) -> Option<&'static str> {
         | M::Root
         | M::TreeMaterial => Some("STONE_RAMP"),
         _ => None,
+    }
+}
+
+/// The ramp sheet a sand hue draws from.
+///
+/// Unlike `STONE_RAMP`, these are full-colour art, not a pattern DF expects
+/// the material to tint, so they are packed and read the same way the ice and
+/// magma wall sheets are: on their own colour, no [`neutralise`].
+pub fn sand_family(hue: SandHue) -> &'static str {
+    match hue {
+        SandHue::Tan => "SAND_TAN_RAMP",
+        SandHue::Yellow => "SAND_YELLOW_RAMP",
+        SandHue::White => "SAND_WHITE_RAMP",
+        SandHue::Black => "SAND_BLACK_RAMP",
+        SandHue::Red => "SAND_RED_RAMP",
     }
 }
 
@@ -341,6 +357,16 @@ mod tests {
         // The 47 names are what DF's ramp sheets hold; anything else means the
         // reduction has drifted from the one the art was cut with.
         assert_eq!(sprite_names("STONE_RAMP").len(), 47);
+    }
+
+    #[test]
+    fn every_hue_has_a_distinct_sheet_and_the_same_47_sprites() {
+        let families: Vec<_> = SandHue::ALL.iter().map(|h| sand_family(*h)).collect();
+        let unique: HashSet<_> = families.iter().collect();
+        assert_eq!(unique.len(), 5, "two hues share a sheet");
+        for family in families {
+            assert_eq!(sprite_names(family).len(), 47);
+        }
     }
 
     #[test]

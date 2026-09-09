@@ -173,11 +173,69 @@ pub fn magma_color(depth: f32) -> (Rgb, f32) {
     (rgb, 0.62 + 0.33 * t)
 }
 
+/// The sand hue a soil material draws from, for the five sand sheets DF ships
+/// (`SAND_FLOOR`, `SAND_YELLOW_FLOOR`, `SAND_WHITE_FLOOR`, `SAND_BLACK_FLOOR`,
+/// `SAND_RED_FLOOR`, and one ramp and wall sheet per hue). Every other soil
+/// material — clay, loam, silt, peat — has no sheet of its own and is `None`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SandHue {
+    Tan,
+    Yellow,
+    White,
+    Black,
+    Red,
+}
+
+impl SandHue {
+    /// Every hue DF ships a sheet for, tan first, matching the unlabelled
+    /// sheet's own place as the default.
+    pub const ALL: [SandHue; 5] =
+        [SandHue::Tan, SandHue::Yellow, SandHue::White, SandHue::Black, SandHue::Red];
+}
+
+/// The same classification from a material's display name, for the rare
+/// reply that carries a name but no id. Matched whole, case-insensitively,
+/// against DF's own `STATE_NAME_ADJ` text — "sand", "yellow sand", "white
+/// sand", "black sand", "red sand" — so "sandy loam" does not qualify.
+fn sand_hue_from_name(name: &str) -> Option<SandHue> {
+    match name.to_ascii_lowercase().as_str() {
+        "sand" | "tan sand" => Some(SandHue::Tan),
+        "yellow sand" => Some(SandHue::Yellow),
+        "white sand" => Some(SandHue::White),
+        "black sand" => Some(SandHue::Black),
+        "red sand" => Some(SandHue::Red),
+        _ => None,
+    }
+}
+
+/// Classifies a material's raw id into the sand hue DF ships a sheet for, or
+/// `None` for every other soil material.
+///
+/// Matched by exact id, not a substring: `SANDY_LOAM` and `SANDY_CLAY` both
+/// contain "SAND" and are ordinary soil, not sand; only the five materials
+/// `[SOIL_SAND]` tags in `inorganic_stone_soil.txt` — `SAND` (also spelled
+/// `SAND_TAN`), `SAND_YELLOW`, `SAND_WHITE`, `SAND_BLACK`, `SAND_RED` — are.
+/// DFHack's material id is sometimes qualified with its object type
+/// (`INORGANIC:SAND_BLACK`); only the token after the last colon is matched.
+pub fn sand_hue_from_id(id: &str) -> Option<SandHue> {
+    match id.rsplit(':').next().unwrap_or(id) {
+        "SAND" | "SAND_TAN" => Some(SandHue::Tan),
+        "SAND_YELLOW" => Some(SandHue::Yellow),
+        "SAND_WHITE" => Some(SandHue::White),
+        "SAND_BLACK" => Some(SandHue::Black),
+        "SAND_RED" => Some(SandHue::Red),
+        _ => None,
+    }
+}
+
 /// Everything needed to give a tile a shape and a colour.
 pub struct Palette {
     tiletypes: HashMap<i32, Tiletype>,
     colors: HashMap<(i32, i32), Rgb>,
     names: HashMap<(i32, i32), String>,
+    /// Material pairs classified as one of DF's five sand hues, resolved once
+    /// here from the raw id rather than re-parsed per tile.
+    sand: HashMap<(i32, i32), SandHue>,
 }
 
 impl Palette {
@@ -190,17 +248,33 @@ impl Palette {
 
         let mut colors = HashMap::new();
         let mut names = HashMap::new();
+        let mut sand = HashMap::new();
         for m in materials.material_list {
             let key = (m.mat_pair.mat_type, m.mat_pair.mat_index);
             if let Some(c) = m.state_color {
                 colors.insert(key, [clamp_channel(c.red), clamp_channel(c.green), clamp_channel(c.blue)]);
             }
-            if let Some(n) = m.name {
-                names.insert(key, n);
+            if let Some(n) = &m.name {
+                names.insert(key, n.clone());
+            }
+            let hue = m
+                .id
+                .as_deref()
+                .and_then(sand_hue_from_id)
+                .or_else(|| m.name.as_deref().and_then(sand_hue_from_name));
+            if let Some(hue) = hue {
+                sand.insert(key, hue);
             }
         }
 
-        Self { tiletypes, colors, names }
+        Self { tiletypes, colors, names, sand }
+    }
+
+    /// The sand hue this material pair draws from, if it is one of DF's five
+    /// named sands. `None` covers both "not soil" and "soil but not sand" —
+    /// clay, loam, silt and peat included.
+    pub fn sand_hue(&self, pair: &MatPair) -> Option<SandHue> {
+        self.sand.get(&(pair.mat_type, pair.mat_index)).copied()
     }
 
     pub fn tiletype(&self, id: i32) -> Option<&Tiletype> {
@@ -235,7 +309,11 @@ impl Palette {
     /// Colour for a tile.
     ///
     /// Ground cover and liquids take their look from the tiletype's material
-    /// class; stone and ore take theirs from the material itself.
+    /// class; stone, ore and sand take theirs from the material itself — sand
+    /// keeps its own five colours the way stone keeps its own, so a black
+    /// sand sheet that turned out to need tinting (`library.rs:pack_walls`)
+    /// tints black rather than the generic soil brown every other soil
+    /// material shares.
     pub fn color(&self, tile_id: i32, pair: &MatPair) -> Rgb {
         use TiletypeShape as S;
         if matches!(self.shape(tile_id), S::Branch | S::Twig | S::Shrub | S::Sapling) {
@@ -243,6 +321,12 @@ impl Palette {
         }
 
         let class = self.tile_material(tile_id);
+        if class == TiletypeMaterial::Soil
+            && self.sand_hue(pair).is_some()
+            && let Some(c) = self.colors.get(&(pair.mat_type, pair.mat_index))
+        {
+            return *c;
+        }
         if class_wins(class) {
             return terrain_color(class);
         }
@@ -263,4 +347,93 @@ impl Palette {
 
 fn clamp_channel(v: i32) -> u8 {
     v.clamp(0, 255) as u8
+}
+
+#[cfg(test)]
+mod sand_tests {
+    use super::*;
+
+    #[test]
+    fn the_five_named_sands_classify_by_id() {
+        assert_eq!(sand_hue_from_id("SAND"), Some(SandHue::Tan));
+        assert_eq!(sand_hue_from_id("SAND_TAN"), Some(SandHue::Tan));
+        assert_eq!(sand_hue_from_id("SAND_YELLOW"), Some(SandHue::Yellow));
+        assert_eq!(sand_hue_from_id("SAND_WHITE"), Some(SandHue::White));
+        assert_eq!(sand_hue_from_id("SAND_BLACK"), Some(SandHue::Black));
+        assert_eq!(sand_hue_from_id("SAND_RED"), Some(SandHue::Red));
+    }
+
+    #[test]
+    fn a_qualified_id_is_matched_on_its_own_token() {
+        assert_eq!(sand_hue_from_id("INORGANIC:SAND_BLACK"), Some(SandHue::Black));
+    }
+
+    #[test]
+    fn other_soil_materials_do_not_contain_sand() {
+        // These all contain the substring "SAND" and are not sand: only an
+        // exact-id match keeps them off the sand sheets.
+        for id in ["SANDY_LOAM", "SANDY_CLAY", "SANDY_CLAY_LOAM", "SANDSTONE"] {
+            assert_eq!(sand_hue_from_id(id), None, "{id} misclassified as sand");
+        }
+        for id in ["CLAY", "CLAY_LOAM", "LOAM", "SILT", "PEAT"] {
+            assert_eq!(sand_hue_from_id(id), None, "{id} misclassified as sand");
+        }
+    }
+
+    #[test]
+    fn the_name_fallback_matches_dfs_adjectives() {
+        assert_eq!(sand_hue_from_name("sand"), Some(SandHue::Tan));
+        assert_eq!(sand_hue_from_name("yellow sand"), Some(SandHue::Yellow));
+        assert_eq!(sand_hue_from_name("Red Sand"), Some(SandHue::Red));
+        assert_eq!(sand_hue_from_name("sandy loam"), None);
+    }
+
+    #[test]
+    fn a_palette_resolves_sand_hue_from_the_material_list() {
+        use dfhack_remote::rfr::MaterialDefinition;
+        let pair = MatPair { mat_type: 0, mat_index: 5 };
+        let other = MatPair { mat_type: 0, mat_index: 6 };
+        let materials = MaterialList {
+            material_list: vec![
+                MaterialDefinition {
+                    mat_pair: pair,
+                    id: Some("SAND_BLACK".to_string()),
+                    ..Default::default()
+                },
+                MaterialDefinition {
+                    mat_pair: other,
+                    id: Some("CLAY_LOAM".to_string()),
+                    ..Default::default()
+                },
+            ],
+        };
+        let palette = Palette::new(TiletypeList::default(), materials);
+        assert_eq!(palette.sand_hue(&pair), Some(SandHue::Black));
+        assert_eq!(palette.sand_hue(&other), None);
+    }
+
+    #[test]
+    fn a_sand_tile_keeps_its_own_colour_instead_of_the_generic_soil_brown() {
+        use dfhack_remote::rfr::{ColorDefinition, MaterialDefinition, Tiletype};
+        let pair = MatPair { mat_type: 0, mat_index: 9 };
+        let materials = MaterialList {
+            material_list: vec![MaterialDefinition {
+                mat_pair: pair,
+                id: Some("SAND_BLACK".to_string()),
+                state_color: Some(ColorDefinition { red: 10, green: 10, blue: 10 }),
+                ..Default::default()
+            }],
+        };
+        let tile = Tiletype {
+            id: 1,
+            material: Some(TiletypeMaterial::Soil as i32),
+            ..Default::default()
+        };
+        let tiletypes = TiletypeList { tiletype_list: vec![tile] };
+        let palette = Palette::new(tiletypes, materials);
+        assert_eq!(palette.color(1, &pair), [10, 10, 10]);
+        // A clay tile of the same class still reads as the generic soil.
+        let clay = MatPair { mat_type: 0, mat_index: 10 };
+        assert_eq!(palette.color(1, &clay), terrain_color(TiletypeMaterial::Soil));
+    }
 }

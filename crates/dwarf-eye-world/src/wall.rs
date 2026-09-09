@@ -14,6 +14,7 @@
 //! two luma levels out of 255, so nothing on the sheet is a lit face — so a
 //! side is cut from the same sprite here, for tiling rather than for meaning.
 
+use crate::palette::SandHue;
 use dfhack_remote::rfr::{TiletypeMaterial, TiletypeSpecial};
 use dwarf_eye_art::Sprite;
 use dwarf_eye_art::raws::{EAST, NORTH, SOUTH, WEST};
@@ -110,6 +111,23 @@ pub fn family_for(
         (M::Stone | M::Feature | M::Hfs, false) => "STONE_WALL",
         _ => return None,
     })
+}
+
+/// The wall sheet a sand hue draws from.
+///
+/// One sheet, `wall_sand.png`, holds all five, at the same fifteen masks
+/// `SOIL_WALL` uses but under DF's own single-letter suffixes rather than a
+/// colour word: `SAND_WALL` unlabelled (tan), then `SAND_Y_WALL`,
+/// `SAND_W_WALL`, `SAND_B_WALL`, `SAND_R_WALL`. Full colour like the ramp
+/// sheets, not a pattern to tint.
+pub fn sand_family(hue: SandHue) -> &'static str {
+    match hue {
+        SandHue::Tan => "SAND_WALL",
+        SandHue::Yellow => "SAND_Y_WALL",
+        SandHue::White => "SAND_W_WALL",
+        SandHue::Black => "SAND_B_WALL",
+        SandHue::Red => "SAND_R_WALL",
+    }
 }
 
 /// How dark the rock behind a wall sprite is, as a fraction of the sprite's
@@ -246,6 +264,21 @@ mod tests {
         // `parse_part` eats a trailing direction group, so two names could in
         // principle land on the same index key. Neither spelling does.
         for family in ["STONE_WALL", "SMOOTHED_STONE_WALL"] {
+            let keys: HashSet<_> = masks()
+                .flat_map(|mask| sprite_names(family, mask))
+                .map(|name| parse_part(&name))
+                .collect();
+            assert_eq!(keys.len(), 30, "{family} lost a variant to the parser");
+        }
+    }
+
+    #[test]
+    fn every_hue_has_a_distinct_wall_sheet_that_survives_the_parser() {
+        use dwarf_eye_art::raws::parse_part;
+        let families: Vec<_> = SandHue::ALL.iter().map(|h| sand_family(*h)).collect();
+        let unique: HashSet<_> = families.iter().collect();
+        assert_eq!(unique.len(), 5, "two hues share a sheet");
+        for family in families {
             let keys: HashSet<_> = masks()
                 .flat_map(|mask| sprite_names(family, mask))
                 .map(|name| parse_part(&name))

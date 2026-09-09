@@ -4,6 +4,7 @@ use crate::canopy::CanopyPart;
 use crate::factory::{self, Plan};
 use crate::mesh::MeshData;
 use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
+use crate::palette::SandHue;
 use crate::ramp;
 use crate::wall;
 use anyhow::Result;
@@ -66,6 +67,8 @@ struct ModelKey {
     caps: Caps,
     /// Orientation, for geometry the mesher works out from neighbours.
     dirs: u8,
+    /// The tile's own sand hue, where it has one.
+    sand: Option<SandHue>,
 }
 
 struct TileInfo {
@@ -76,6 +79,10 @@ struct TileInfo {
     beneath: Option<&'static str>,
     /// Which of DF's ramp sheets a ramp tile draws from.
     ramp: Option<&'static str>,
+    /// Whether this tiletype's material class is `Soil`: the gate for trying
+    /// a sand hue's sheet in place of the generic soil one, on a floor, a wall
+    /// or a ramp alike.
+    soil: bool,
     dirs: u8,
     /// Neighbours a branch tile joins, read from DFHack's direction string.
     links: u8,
@@ -235,6 +242,43 @@ fn ground_alias(family: &str) -> Vec<String> {
     vec![family.to_string()]
 }
 
+/// The floor sheet a sand hue draws from. Tan is the unlabelled sheet DF
+/// ships alongside the four named ones.
+fn sand_floor_family(hue: SandHue) -> &'static str {
+    match hue {
+        SandHue::Tan => "SAND_FLOOR",
+        SandHue::Yellow => "SAND_YELLOW_FLOOR",
+        SandHue::White => "SAND_WHITE_FLOOR",
+        SandHue::Black => "SAND_BLACK_FLOOR",
+        SandHue::Red => "SAND_RED_FLOOR",
+    }
+}
+
+/// A soil floor's sand counterpart for one hue, mirroring `ground_alias`'s
+/// numbered-family reduction onto DF's sand floor sheets: `SoilFloor2`'s
+/// `SOIL_FLOOR_2` becomes `SAND_YELLOW_FLOOR_5B` rather than `DIRT_FLOOR_5B`.
+/// `None` when `family` is not one of DFHack's numbered soil floors.
+fn sand_floor_alias(family: &str, hue: SandHue) -> Option<Vec<String>> {
+    const SUFFIX: [&str; 4] = ["", "B", "C", "D"];
+    let n = family.strip_prefix("SOIL_FLOOR_")?;
+    let index = n.parse::<usize>().unwrap_or(1).saturating_sub(1).min(3);
+    let base = sand_floor_family(hue);
+    Some(vec![format!("{base}_5{}", SUFFIX[index]), format!("{base}_5")])
+}
+
+/// The single ground-beneath sheet a sand hue draws from — the fixed centre
+/// variant `ground_under`'s `DIRT_FLOOR_5` names for every other soil, used
+/// under a billboard and on a flat or unsheeted ramp.
+fn sand_ground_family(hue: SandHue) -> &'static str {
+    match hue {
+        SandHue::Tan => "SAND_FLOOR_5",
+        SandHue::Yellow => "SAND_YELLOW_FLOOR_5",
+        SandHue::White => "SAND_WHITE_FLOOR_5",
+        SandHue::Black => "SAND_BLACK_FLOOR_5",
+        SandHue::Red => "SAND_RED_FLOOR_5",
+    }
+}
+
 /// Which of DF's floor sheets a built floor draws from, or `None` for ground
 /// the numbered families already name.
 ///
@@ -304,6 +348,10 @@ pub struct TileLibrary {
     /// Ground families packed for use beneath free-standing objects.
     under_uv: HashMap<&'static str, (Rect, bool)>,
     under_model: HashMap<&'static str, Option<Model>>,
+    /// (soil floor tiletype, sand hue) -> where that hue's floor sprite sits
+    /// in the atlas, for the floors `flat_uv` would otherwise send to
+    /// `DIRT_FLOOR` regardless of which sand the tile actually is.
+    sand_flat_uv: HashMap<(i32, SandHue), (Rect, bool)>,
     /// Species index -> the colour its crown is painted, cached on first use.
     canopy_color: HashMap<i32, [u8; 3]>,
     /// Species index -> the colour of its wood.
@@ -326,8 +374,9 @@ pub struct TileLibrary {
     building_uv: HashMap<BuildingCell, (Rect, bool)>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
-    /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
-    ramp_model: HashMap<(i32, u8), Option<Model>>,
+    /// Ramp geometry, by tiletype, the eight-neighbour wall mask and the
+    /// tile's sand hue, where it has one.
+    ramp_model: HashMap<(i32, u8, Option<SandHue>), Option<Model>>,
     /// Tiletypes the factory calls built work. Kept apart from `tiles`, which
     /// holds only what has a sprite treatment: a constructed wall is drawn as a
     /// plain block and would not be in there, and a tree still has to know not
@@ -404,6 +453,7 @@ impl TileLibrary {
                     ramp: (mode == RenderMode::Ramp)
                         .then(|| ramp::family_for(t.material()))
                         .flatten(),
+                    soil: t.material() == TiletypeMaterial::Soil,
                     // The block sheet has no directional cuts, so the sixteen
                     // track floors would otherwise pack one sprite sixteen
                     // times under sixteen atlas keys.
@@ -448,6 +498,7 @@ impl TileLibrary {
             flat_tint: HashMap::new(),
             under_uv: HashMap::new(),
             under_model: HashMap::new(),
+            sand_flat_uv: HashMap::new(),
             canopy_color: HashMap::new(),
             bark: HashMap::new(),
             leaf_uv: HashMap::new(),
@@ -532,6 +583,41 @@ impl TileLibrary {
                 self.flat_tint.insert((tile, plant_index), pattern);
             }
         }
+
+        self.pack_sand_floors();
+    }
+
+    /// Packs every sand hue's floor sheet for each soil floor tiletype.
+    ///
+    /// A specific tile's material tells sand from clay, not its tiletype, so
+    /// this cannot fold into the loop above: every soil floor tiletype gets
+    /// all five hues packed regardless of which (if any) actually turns up on
+    /// the map, the same bargain `pack_ramps` and `pack_walls` make for the
+    /// sheets they hold ready before the first block arrives.
+    fn pack_sand_floors(&mut self) {
+        let soil_floors: Vec<(i32, String, u8)> = self
+            .tiles
+            .iter()
+            .filter(|(_, info)| info.mode == RenderMode::FlatTile && info.soil)
+            .map(|(id, info)| (*id, info.family.clone(), info.dirs))
+            .collect();
+        for (tile, family, dirs) in soil_floors {
+            for hue in SandHue::ALL {
+                let Some(candidates) = sand_floor_alias(&family, hue) else { continue };
+                let found = candidates.iter().find_map(|name| {
+                    self.art.tree_sprite("", name, dirs).cloned().map(|s| (name.clone(), s))
+                });
+                let Some((name, sprite)) = found else {
+                    self.misses.insert(candidates[0].clone());
+                    continue;
+                };
+                let pattern = sprite.saturation() < PATTERN_SATURATION;
+                let backdrop = if pattern { Some([255, 255, 255]) } else { sprite_mean(&sprite) };
+                let key = atlas_key(&name, dirs, "");
+                let Some(rect) = self.atlas.insert(key, &sprite, backdrop) else { continue };
+                self.sand_flat_uv.insert((tile, hue), (rect, pattern));
+            }
+        }
     }
 
     /// A ramp's sloped surface for one eight-neighbour wall mask.
@@ -541,34 +627,45 @@ impl TileLibrary {
     /// always agrees with the shape underneath it.
     ///
     /// Falls back to a flat slab of ground when no neighbour is a wall and
-    /// there is nothing for the tile to climb toward.
-    pub fn ramp(&mut self, tile: i32, mask: u8) -> Option<Model> {
-        if let Some(found) = self.ramp_model.get(&(tile, mask)) {
+    /// there is nothing for the tile to climb toward. `sand` is the specific
+    /// tile's own hue, not the tiletype's: only a soil ramp with one draws
+    /// from the sand sheets, everything else ignores it.
+    pub fn ramp(&mut self, tile: i32, mask: u8, sand: Option<SandHue>) -> Option<Model> {
+        let cache_key = (tile, mask, sand);
+        if let Some(found) = self.ramp_model.get(&cache_key) {
             return found.clone();
         }
 
         let info = self.tiles.get(&tile)?;
+        let hue = sand.filter(|_| info.soil);
+        // The ground a flat or unsheeted sloped ramp wears: the hue's own
+        // sand sheet where the tile has one, else the family's generic
+        // ground, both packed by `pack_under`.
+        let beneath = |lib: &Self| -> Option<(Rect, bool)> {
+            hue.and_then(|h| lib.under_uv.get(sand_ground_family(h)).copied())
+                .or_else(|| info.beneath.and_then(|g| lib.under_uv.get(g).copied()))
+        };
         let built = if ramp::is_flat(mask) {
-            let family = info.beneath?;
-            self.under_uv.get(family).copied().map(|(rect, tint)| Model {
+            beneath(self).map(|(rect, tint)| Model {
                 mesh: Arc::new(build_flat_tile(rect, FLOOR_HEIGHT)),
                 tint,
             })
         } else {
             // A slope with a sheet of its own wears DF's sprite for this wall
-            // set, greyed to a pattern at pack time. The rest — soil, grass,
-            // ice, everything whose sheet bakes in a shadow or does not exist
-            // — wear the flat ground beside them, lit by the renderer.
-            let uv = match info.ramp {
+            // set, greyed to a pattern at pack time (or, for sand, kept in
+            // its own full colour). The rest — soil, grass, ice, everything
+            // whose sheet bakes in a shadow or does not exist — wear the flat
+            // ground beside them, lit by the renderer.
+            let uv = match hue.map(ramp::sand_family).or(info.ramp) {
                 Some(family) => self.ramp_uv.get(&ramp::sprite_name(family, mask)).copied(),
-                None => info.beneath.and_then(|ground| self.under_uv.get(ground).copied()),
+                None => beneath(self),
             };
             uv.map(|(rect, tint)| Model {
                 mesh: Arc::new(ramp::build_ramp(rect, mask, FLOOR_HEIGHT)),
                 tint,
             })
         };
-        self.ramp_model.insert((tile, mask), built.clone());
+        self.ramp_model.insert(cache_key, built.clone());
         built
     }
 
@@ -608,13 +705,22 @@ impl TileLibrary {
     }
 
     /// Packs the handful of ground families used beneath objects.
+    ///
+    /// Every sand hue's own single-cell ground sheet is packed alongside the
+    /// generic `DIRT_FLOOR_5` whenever a soil tile needs ground beneath it —
+    /// a billboard standing on sand, or a flat or unsheeted sand ramp — since
+    /// which hue a specific tile is comes from its material, not its
+    /// tiletype, and is not known until a voxel asks.
     fn pack_under(&mut self) {
-        let wanted: Vec<&'static str> = {
+        let mut wanted: Vec<&'static str> = {
             let mut v: Vec<_> = self.tiles.values().filter_map(|t| t.beneath).collect();
             v.sort_unstable();
             v.dedup();
             v
         };
+        if self.tiles.values().any(|t| t.soil && t.beneath.is_some()) {
+            wanted.extend(SandHue::ALL.iter().map(|hue| sand_ground_family(*hue)));
+        }
         for family in wanted {
             let Some(sprite) = self.art.tree_sprite("", family, 0).cloned() else {
                 self.misses.insert(family.to_string());
@@ -654,19 +760,35 @@ impl TileLibrary {
                         .and_then(|g| self.under_uv.get(g))
                         .is_some_and(|(_, pattern)| *pattern)
             });
+            self.pack_ramp_family(family, tinted);
+        }
 
-            for name in ramp::sprite_names(family) {
-                let key = raws::parse_part(&name);
-                let Some(sprite) = self.art.tree_sprite("", &key.family, key.dirs).cloned() else {
-                    self.misses.insert(name);
-                    continue;
-                };
-                let sprite = if tinted { ramp::neutralise(&sprite) } else { sprite };
-                let pattern = tinted || sprite.saturation() < PATTERN_SATURATION;
-                let backdrop = sprite_mean(&sprite);
-                if let Some(rect) = self.atlas.insert(atlas_key(&name, 0, ""), &sprite, backdrop) {
-                    self.ramp_uv.insert(name, (rect, pattern));
-                }
+        // A sand ramp's own sheet is full colour, unlike `STONE_RAMP`: never
+        // neutralised, and packed for every hue regardless of which (if any)
+        // this map actually has, the same as `pack_walls` does for
+        // `SOIL_WALL`. Which hue a specific tile is comes from its material,
+        // not from `TileInfo::ramp` above.
+        if self.tiles.values().any(|t| t.mode == RenderMode::Ramp && t.soil) {
+            for hue in SandHue::ALL {
+                self.pack_ramp_family(ramp::sand_family(hue), false);
+            }
+        }
+    }
+
+    /// Packs one ramp family's 47 sprites, neutralised to a pattern first
+    /// when `tinted`.
+    fn pack_ramp_family(&mut self, family: &str, tinted: bool) {
+        for name in ramp::sprite_names(family) {
+            let key = raws::parse_part(&name);
+            let Some(sprite) = self.art.tree_sprite("", &key.family, key.dirs).cloned() else {
+                self.misses.insert(name);
+                continue;
+            };
+            let sprite = if tinted { ramp::neutralise(&sprite) } else { sprite };
+            let pattern = tinted || sprite.saturation() < PATTERN_SATURATION;
+            let backdrop = sprite_mean(&sprite);
+            if let Some(rect) = self.atlas.insert(atlas_key(&name, 0, ""), &sprite, backdrop) {
+                self.ramp_uv.insert(name, (rect, pattern));
             }
         }
     }
@@ -687,12 +809,19 @@ impl TileLibrary {
     /// tiletype list, so the whole set is finished before the first frame like
     /// the ground and the ramps are.
     fn pack_walls(&mut self) {
-        let wanted: Vec<&'static str> = {
+        let mut wanted: Vec<&'static str> = {
             let mut v: Vec<_> = self.walls.values().copied().collect();
             v.sort_unstable();
             v.dedup();
             v
         };
+        // A sand wall's own sheet is full colour, packed for every hue
+        // regardless of which (if any) this map actually has, the same as
+        // the ramps do — which hue a specific wall is comes from its
+        // material, not from `walls` above.
+        if wanted.contains(&"SOIL_WALL") {
+            wanted.extend(SandHue::ALL.iter().map(|hue| wall::sand_family(*hue)));
+        }
 
         for family in wanted {
             // The fully connected sprite is the only one that covers the tile,
@@ -820,8 +949,17 @@ impl TileLibrary {
     }
 
     /// Where a wall's faces sample the atlas, for a set of neighbouring walls.
-    pub fn wall_skin(&self, tile: i32, mask: u8) -> Option<WallSkin> {
-        let family = *self.walls.get(&tile)?;
+    ///
+    /// `sand` is the specific tile's own hue; only a `SOIL_WALL` tile with one
+    /// is redirected to its sand sheet, falling back to plain soil if that
+    /// hue somehow was not packed.
+    pub fn wall_skin(&self, tile: i32, mask: u8, sand: Option<SandHue>) -> Option<WallSkin> {
+        let base = *self.walls.get(&tile)?;
+        let family = sand
+            .filter(|_| base == "SOIL_WALL")
+            .map(wall::sand_family)
+            .filter(|f| self.wall_side.contains_key(f))
+            .unwrap_or(base);
         let (side, tint) = *self.wall_side.get(family)?;
         let top = *self.wall_top.get(&(family, wall::variant(mask)))?;
         Some(WallSkin { top, side, tint })
@@ -840,6 +978,18 @@ impl TileLibrary {
     /// How many atlas cells the wall sheets took.
     pub fn wall_cells(&self) -> usize {
         self.wall_top.len() + self.wall_side.len()
+    }
+
+    /// How many atlas cells the ramp sheets took in total, and how many of
+    /// those are the five sand hues' own sheets.
+    pub fn ramp_cells(&self) -> (usize, usize) {
+        let sand = self.ramp_uv.keys().filter(|name| name.starts_with("SAND_")).count();
+        (self.ramp_uv.len(), sand)
+    }
+
+    /// How many atlas cells a soil floor's sand hues took.
+    pub fn sand_floor_cells(&self) -> usize {
+        self.sand_flat_uv.len()
     }
 
     /// Per-family wall packing result: family, whether it is tinted by the
@@ -907,10 +1057,15 @@ impl TileLibrary {
 
     /// Returns the geometry for a tile, or `None` when it has no sprite and the
     /// caller should fall back to a plain block.
-    pub fn model(&mut self, tile: i32, mat_index: i32, caps: Caps) -> Option<Model> {
+    ///
+    /// `sand` is the specific tile's own hue; only a soil floor with one is
+    /// redirected to that hue's sheet, so a black sand beach and a clay floor
+    /// of the same tiletype still resolve to different cells.
+    pub fn model(&mut self, tile: i32, mat_index: i32, sand: Option<SandHue>, caps: Caps) -> Option<Model> {
         let info = self.tiles.get(&tile)?;
         let plant = if info.generic { -1 } else { mat_index };
-        let key = ModelKey { tile, plant, caps, dirs: 0 };
+        let hue = sand.filter(|_| info.soil);
+        let key = ModelKey { tile, plant, caps, dirs: 0, sand: hue };
         if let Some(found) = self.cache.get(&key) {
             return found.clone();
         }
@@ -926,19 +1081,26 @@ impl TileLibrary {
         // Ground was packed at load; look up its atlas cell instead of
         // voxelising a picture.
         if mode == RenderMode::FlatTile {
-            let uv = self
-                .flat_uv
-                .get(&(tile, mat_index))
-                .or_else(|| self.flat_uv.get(&(tile, -1)))
-                .copied();
-            let built = uv.map(|rect| Model {
+            let uv = hue
+                .and_then(|h| self.sand_flat_uv.get(&(tile, h)))
+                .copied()
+                .or_else(|| {
+                    let rect = self
+                        .flat_uv
+                        .get(&(tile, mat_index))
+                        .or_else(|| self.flat_uv.get(&(tile, -1)))
+                        .copied()?;
+                    let tint = self
+                        .flat_tint
+                        .get(&(tile, mat_index))
+                        .or_else(|| self.flat_tint.get(&(tile, -1)))
+                        .copied()
+                        .unwrap_or(true);
+                    Some((rect, tint))
+                });
+            let built = uv.map(|(rect, tint)| Model {
                 mesh: Arc::new(build_flat_tile(rect, FLOOR_HEIGHT)),
-                tint: self
-                    .flat_tint
-                    .get(&(tile, mat_index))
-                    .or_else(|| self.flat_tint.get(&(tile, -1)))
-                    .copied()
-                    .unwrap_or(true),
+                tint,
             });
             self.cache.insert(key, built.clone());
             return built;
@@ -1152,6 +1314,48 @@ impl TileLibrary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_soil_floor_maps_onto_the_matching_sand_variant() {
+        // SoilFloor2's numbered suffix (5B) survives onto whichever hue the
+        // specific tile turns out to be, the way `ground_alias` maps it onto
+        // `DIRT_FLOOR_5B` for every other soil.
+        assert_eq!(
+            sand_floor_alias("SOIL_FLOOR_2", SandHue::Yellow),
+            Some(vec!["SAND_YELLOW_FLOOR_5B".to_string(), "SAND_YELLOW_FLOOR_5".to_string()])
+        );
+        assert_eq!(
+            sand_floor_alias("SOIL_FLOOR_1", SandHue::Tan),
+            Some(vec!["SAND_FLOOR_5".to_string(), "SAND_FLOOR_5".to_string()])
+        );
+        // Furrowed soil and anything not a numbered soil floor has no sand
+        // counterpart to try.
+        assert_eq!(sand_floor_alias("FURROWED_SOIL", SandHue::Red), None);
+        assert_eq!(sand_floor_alias("STONE_FLOOR_1", SandHue::Red), None);
+    }
+
+    #[test]
+    fn every_hue_names_a_distinct_floor_and_ground_family() {
+        let floor: HashSet<_> = SandHue::ALL.iter().map(|h| sand_floor_family(*h)).collect();
+        let ground: HashSet<_> = SandHue::ALL.iter().map(|h| sand_ground_family(*h)).collect();
+        assert_eq!(floor.len(), 5);
+        assert_eq!(ground.len(), 5);
+    }
+
+    #[test]
+    fn the_five_hues_worth_of_sheets_fit_the_atlas_budget() {
+        // Ramps: 5 hues x 47 sprites. Walls: 5 hues x (15 masks + 1 side).
+        // Floors: a handful of soil floor tiletypes x 5 hues, small next to
+        // the rest. None of it is worth the atlas's 1024 cells (32x32) on its
+        // own, but the ramp and wall additions are the two large blocks, so a
+        // budget check pins them rather than the whole atlas, which needs a
+        // DF install to build.
+        let ramp_cells = 5 * 47;
+        let wall_cells = 5 * (15 + 1);
+        assert_eq!(ramp_cells, 235);
+        assert_eq!(wall_cells, 80);
+        assert!(ramp_cells + wall_cells < 32 * 32);
+    }
 
     #[test]
     fn a_built_floor_takes_dfs_block_sheet() {

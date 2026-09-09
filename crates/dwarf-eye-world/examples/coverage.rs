@@ -24,21 +24,22 @@ fn main() -> Result<()> {
     df.fetch(BlockBounds::around_tile(cx, cy, cz, 4, 4), true)?;
 
     // Count how each distinct tile in view is treated.
-    let mut tally: HashMap<(i32, i32), usize> = HashMap::new();
+    let mut tally: HashMap<(i32, i32, Option<dwarf_eye_world::palette::SandHue>), usize> =
+        HashMap::new();
     for chunk in df.world.chunks() {
         for v in &chunk.voxels {
             if v.solid.is_empty() {
                 continue;
             }
-            *tally.entry((v.tile_id, v.mat_index)).or_default() += 1;
+            *tally.entry((v.tile_id, v.mat_index, v.sand)).or_default() += 1;
         }
     }
 
     let mut rows: Vec<_> = tally
         .into_iter()
-        .map(|((tile, mat), n)| {
+        .map(|((tile, mat, sand), n)| {
             let handled = lib.handles(tile);
-            let modelled = handled && lib.model(tile, mat, Caps::BOTH).is_some();
+            let modelled = handled && lib.model(tile, mat, sand, Caps::BOTH).is_some();
             (n, tile, mat, handled, modelled)
         })
         .collect();
