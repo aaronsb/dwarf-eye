@@ -2383,6 +2383,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bevy",
+ "bytemuck",
  "dfhack-remote",
  "dwarf-eye-art",
  "dwarf-eye-trees",

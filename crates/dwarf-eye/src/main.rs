@@ -7,6 +7,7 @@ mod camera;
 mod capture;
 mod clouds;
 mod god_rays;
+mod instancing;
 mod noise;
 mod polls;
 mod precipitation;
@@ -121,6 +122,7 @@ fn main() {
         .add_plugins(shadow::CloudShadowPlugin)
         .add_plugins(clouds::CloudPlugin)
         .add_plugins(god_rays::GodRaysPlugin)
+        .add_plugins(instancing::InstancingPlugin)
         .add_plugins(capture::CapturePlugin)
         .add_plugins(precipitation::PrecipitationPlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
