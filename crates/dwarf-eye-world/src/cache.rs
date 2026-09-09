@@ -7,10 +7,12 @@
 //! elevation), so a later session with a different render origin places them
 //! where they belong.
 //!
-//! Layout: one file per chunk, `<bx>_<by>_<z>.chunk`, 256 voxels of 19 bytes
-//! after a 4-byte magic. The format is private to this crate, and the magic
-//! carries its version: a file written by an older layout fails to read and is
-//! deleted.
+//! Layout: one file per chunk, `<bx>_<by>_<z>.chunk`, 256 voxels of 24 bytes
+//! after a 4-byte magic. Loose items are not in it: they move faster than the
+//! cache is read back, so a restored chunk simply carries none.
+//!
+//! The format is private to this crate, and the magic carries its version: a
+//! file written by an older layout fails to read and is deleted.
 //!
 //! Alongside them sits `floors`, one line per block column: the level at which
 //! that column turned to unrevealed rock, so a later session knows how deep to
@@ -25,8 +27,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"DEC2";
-const VOXEL_BYTES: usize = 19;
+const MAGIC: &[u8; 4] = b"DEC3";
+const VOXEL_BYTES: usize = 24;
 
 /// Name and version of the column-floor sidecar.
 const FLOORS: &str = "floors";
@@ -102,6 +104,9 @@ impl Cache {
             bytes.push(v.tree_dx as u8);
             bytes.push(v.tree_dy as u8);
             bytes.push(v.tree_dz as u8);
+            bytes.extend_from_slice(&v.building.to_le_bytes());
+            bytes.extend_from_slice(&v.building_sub.to_le_bytes());
+            bytes.push(v.building_at);
         }
         let path = self.path(key);
         let tmp = path.with_extension("tmp");
@@ -232,6 +237,9 @@ fn read_chunk(path: &Path) -> Result<Vec<Voxel>> {
             tree_dx: v[16] as i8,
             tree_dy: v[17] as i8,
             tree_dz: v[18] as i8,
+            building: i16::from_le_bytes([v[19], v[20]]),
+            building_sub: i16::from_le_bytes([v[21], v[22]]),
+            building_at: v[23],
         });
     }
     Ok(voxels)

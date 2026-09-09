@@ -12,11 +12,22 @@ holds, and remembers how deep each block column is worth asking about.
 
 `Cache::open` places one directory per world under
 `~/.cache/dwarf-eye/<world>-<save>/`, with `DWARF_EYE_CACHE` overriding the
-root. One file per chunk, `<bx>_<by>_<z>.chunk`: a 4-byte magic `DEC2` then 256
-voxels of 19 bytes (`cache.rs:Cache::store`, `cache.rs:read_chunk`). Keys are
+root. One file per chunk, `<bx>_<by>_<z>.chunk`: a 4-byte magic `DEC3` then 256
+voxels of 24 bytes (`cache.rs:Cache::store`, `cache.rs:read_chunk`). Keys are
 absolute. `Session::persist` writes every chunk that arrived;
 `Session::restore_cache` reads them back on connect and places them through
 `World::restore`, which never overwrites a chunk the game has already supplied.
+
+`DEC3` added the five bytes a building takes in a voxel: DF's building type and
+subtype, and where the tile sits inside the footprint (issue #15). A `DEC2`
+file fails to read and is deleted, so the first connect after the bump refetches
+the land rather than losing it.
+
+What a building is *made of* is not in the file. Colour and material sheet live
+in `Chunk::built`, a sparse side table filled from the reply, and so do item
+piles in `Chunk::piles`: both are what the game holds right now, and a chunk
+read back from disk is land the game has moved on from. A restored hall keeps
+its furniture and draws it in stone until the window returns to it.
 
 Alongside the chunks sits `floors`, one line per block column giving the level
 at which that column turned to unrevealed rock, versioned by its first line

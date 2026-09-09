@@ -348,7 +348,113 @@ pub struct Budget {
     pub floors: usize,
     pub foliage: usize,
     pub liquids: usize,
+    pub buildings: usize,
+    pub items: usize,
     pub other: usize,
+}
+
+/// Buildings and item piles: a second pass over the chunk, drawn on top of
+/// whatever the tile itself drew.
+///
+/// A building is a thing standing in a tile, not a tile: DF reports it apart
+/// from the tiletype, and the floor under a door is still a floor. So the box
+/// goes on afterwards rather than in place of the tile, and a hatch over a
+/// shaft still lands where the tile itself is empty.
+///
+/// The factory decides the class and the treatment; this only draws what it
+/// says, inside the footprint DF gave it and never outside.
+fn build_furnishings(
+    chunk: &Chunk,
+    opts: MeshOptions,
+    library: Option<&TileLibrary>,
+    mesh: &mut MeshData,
+    budget: &mut Budget,
+) {
+    if chunk.z > opts.z_ceiling {
+        return;
+    }
+    let (ox, oy, oz) = chunk.origin();
+
+    for ly in 0..BLOCK {
+        for lx in 0..BLOCK {
+            let voxel = chunk.get(lx, ly);
+            if voxel.hidden && !opts.show_hidden {
+                continue;
+            }
+            let (fx, fy, fz) = ((ox + lx) as f32, oz as f32 * Z_SCALE, (oy + ly) as f32);
+
+            if voxel.built_over() {
+                let class = crate::factory::classify_building(voxel.building as i32);
+                let kind = crate::factory::building_kind(voxel.building as i32);
+                if let (crate::factory::Treatment::Massing(height), true) =
+                    (crate::factory::resolve(class, Style::current()), kind.drawn())
+                {
+                    let built = chunk.built(lx, ly);
+                    let lid = library.and_then(|lib| {
+                        lib.building_cell(
+                            voxel.building as i32,
+                            voxel.building_sub as i32,
+                            built.sheet,
+                            voxel.building_offset(),
+                        )
+                    });
+                    let before = mesh.indices.len();
+                    let colour = to_linear(built.color, 1.0);
+                    let top = fy + height * Z_SCALE;
+                    // The sides are the material — DF draws no side of a chair
+                    // and inventing one would be a lie — and the lid is DF's
+                    // own picture of the thing, seen from above, which is the
+                    // only view it ever drew.
+                    mesh.cuboid(
+                        [fx, fy, fz],
+                        [fx + 1.0, top, fz + 1.0],
+                        colour,
+                        Faces { bottom: true, top: lid.is_some(), ..Default::default() },
+                    );
+                    if let Some((rect, pattern)) = lid {
+                        // A near-grey sheet is a pattern the material colours,
+                        // as the ground is; one with colour of its own keeps it.
+                        let tint = if pattern {
+                            let d = damp([colour[0], colour[1], colour[2]], 0.35);
+                            [d[0], d[1], d[2], 1.0]
+                        } else {
+                            [1.0, 1.0, 1.0, 1.0]
+                        };
+                        mesh.push_textured_quad(
+                            [
+                                [fx, top, fz],
+                                [fx, top, fz + 1.0],
+                                [fx + 1.0, top, fz + 1.0],
+                                [fx + 1.0, top, fz],
+                            ],
+                            [0.0, 1.0, 0.0],
+                            tint,
+                            [
+                                [rect.u0, rect.v0],
+                                [rect.u0, rect.v1],
+                                [rect.u1, rect.v1],
+                                [rect.u1, rect.v0],
+                            ],
+                        );
+                    }
+                    budget.buildings += (mesh.indices.len() - before) / 3;
+                }
+            }
+
+            // A stockpile square, and nothing smaller: one dropped sock costs
+            // a box for nothing.
+            if let Some(pile) = chunk.pile(lx, ly) {
+                let before = mesh.indices.len();
+                mesh.cuboid(
+                    [fx + 0.1, fy, fz + 0.1],
+                    [fx + 0.9, fy + crate::factory::PILE_HEIGHT * Z_SCALE, fz + 0.9],
+                    to_linear(pile.color, 1.0),
+                    Faces { bottom: true, ..Default::default() },
+                );
+                budget.items += (mesh.indices.len() - before) / 3;
+            }
+        }
+    }
 }
 
 pub fn build_chunk(
@@ -688,6 +794,8 @@ pub fn build_chunk_budgeted(
             tally(&mesh, before, &mut budget.liquids);
         }
     }
+
+    build_furnishings(chunk, opts, library.as_deref(), &mut mesh, budget);
 
     // Water is a sheet across tiles rather than a box inside one, and it is
     // meshed whatever else a tile is drawing: a pool's rim tiles are ramps, and

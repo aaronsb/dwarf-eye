@@ -230,7 +230,7 @@ impl Envelope {
                 for i in 0..bw {
                     if world
                         .voxel(bx0 + i, by0 + j, z)
-                        .is_some_and(|v| library.is_built(v.tile_id))
+                        .is_some_and(|v| library.is_built(v.tile_id) || v.built_over())
                     {
                         slab[(j * bw + i) as usize] = true;
                     }

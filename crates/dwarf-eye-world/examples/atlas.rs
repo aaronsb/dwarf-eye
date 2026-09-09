@@ -13,11 +13,12 @@ fn main() -> Result<()> {
     let atlas = lib.atlas();
 
     println!(
-        "atlas {}x{}, {} cells used, {} of them walls",
+        "atlas {}x{}, {} cells used, {} of them walls, {} of them buildings",
         atlas.width,
         atlas.height,
         atlas.capacity_used(),
-        lib.wall_cells()
+        lib.wall_cells(),
+        lib.building_cells()
     );
     for (family, tint, cells) in lib.wall_report() {
         println!("  {family:<22} {cells:>2} cells {}", if tint { "tinted" } else { "own colour" });

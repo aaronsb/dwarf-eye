@@ -31,6 +31,7 @@ rfr!(GET_WORLD_MAP_CENTER, "GetWorldMapCenter", EMPTY, "RemoteFortressReader.Wor
 rfr!(GET_WORLD_MAP, "GetWorldMap", EMPTY, "RemoteFortressReader.WorldMap");
 rfr!(GET_WORLD_MAP_NEW, "GetWorldMapNew", EMPTY, "RemoteFortressReader.WorldMap");
 rfr!(GET_BUILDING_DEF_LIST, "GetBuildingDefList", EMPTY, "RemoteFortressReader.BuildingList");
+rfr!(GET_CREATURE_RAWS, "GetCreatureRaws", EMPTY, "RemoteFortressReader.CreatureRawList");
 rfr!(GET_PLANT_RAWS, "GetPlantRaws", EMPTY, "RemoteFortressReader.PlantRawList");
 rfr!(RESET_MAP_HASHES, "ResetMapHashes", EMPTY, EMPTY);
 
