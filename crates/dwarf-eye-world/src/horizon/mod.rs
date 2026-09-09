@@ -561,7 +561,7 @@ fn crown_mesh(preset: Preset, stage: Stage, variant: u32) -> MeshData {
         normals: source.normals,
         colors: source.colors,
         indices: source.indices,
-        water: None,
+        ..Default::default()
     }
 }
 

@@ -146,6 +146,33 @@ pub fn water_color(depth: f32) -> (Rgb, f32) {
     (rgb, 0.22 + 0.62 * t)
 }
 
+/// A film of magma over its own crust, and magma deep enough to be all glow.
+///
+/// The thin edge of a flow has cooled and lets the rock under it through; a sea
+/// is opaque and near white-hot. The material's emissive is what makes either
+/// of them light (`main.rs:MagmaMaterial`); these are the colours it multiplies.
+pub const MAGMA_THIN: Rgb = [168, 46, 16];
+pub const MAGMA_DEEP: Rgb = [255, 148, 42];
+
+/// How deep magma has to stand before it reads as a sea, in tiles.
+const MAGMA_RANGE: f32 = 2.0;
+
+/// Colour and opacity of a magma surface over `depth` tiles of magma.
+///
+/// Unlike water, magma darkens *outward*: the shallows are cooling crust rather
+/// than clear liquid, so they are dimmer and thinner and the deep is bright and
+/// nearly opaque.
+pub fn magma_color(depth: f32) -> (Rgb, f32) {
+    let t = (depth / MAGMA_RANGE).clamp(0.0, 1.0).powf(0.6);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    let rgb = [
+        mix(MAGMA_THIN[0], MAGMA_DEEP[0]),
+        mix(MAGMA_THIN[1], MAGMA_DEEP[1]),
+        mix(MAGMA_THIN[2], MAGMA_DEEP[2]),
+    ];
+    (rgb, 0.62 + 0.33 * t)
+}
+
 /// Everything needed to give a tile a shape and a colour.
 pub struct Palette {
     tiletypes: HashMap<i32, Tiletype>,

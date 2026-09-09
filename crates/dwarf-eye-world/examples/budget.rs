@@ -36,14 +36,22 @@ fn main() -> Result<()> {
         total.foliage += budget.foliage;
         total.liquids += budget.liquids;
         total.other += budget.other;
+        total.merged += budget.merged;
         if let Some(lib) = library.as_mut() {
             let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, Band::Near, &mut canopy);
             let _ = forest.build_budgeted(&df.world, chunk, opts, lib, origin, Band::Mid, &mut mid);
         }
         chunks += 1;
     }
+    // The classes are counted as the mesher pushes faces; the greedy merge
+    // takes some back out afterwards (`mesh.rs:Plane`).
     let sum = canopy.triangles + total.models + total.ramps + total.ground_under + total.cubes + total.floors + total.surface + total.foliage + total.liquids + total.other;
-    println!("{chunks} chunks, {sum} triangles");
+    println!(
+        "{chunks} chunks, {} triangles ({sum} pushed, {} merged away, {:.2}%)",
+        sum - total.merged,
+        total.merged,
+        total.merged as f32 * 100.0 / sum.max(1) as f32,
+    );
     for (name, n) in [
         ("trees", canopy.triangles),
         ("sprite models (trunks, shrubs, boulders)", total.models),

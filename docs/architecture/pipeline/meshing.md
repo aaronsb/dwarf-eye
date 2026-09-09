@@ -2,8 +2,8 @@
 
 Status: landed (`crates/dwarf-eye-world/src/mesh.rs`,
 `crates/dwarf-eye-world/src/heightfield.rs`,
-`crates/dwarf-eye-world/src/water.rs`, `crates/dwarf-eye-world/src/canopy.rs`,
-`crates/dwarf-eye/src/main.rs`).
+`crates/dwarf-eye-world/src/water.rs`, `crates/dwarf-eye-world/src/magma.rs`,
+`crates/dwarf-eye-world/src/canopy.rs`, `crates/dwarf-eye/src/main.rs`).
 
 ## What it does
 
@@ -19,11 +19,12 @@ indices; the renderer copies them straight into a Bevy mesh
 (`main.rs:to_bevy_mesh`). `mesh.rs:build_chunk_budgeted` is the same pass with a
 `Budget` tally, which `make budget` prints.
 
-Water is meshed separately too, by `water.rs:build_chunk`, and rides back
-inside `MeshData::water`; `main.rs:upload_chunks` lifts it out with
-`MeshData::take_water` and gives it its own entity on `main.rs:WaterMaterial`.
-It travels inside the terrain buffer only so a chunk stays one value on the
-channel.
+Each liquid is meshed separately too — water by `water.rs:build_chunk`, magma by
+`magma.rs:build_chunk` — and rides back inside `MeshData::water` and
+`MeshData::magma`; `main.rs:upload_chunks` lifts them out with
+`MeshData::take_water` and `MeshData::take_magma` and gives each its own entity
+on `main.rs:WaterMaterial` and `main.rs:MagmaMaterial`. They travel inside the
+terrain buffer only so a chunk stays one value on the channel.
 
 Crowns are meshed separately by `canopy.rs:Forest::build_chunk` into
 `CanopyMeshes`, four buffers: bark, broadleaf, needle, streamers. Each becomes
@@ -103,7 +104,7 @@ own slab before and may sink to meet the sheet, never rise off it.
 | `Ramp` | a patch of the ground sheet where natural; a constructed one keeps the wedge from the ramp sheet, or a half-height block with no sprite |
 | `Stair` | two stacked boxes |
 | `Foliage` | inset box, 0.85 tall |
-| magma | box whose height is the fill level over 7, opaque material |
+| magma | a surface with corner heights, on its own translucent, glowing material |
 | water | a surface with corner heights, on its own translucent material |
 
 ## Invariants and gotchas
@@ -123,13 +124,59 @@ own slab before and may sink to meet the sheet, never rise off it.
   `ramp.rs:NEIGHBOURS` is a wall. A wall's own sprite is picked the same way,
   from `wall.rs:NEIGHBOURS`, rather than from DF's `Tiletype::direction`
   ([../textures/walls.md](../textures/walls.md)).
-- Magma still draws as an opaque box with vertex alpha the material ignores.
-  Greedy-merging terrain cubes is the rest of issue #16; the merge already
-  exists for crowns in `canopy.rs:emit` and in `dwarf-eye-trees::mesh`.
+- The greedy merge only ever sees flat-coloured faces, so nothing wearing a
+  sprite can be moved by it; see below for what that leaves.
 - Natural ground is one smoothed sheet; the tile loop draws no top face and no
   side face for a tile the sheet covers, and the sheet draws its own rim.
   Constructed floors, buildings, stairs, water and anything a plant or a tree
   grows out of keep their tile geometry.
+
+## Greedy merging
+
+`mesh.rs:MeshData::merging` holds every flat-coloured face back instead of
+emitting it, buckets them by `mesh.rs:Plane`, and `flush_merges` joins the ones
+that tile: runs along one axis first, then runs of equal length stacked along
+the other. That is the classic greedy pass, and `canopy.rs:emit` has run it on
+crowns since the trees landed.
+
+Two faces may become one quad only when everything in the key matches:
+
+- the plane, the normal and the winding, so the merged quad lies where both lay
+  and faces the way they faced;
+- the vertex colour, exactly. Lighting is baked per face (`shade`) and the
+  per-tile wobble (`jitter`) is in the colour too, so this is the invariant that
+  keeps a merge invisible;
+- the atlas point, and only a face that samples a *single* texel is offered at
+  all. A merged quad spans n tiles, so its UVs would have to repeat across the
+  cell to keep a sprite where it was, and an atlas cell cannot repeat: cells are
+  packed 32 to a row with 16 px of edge-bled padding
+  (`dwarf_eye_art::atlas`), so a UV past the cell walks into its neighbour.
+  Repeating one would need the terrain shader to wrap within the cell rect, not
+  the sampler.
+
+So what merges is exactly the untextured geometry: a cube with no wall skin, a
+floor slab's rim, a stair, a foliage box, a building massing, an item pile —
+`MeshData::cuboid`, and nothing that goes through `textured_cuboid` or `stamp`.
+What does not merge is every wall, every built floor and every patch of the
+ground sheet, because each wears its own cell of the atlas, and every pair of
+neighbouring tiles of one material, because the wobble gives each its own shade.
+
+Measured over one live window of 2159 chunks (`make budget`, a wooded surface),
+that is 5 quads: 10 triangles of 5,919,984. Lifting each barrier in turn says
+why, and both have to go before the pass pays for itself:
+
+| Pass | Triangles merged away |
+|---|---|
+| as it ships | 10 |
+| with the wobble off, so equal materials share a colour | 10 |
+| with the atlas able to repeat a cell (probe, not shipped) | 26 |
+| with both | 27,674 — 72% of the cube and floor classes, 0.47% of the frame |
+
+The frame is 97.6% crowns in that window, so terrain merging is a saving for an
+underground view rather than for this one, and the pass is kept because it is
+free and correct rather than because it pays here. Making it pay means a terrain
+shader that wraps a UV inside its cell, and a wobble that is not in the vertex
+colour (issue #16).
 
 ## Water
 
@@ -154,8 +201,38 @@ Colour is vertex data: `palette.rs:water_color` reads the surface height plus
 the tiles of water stacked below and returns a teal that darkens and thickens
 with depth, so a shore is nearly clear and open water is not.
 
+The corner rule itself is one piece of code for both liquids:
+`water.rs:corners_of` takes a `water.rs:Liquid`, which is only a choice of which
+fill level to read.
+
+## Magma
+
+`magma.rs` is that same sheet made of magma, and it replaces the opaque box a
+magma tile used to draw inside its own cell. The differences are what it is
+made of:
+
+- `palette.rs:magma_color` runs the other way from water. The shallows are
+  cooling crust — dimmer, thinner, letting the rock under them through — and the
+  deep is bright and nearly opaque.
+- The material is its own (`main.rs:MagmaMaterial`): blended like water, but
+  emissive, so a sea lights itself and the bloom pass spills that onto the rock
+  beside it. No point light anywhere; the glow is emissive strength alone.
+- `main.rs:pulse_magma` breathes that strength — three slow sines whose periods
+  share no factor, which reads as a wandering noise rather than a heartbeat. One
+  material for the world, so it is one asset write a frame.
+- A side face keeps more of its colour than a water side does (0.92 and 0.86
+  against 0.8 and 0.68), because a glowing liquid is lit by itself rather than
+  by the sun.
+
+Magma also now draws in a tile the terrain pass skips: the old box hung off the
+tile loop, which walks past anything whose shape is empty, so a column of magma
+standing in open air drew nothing. The sheet is a pass of its own, like water's.
+
+Semi-molten rock and the lava stone that cooled beside it wear DF's own magma
+wall sheet (`wall.rs:family_for`, [../textures/walls.md](../textures/walls.md)).
+
 ## Related issues
 
-#5 (registry lookups in place of the scattered checks), #16 (magma
-transparency and greedy meshing), #10 (mid LOD), #6 (closed, this
+#5 (registry lookups in place of the scattered checks), #16 (this magma
+surface and this merge), #10 (mid LOD), #6 (closed, this
 heightfield), #29 (closed, this water), #13 (closed, textured walls).

@@ -39,14 +39,14 @@ walls, one cell of texture per z-level.
 
 | Tiletype class | DFHack material, special | Sheet | Family |
 |---|---|---|---|
-| rough stone, lava stone, feature, glowing barrier | Stone / LavaStone / Feature / Hfs, Normal or Worn1-3 | `wall_stone.png` | `STONE_WALL` |
+| rough stone, feature, glowing barrier | Stone / Feature / Hfs, Normal or Worn1-3 | `wall_stone.png` | `STONE_WALL` |
 | smoothed stone, smoothed vein | Stone / LavaStone / Feature / Hfs / Mineral, Smooth | `wall_stone_smoothed.png` | `SMOOTHED_STONE_WALL` |
 | soil, sand | Soil, any | `wall_soil.png` | `SOIL_WALL` |
 | mineral vein | Mineral, Normal or Worn1-3 | `wall_ore_vein.png` | `ORE_VEIN_WALL` |
 | constructed wall, pillar, fortification | Construction, any | `wall_rock_blocks.png` | `ROCK_BLOCKS_WALL` |
 | natural ice | FrozenLiquid, Normal or Worn1-3 | `wall_ice.png` | `ICE_WALL` |
 | smoothed ice | FrozenLiquid, Smooth | `wall_ice_smoothed.png` | `SMOOTHED_ICE_WALL` |
-| semi-molten rock | Magma, any | `wall_magma.png` | `MAGMA_WALL` |
+| semi-molten rock, rough lava stone | Magma any, LavaStone Normal or Worn1-3 | `wall_magma.png` | `MAGMA_WALL` |
 | constructed floor, shoddy floor, track floor | Construction, any, floor shape | `floor_stone_blocks.png` | `FLOOR_STONE_BLOCK` |
 
 Cells: 8 families x (15 variants + 1 side) = 128, taking the atlas from 181 to
@@ -93,6 +93,10 @@ a four-by-two cliff of each face; it needs a DF install, not a game.
 - DF ships no sprite for a wall with nothing beside it — it draws that tile from
   four corner pieces, which one quad cannot carry — so a lone wall takes the
   fully connected variant (`wall.rs:variant`).
+- The magma sheet is the wall of a magma sea, and both of the materials that
+  wall is made of take it: semi-molten rock, which DF reports as the tiletype
+  material `MAGMA`, and the lava stone that cooled at its edge. Worked lava
+  stone is masonry and keeps `SMOOTHED_STONE_WALL`.
 - `wall_stone_engraved.png` is unreachable. An engraving lives in the block's
   engraving list, not in the tiletype, so nothing here can ask for it.
 - The three worn stone sheets differ from the plain one only in surface noise
@@ -108,5 +112,6 @@ a four-by-two cliff of each face; it needs a DF install, not a game.
 
 ## Related issues
 
-#13 (this), #26 (the grey-base-plus-tint library this follows), #16 (greedy
-meshing would merge wall faces and change the UV rule).
+#13 (this), #26 (the grey-base-plus-tint library this follows), #16 (the magma
+sheet's second material, and why a wall face cannot be greedily merged: an atlas
+cell cannot repeat, see [../pipeline/meshing.md](../pipeline/meshing.md)).

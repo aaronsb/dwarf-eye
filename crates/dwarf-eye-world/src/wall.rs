@@ -95,14 +95,19 @@ pub fn family_for(
     Some(match (material, smooth) {
         (M::Soil, _) => "SOIL_WALL",
         (M::Construction, _) => "ROCK_BLOCKS_WALL",
+        // Semi-molten rock is DF's `MAGMA` tiletype material, and the rock a
+        // magma sea has cooled at its edge is `LAVA_STONE`. Both are the wall
+        // of the magma sea; the sheet DF cut for them is the same one, and
+        // rough lava stone anywhere else is still rock that ran.
         (M::Magma, _) => "MAGMA_WALL",
+        (M::LavaStone, false) => "MAGMA_WALL",
         (M::Mineral, false) => "ORE_VEIN_WALL",
         (M::FrozenLiquid, false) => "ICE_WALL",
         (M::FrozenLiquid, true) => "SMOOTHED_ICE_WALL",
         (M::Stone | M::LavaStone | M::Feature | M::Hfs | M::Mineral, true) => {
             "SMOOTHED_STONE_WALL"
         }
-        (M::Stone | M::LavaStone | M::Feature | M::Hfs, false) => "STONE_WALL",
+        (M::Stone | M::Feature | M::Hfs, false) => "STONE_WALL",
         _ => return None,
     })
 }
@@ -263,8 +268,11 @@ mod tests {
         assert_eq!(f(M::FrozenLiquid, S::Normal), Some("ICE_WALL"));
         assert_eq!(f(M::FrozenLiquid, S::Smooth), Some("SMOOTHED_ICE_WALL"));
         assert_eq!(f(M::Construction, S::Smooth), Some("ROCK_BLOCKS_WALL"));
+        // Semi-molten rock and the lava stone beside it share the magma sheet;
+        // worked lava stone is masonry and takes the smoothed sheet.
         assert_eq!(f(M::Magma, S::Normal), Some("MAGMA_WALL"));
-        assert_eq!(f(M::LavaStone, S::Normal), Some("STONE_WALL"));
+        assert_eq!(f(M::LavaStone, S::Normal), Some("MAGMA_WALL"));
+        assert_eq!(f(M::LavaStone, S::Smooth), Some("SMOOTHED_STONE_WALL"));
         // Air and water are not walls; a tree's parts are the library's.
         assert_eq!(f(M::Air, S::Normal), None);
         assert_eq!(f(M::TreeMaterial, S::Normal), None);

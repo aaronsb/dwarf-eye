@@ -7,6 +7,7 @@ pub mod heightfield;
 pub mod canopy;
 pub mod horizon;
 pub mod library;
+pub mod magma;
 pub mod mesh;
 pub mod model;
 pub mod palette;
