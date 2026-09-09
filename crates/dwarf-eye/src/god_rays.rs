@@ -148,22 +148,31 @@ impl Overrides {
 /// wind offset and all.
 fn drive(
     weather: Res<Weather>,
+    precip: Res<crate::precipitation::Precipitation>,
     clock: Res<Clock>,
     over: Res<Overrides>,
     terrain: Res<crate::TerrainMaterial>,
     materials: Res<Assets<TerrainMaterial>>,
     mut rays: ResMut<GodRays>,
 ) {
-    let Weather { cumulus, stratus, cirrus: _, fog } = *weather;
+    let Weather { cumulus, stratus, cirrus: _, fog, countdown } = *weather;
 
     // A clear day is a thin haze, thicker in the first and last hours of
     // light when the air holds the night's moisture; fog thickens it and
     // pulls it to the ground. Rain arrives as stratus, which adds a little.
+    //
+    // `fog` is DF's own kind rather than a guess: 0.25 mist, 0.55 fog, 0.85
+    // thick, straight off the region tile the Lua probe reads. The stratus
+    // countdown rides with it, so the sheet's own build-up thickens the air
+    // ahead of the change instead of the haze stepping when the kind flips, and
+    // falling rain wets it on top of all of that (issue #18).
     let elevation = clock.sun_direction().y.clamp(0.0, 1.0);
     let low_sun = 1.0 - (elevation * 4.0).min(1.0);
-    rays.density = over
-        .density
-        .unwrap_or(0.006 + low_sun * 0.014 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002);
+    let (_, falling) = precip.drawn();
+    rays.density = over.density.unwrap_or(
+        0.006 + low_sun * 0.014 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002
+            + countdown * 0.004 + falling * 0.010,
+    );
     let height = 60.0 - 44.0 * fog.clamp(0.0, 1.0);
     rays.falloff = over.falloff.unwrap_or(1.0 / height);
     rays.g = over.g.unwrap_or(0.6);

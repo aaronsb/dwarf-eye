@@ -93,6 +93,10 @@ pub const MONTHS: [&str; 12] = [
 pub struct Clock {
     pub year: i32,
     pub tick: i32,
+    /// Dwarf Fortress's own `world_data.moon_phase`, as a fraction of the lunar
+    /// month, once the weather probe has read it. `None` leaves the calendar
+    /// derivation below in charge.
+    pub moon: Option<f32>,
 }
 
 impl Clock {
@@ -169,9 +173,15 @@ impl Clock {
     }
 
     /// How far the moon has swung away from the sun: 0 at new, 0.5 at full.
-    /// Dwarf Fortress's 28-day month is a lunar month, so the cycle is the
-    /// calendar's own.
+    ///
+    /// Dwarf Fortress keeps a real phase in `world_data.moon_phase`, which the
+    /// weather probe reads; the protocol never sends it, so the fallback is the
+    /// calendar's own 28-day month, which is DF's lunar month. The two agree to
+    /// within a day where both are known.
     pub fn moon_phase(self) -> f32 {
+        if let Some(phase) = self.moon {
+            return phase.rem_euclid(1.0);
+        }
         let cycle = (TICKS_PER_DAY * DAYS_PER_MONTH) as f32;
         (self.tick as f32 / cycle).rem_euclid(1.0)
     }
@@ -225,7 +235,7 @@ impl Clock {
     pub fn with_hour_override(self) -> Self {
         match hour_override() {
             Some(tick_of_day) => {
-                Self { year: self.year, tick: self.tick - self.tick_of_day() + tick_of_day }
+                Self { tick: self.tick - self.tick_of_day() + tick_of_day, ..self }
             }
             None => self,
         }
@@ -285,7 +295,7 @@ mod tests {
 
     /// 15 Granite of year 100: the middle of a month, so a full moon.
     fn day(tick_of_day: i32) -> Clock {
-        Clock { year: 100, tick: 14 * TICKS_PER_DAY + tick_of_day }
+        Clock { year: 100, tick: 14 * TICKS_PER_DAY + tick_of_day, moon: None }
     }
 
     #[test]
@@ -348,8 +358,8 @@ mod tests {
 
     #[test]
     fn the_hour_override_keeps_the_date() {
-        let clock = Clock { year: 100, tick: 14 * TICKS_PER_DAY + 844 };
-        let pinned = Clock { year: clock.year, tick: clock.tick - clock.tick_of_day() + 600 };
+        let clock = Clock { year: 100, tick: 14 * TICKS_PER_DAY + 844, moon: None };
+        let pinned = Clock { tick: clock.tick - clock.tick_of_day() + 600, ..clock };
         assert_eq!(pinned.day_of_month(), clock.day_of_month());
         assert_eq!(pinned.tick_of_day(), 600);
     }

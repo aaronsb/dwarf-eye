@@ -10,10 +10,12 @@ Draws the sky DF reports and shadows the ground with the same sky.
 
 ## How
 
-DF gives a cloud kind per world tile rather than a coverage number.
-`worker.rs:read_weather` averages the 3x3 of world tiles around the embark and
-turns each kind into a fraction, giving `clouds.rs:Weather`: cumulus, stratus,
-cirrus, fog.
+DF gives a cloud kind per world tile rather than a coverage number. The Lua
+weather probe reads the embark's own world tile outright and turns each kind
+into a fraction, giving `clouds.rs:Weather`: cumulus, stratus, cirrus, fog and
+the stratus countdown (see [weather.md](weather.md)). Where the probe fails,
+`worker.rs:read_weather` averages the 3x3 of world tiles around the embark off
+`GetWorldMap` on the same scales.
 
 `noise.rs:weather_sheet` packs that into a 256x256 sheet: red is coverage, green
 is the kind mix from stratus to cumulus, blue is cirrus. Two 3D volumes carry

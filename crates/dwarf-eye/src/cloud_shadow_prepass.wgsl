@@ -20,6 +20,11 @@ struct CloudShadow {
     horizon: f32,
     mask_origin: vec2<f32>,
     canopy: f32,
+    // How far rain darkens the albedo, and how far it drops the roughness.
+    wet: f32,
+    polish: f32,
+    // Snow lying on upward faces, 0..1.
+    snow: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> cloud: CloudShadow;
