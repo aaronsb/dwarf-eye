@@ -8,6 +8,7 @@ mod capture;
 mod clouds;
 mod god_rays;
 mod noise;
+mod polls;
 mod precipitation;
 mod shadow;
 mod sky;
@@ -143,8 +144,6 @@ fn main() {
                 sky::drive_lights,
                 sky::drive_exposure,
                 stars::drive,
-                poll_weather,
-                poll_clock,
                 log_scene,
                 request_blocks,
                 refresh_mask,
@@ -1526,27 +1525,6 @@ fn request_blocks(
         opts: settings.mesh_options(),
         force,
     });
-}
-
-/// Asks for the world's cloud cover now and then. The map message is large and
-/// the sky changes slowly, so this is deliberately infrequent.
-fn poll_weather(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
-    *next -= time.delta_secs();
-    if *next > 0.0 {
-        return;
-    }
-    *next = 12.0;
-    let _ = bridge.tx.send(Command::Weather);
-}
-
-/// Asks for the game's calendar a few times a second.
-fn poll_clock(time: Res<Time>, bridge: NonSend<Bridge>, mut next: Local<f32>) {
-    *next -= time.delta_secs();
-    if *next > 0.0 {
-        return;
-    }
-    *next = 0.5;
-    let _ = bridge.tx.send(Command::Clock);
 }
 
 fn update_hud(
