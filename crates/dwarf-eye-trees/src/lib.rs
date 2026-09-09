@@ -55,7 +55,7 @@ pub use params::{
     Envelope, Footprint, Habit, Palette, Preset, Rgb, TreeParams, VegetationKind, birch, bush,
     dead_tree, mushroom_tree, oak, pine, sapling, shrub, spruce, tall_grass, willow,
 };
-pub use raster::{Kind, Voxel, VoxelTree, rasterise};
+pub use raster::{Cut, Kind, Voxel, VoxelTree, rasterise, rasterise_cut};
 
 /// Grow, voxelise and mesh in one call: the entry point a treatment registry
 /// maps a classified tile onto.

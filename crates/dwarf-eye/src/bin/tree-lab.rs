@@ -6,8 +6,10 @@
 //! change the voxel resolution, `-` and `=` halve and double the texel density,
 //! F12 saves a screenshot. `DWARF_EYE_SHOT=path[:seconds]` saves one after a
 //! delay and exits; `DWARF_EYE_TEXELS` sets the starting texel density,
-//! `TREE_LAB_CAM=x,y,z,yaw,pitch` the camera and
-//! `TREE_LAB_SUN=azimuth,elevation` (degrees) where the sun stands.
+//! `TREE_LAB_CAM=x,y,z,yaw,pitch` the camera,
+//! `TREE_LAB_SUN=azimuth,elevation` (degrees) where the sun stands, and
+//! `TREE_LAB_WOOD` the resolution whose limb widths the cut shows, which
+//! otherwise follows the detail band of the chosen resolution.
 
 #[path = "../camera.rs"]
 mod camera;
@@ -37,7 +39,8 @@ use shadow::{
     CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
 };
 use dwarf_eye_trees::texture::{self, Texels};
-use dwarf_eye_trees::{Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise};
+use dwarf_eye_trees::{Cut, Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise_cut};
+use dwarf_eye_world::canopy;
 
 /// Tiles between trunks along a row.
 const SPACING: f32 = 16.0;
@@ -70,7 +73,23 @@ struct Lab {
     forced: Option<Preset>,
     seed: u64,
     voxels_per_tile: u32,
+    /// `TREE_LAB_WOOD`, overriding the resolution whose limb widths this cut
+    /// shows. Unset, the lab shows what the viewer draws; set to the cut's own
+    /// resolution, it shows the uncorrected coarse cut the bands were measured
+    /// against.
+    wood_like: Option<u32>,
     dirty: bool,
+}
+
+impl Lab {
+    /// What this cut asks the rasteriser for: the band's own correction at
+    /// this resolution, unless `TREE_LAB_WOOD` overrides it.
+    fn cut(&self) -> Cut {
+        match self.wood_like {
+            Some(wood_like) => Cut { wood_like },
+            None => canopy::cut_at(self.voxels_per_tile as i32),
+        }
+    }
 }
 
 impl Default for Lab {
@@ -81,7 +100,8 @@ impl Default for Lab {
         let seed = std::env::var("TREE_LAB_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let voxels_per_tile =
             std::env::var("TREE_LAB_VPT").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-        Self { forced, seed, voxels_per_tile, dirty: true }
+        let wood_like = std::env::var("TREE_LAB_WOOD").ok().and_then(|v| v.parse().ok());
+        Self { forced, seed, voxels_per_tile, wood_like, dirty: true }
     }
 }
 
@@ -314,7 +334,7 @@ fn handle_input(
         };
         lab.dirty = true;
     }
-    if keys.just_pressed(KeyCode::BracketLeft) && lab.voxels_per_tile > 2 {
+    if keys.just_pressed(KeyCode::BracketLeft) && lab.voxels_per_tile > 1 {
         lab.voxels_per_tile -= 1;
         lab.dirty = true;
     }
@@ -351,7 +371,7 @@ fn rebuild(
         }
         let seed = lab.seed.wrapping_add(i as u64 * 0x9E3779B97F4A7C15);
         let skeleton = grow(&params, seed, None);
-        let voxels = rasterise(&skeleton, lab.voxels_per_tile);
+        let voxels = rasterise_cut(&skeleton, lab.voxels_per_tile, lab.cut());
         let counts = voxels.counts();
         let row = (i / PER_ROW) as f32;
         // Rows nearer the camera hold the smaller vegetation, offset half a slot
@@ -443,9 +463,10 @@ fn update_hud(
     }
     for mut text in hud {
         text.0 = format!(
-            "seed {}  {} voxels/tile  {} texels/tile  {}\nR reseed  1..0 and Tab preset  [ ] voxels  - = texels  F12 shot\n{}",
+            "seed {}  {} voxels/tile  wood at {}  {} texels/tile  {}\nR reseed  1..0 and Tab preset  [ ] voxels  - = texels  F12 shot\n{}",
             lab.seed,
             lab.voxels_per_tile,
+            lab.cut().wood_like,
             texels.per_tile,
             lab.forced.map(|p| p.name()).unwrap_or("all presets"),
             report.0,

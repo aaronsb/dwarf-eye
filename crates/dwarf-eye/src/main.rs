@@ -196,11 +196,18 @@ struct Bands {
     near: f32,
 }
 
-/// How much of the near band's range the crossfade takes, so one band dithers
-/// into the other rather than popping.
-const CROSSFADE: f32 = 0.15;
+/// How much of the way to the neighbouring hand-off a crossfade reaches, in
+/// log distance, either side of the edge.
+///
+/// The blend is a screen-space dither, which reads as a soft fade only if the
+/// camera spends real distance inside it; straddling the edge rather than
+/// starting at it means a band is already going before the one behind it is
+/// gone. Under a half, so two neighbouring fades can never overlap however
+/// close together their edges fall — Bevy requires a range's start margin to
+/// end before its end margin begins.
+const CROSSFADE: f32 = 0.45;
 
-/// Where the mid band stops: the camera's own far plane, which no chunk
+/// Where the last band stops: the camera's own far plane, which no chunk
 /// retention ever reaches.
 const BAND_FAR: f32 = 40000.0;
 
@@ -214,19 +221,43 @@ fn band_edges(near: f32) -> Vec<f32> {
     BANDS[..BANDS.len() - 1].iter().map(|band| band.edge(near)).collect()
 }
 
+/// The distances a hand-off dithers across, one per edge.
+///
+/// The fade straddles its edge and reaches [`CROSSFADE`] of the way to
+/// whichever neighbouring edge is nearer, measured as a ratio, so a hand-off
+/// gets as much room as its own gap allows and no more: the closer two bands
+/// stand, the shorter their blend, and none of them ever runs into the next.
+fn band_fades(edges: &[f32]) -> Vec<std::ops::Range<f32>> {
+    edges
+        .iter()
+        .enumerate()
+        .map(|(i, &at)| {
+            let below = (i > 0).then(|| at / edges[i - 1]);
+            let above = edges.get(i + 1).map(|&next| next / at);
+            let gap = match (below, above) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                // One edge and nothing to crowd it: a fixed, generous blend.
+                (None, None) => 2.0,
+            };
+            let reach = gap.powf(CROSSFADE);
+            at / reach..at * reach
+        })
+        .collect()
+}
+
 /// One range per band, nearest first. Each band's end margin is the next one's
 /// start margin, which is what Bevy crossfades across; the last runs to the far
 /// plane.
 fn band_ranges(near: f32) -> Vec<VisibilityRange> {
     let edges = band_edges(near);
-    let fade = |at: f32| at..at * (1.0 + CROSSFADE);
+    let fades = band_fades(&edges);
+    let fade = |stage: usize| fades[stage].clone();
     (0..=edges.len())
         .map(|stage| VisibilityRange {
-            start_margin: if stage == 0 { 0.0..0.0 } else { fade(edges[stage - 1]) },
-            end_margin: match edges.get(stage) {
-                Some(&at) => fade(at),
-                None => BAND_FAR..BAND_FAR,
-            },
+            start_margin: if stage == 0 { 0.0..0.0 } else { fade(stage - 1) },
+            end_margin: if stage < edges.len() { fade(stage) } else { BAND_FAR..BAND_FAR },
             // Chunk meshes hold world-space vertices at an identity transform,
             // so the range has to measure from the mesh's own bounds, not its
             // origin.
@@ -968,10 +999,16 @@ fn size_bands(
             *range = wanted.clone();
         }
     }
+    let edges = band_edges(near);
+    let handovers: Vec<String> = band_fades(&edges)
+        .iter()
+        .zip(&edges)
+        .map(|(fade, at)| format!("{at:.0} ({:.0}..{:.0})", fade.start, fade.end))
+        .collect();
     info!(
-        "canopy bands: near out to {near:.0} tiles ({:.1} blocks), mid to {:.0}, far beyond",
+        "canopy bands: near out to {near:.0} tiles ({:.1} blocks), hand-offs at {}, far beyond",
         near / BLOCK as f32,
-        Band::Mid.edge(near)
+        handovers.join(", ")
     );
 }
 
@@ -1323,4 +1360,56 @@ fn update_hud(
         weather.describe(),
         if rays.enabled { "on" } else { "off" },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where the near band ends for a 45-degree lens in a 720-tall window.
+    fn near() -> f32 {
+        dwarf_eye_world::canopy::near_band(std::f32::consts::FRAC_PI_4, 720.0)
+    }
+
+    #[test]
+    fn a_hand_off_dithers_across_a_distance_and_not_a_line() {
+        let edges = band_edges(near());
+        assert_eq!(edges.len(), BANDS.len() - 1, "one hand-off per gap");
+        for (fade, at) in band_fades(&edges).iter().zip(&edges) {
+            assert!(fade.start < *at && fade.end > *at, "{fade:?} does not straddle {at}");
+            // The dither is screen-space, so it only reads as a fade if the
+            // camera spends real distance inside it.
+            assert!((fade.end - fade.start) / at > 0.2, "{fade:?} is barely wider than {at}");
+        }
+    }
+
+    #[test]
+    fn no_two_hand_offs_overlap() {
+        // Bevy wants a range's start margin over before its end margin begins,
+        // and a band caught fading in and out at once would flicker.
+        let fades = band_fades(&band_edges(near()));
+        assert!(fades.windows(2).all(|w| w[0].end < w[1].start), "{fades:?} run into each other");
+        for range in band_ranges(near()) {
+            assert!(
+                range.start_margin.end <= range.end_margin.start,
+                "a band fades in over {:?} and out over {:?} at once",
+                range.start_margin,
+                range.end_margin
+            );
+        }
+    }
+
+    #[test]
+    fn the_ranges_run_nearest_first_and_meet_at_the_hand_offs() {
+        let ranges = band_ranges(near());
+        assert_eq!(ranges.len(), BANDS.len(), "one range per band");
+        assert_eq!(ranges[0].start_margin, 0.0..0.0, "the near band starts at the camera");
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[0].end_margin, pair[1].start_margin,
+                "a band's end margin is the next one's start margin"
+            );
+        }
+        assert_eq!(ranges[BANDS.len() - 1].end_margin, BAND_FAR..BAND_FAR);
+    }
 }
