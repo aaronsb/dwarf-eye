@@ -49,9 +49,17 @@ the far band wears no cutout.
   and the shadow under it is dappled at that scale.
 - Per-species `cutout_openness` exists in `dwarf-eye-trees::params` but only the
   tree lab uses it. The renderer shares two cutouts.
-- `dwarf-eye-trees::mesh` calls `streamer_uv` with `DEFAULT_TEXELS` hardcoded
-  while the strip image is generated at `tree_texels()`. Setting
-  `DWARF_EYE_TEXELS` to anything but 32 misaligns streamer UVs from the strip.
+- `mesh.rs:mesh_of_texels` addresses streamer quads against
+  `streamer_uv(cell, texels)` at a caller-given density; `mesh`/`mesh_of` stay
+  thin wrappers at `DEFAULT_TEXELS` (32) for callers that predate this. The
+  tree lab threads its own `TexelDensity` resource through, so `-`/`=` and
+  `DWARF_EYE_TEXELS` now rebuild streamers at the strip's own density (issue
+  #25; a shot at 16 texels/tile shows the leaflets landing on their cells
+  rather than sampling a neighbour's). `dwarf-eye-world::canopy`'s own calls to
+  `mesh_of` are unchanged and still default to `DEFAULT_TEXELS`, so the live
+  viewer still misaligns streamer UVs whenever `DWARF_EYE_TEXELS` is set to
+  anything but 32 — threading the density from `main.rs:tree_texels` into
+  `canopy.rs`'s meshing is the remaining half of #25.
 - Tree surfaces carry no mipmaps and minify nearest, so they alias at distance
   where the ground atlas does not.
 - Leaf tones come from the species' own twig sprite, darkest first
@@ -61,4 +69,6 @@ the far band wears no cutout.
 ## Related issues
 
 #1 (shrubs, saplings and dead trees through the same surfaces), #7 (ground
-cover), #14 (extra materials per class is the pattern the canopy already shows).
+cover), #14 (extra materials per class is the pattern the canopy already
+shows), #25 (open: streamer UVs at a live texel density, threaded as far as
+the crate and the tree lab; `canopy.rs`'s own meshing still wants it).

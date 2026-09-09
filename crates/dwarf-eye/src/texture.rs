@@ -10,9 +10,14 @@ use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerD
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-/// Levels below the base. The atlas pads each 32 px sprite by 16 px of its
-/// own edge, which keeps neighbours out of the chain for four halvings.
-const MIP_LEVELS: u32 = 4;
+/// Levels below the base, derived from the atlas's own padding
+/// (`dwarf_eye_art::atlas::PAD`) rather than repeating the number here: each
+/// halving shrinks a sprite's bleed by half too, so `PAD` texels of padding
+/// survive exactly `PAD`'s log2 halvings with a texel of bleed still standing
+/// between neighbours. `PAD` 16 gives 4 levels the same way it always did;
+/// change the padding and this follows without a second constant to keep in
+/// sync (issue #25).
+const MIP_LEVELS: u32 = dwarf_eye_art::atlas::PAD.trailing_zeros();
 
 /// sRGB bytes to linear and back, so averages are done on light rather than
 /// on encoded values.
@@ -134,4 +139,19 @@ pub fn atlas_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
         ..default()
     });
     image
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The atlas's own invariant, checked from this side of the derivation:
+    /// `PAD` halved `MIP_LEVELS` times must still leave at least one texel of
+    /// bleed, or the deepest mip level starts sampling a neighbour's sprite.
+    #[test]
+    fn pad_covers_the_mip_chain() {
+        let pad = dwarf_eye_art::atlas::PAD;
+        assert!(pad >= 1 << MIP_LEVELS, "PAD {pad} does not cover {MIP_LEVELS} halvings");
+        assert_eq!(MIP_LEVELS, 4, "PAD 16 should still land on today's 4 levels");
+    }
 }
