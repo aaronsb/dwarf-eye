@@ -45,7 +45,7 @@ function needs. Agents given a task receive the same rule and the page path.
 
 Four layers, described in `docs/architecture/testing/`:
 
-- unit tests per crate (`make test`, no game): pure functions such as clock
+- unit tests per crate and per binary (`make test`, no game): pure functions such as clock
   arithmetic, ramp corner heights, walk classification and heading, tree
   rasterisation pinned by voxel counts and checksums;
 - probes: the examples under `crates/dwarf-eye-world/examples/` (`sky`,

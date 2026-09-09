@@ -82,7 +82,7 @@ horizon:
 	$(CARGO) run --release -q -p dwarf-eye-world --example horizon
 
 test:
-	$(CARGO) test --release --workspace --lib
+	$(CARGO) test --release --workspace --lib --bins
 
 # Walks the adventurer east and back through walk sync, and checks the game
 # agrees. Needs a live game with an adventurer on open ground, clear to the
