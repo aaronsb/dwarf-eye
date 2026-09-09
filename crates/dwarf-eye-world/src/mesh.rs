@@ -28,6 +28,12 @@ pub struct MeshData {
     /// here so a chunk still travels as one value; the renderer splits it off
     /// before uploading (`main.rs:upload_chunks`).
     pub water: Option<Box<MeshData>>,
+    /// Magma surfaces, which want a translucent, glowing material of their own.
+    /// Carried and split off exactly as the water is.
+    pub magma: Option<Box<MeshData>>,
+    /// Where flat-coloured faces wait to be greedily merged, when this mesh was
+    /// made by [`MeshData::merging`]. Nothing outside this module fills it in.
+    pub(crate) merge: Option<Merger>,
 }
 
 impl Default for MeshData {
@@ -39,11 +45,19 @@ impl Default for MeshData {
             uvs: Vec::new(),
             indices: Vec::new(),
             water: None,
+            magma: None,
+            merge: None,
         }
     }
 }
 
 impl MeshData {
+    /// A mesh that holds its flat-coloured faces back and greedily merges them
+    /// when [`MeshData::flush_merges`] runs.
+    pub fn merging() -> Self {
+        Self { merge: Some(Merger::default()), ..Default::default() }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
@@ -52,9 +66,39 @@ impl MeshData {
         self.indices.len() / 3
     }
 
+    /// Triangles pushed so far, whether they have been emitted or are still
+    /// waiting to be merged. This is what a budget tally counts, so the classes
+    /// mean the same thing merged or not.
+    pub fn triangles_pushed(&self) -> usize {
+        self.indices.len() / 3 + self.merge.as_ref().map_or(0, |m| m.deferred * 2)
+    }
+
+    /// Emits every held-back face, merged as far as the rules allow. Returns
+    /// the triangles the merge saved.
+    pub fn flush_merges(&mut self) -> usize {
+        let Some(merger) = self.merge.take() else { return 0 };
+        let before = merger.deferred;
+        let mut kept = 0;
+        for (plane, patch) in merger.merged() {
+            self.push_textured_quad(
+                plane.corners(patch),
+                plane.normal(),
+                plane.color(),
+                [plane.uv(); 4],
+            );
+            kept += 1;
+        }
+        (before - kept) * 2
+    }
+
     /// Lifts the water surfaces out, leaving the terrain behind.
     pub fn take_water(&mut self) -> MeshData {
         self.water.take().map(|w| *w).unwrap_or_default()
+    }
+
+    /// Lifts the magma surfaces out, leaving the terrain behind.
+    pub fn take_magma(&mut self) -> MeshData {
+        self.magma.take().map(|m| *m).unwrap_or_default()
     }
 
     /// A quad whose corners each carry their own colour, for a surface that
@@ -206,54 +250,255 @@ impl MeshData {
         }
     }
 
+    /// A flat-coloured face: held back for the greedy merge where this mesh is
+    /// merging at all, and pushed as it stands otherwise.
+    fn flat_quad(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 4]) {
+        let uv = dwarf_eye_art::atlas::WHITE_UV;
+        if self.merge.as_mut().is_some_and(|m| m.push(corners, normal, color, uv)) {
+            return;
+        }
+        self.push_textured_quad(corners, normal, color, [uv; 4]);
+    }
+
     /// Appends a box spanning `lo`..`hi`, skipping the faces marked in `skip`.
     fn cuboid(&mut self, lo: [f32; 3], hi: [f32; 3], color: [f32; 4], skip: Faces) {
         let [x0, y0, z0] = lo;
         let [x1, y1, z1] = hi;
 
         if !skip.top {
-            self.push_quad(
+            self.flat_quad(
                 [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
                 [0.0, 1.0, 0.0],
                 shade(color, 1.0),
             );
         }
         if !skip.bottom {
-            self.push_quad(
+            self.flat_quad(
                 [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
                 [0.0, -1.0, 0.0],
                 shade(color, 0.55),
             );
         }
         if !skip.north {
-            self.push_quad(
+            self.flat_quad(
                 [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
                 [0.0, 0.0, -1.0],
                 shade(color, 0.8),
             );
         }
         if !skip.south {
-            self.push_quad(
+            self.flat_quad(
                 [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]],
                 [0.0, 0.0, 1.0],
                 shade(color, 0.8),
             );
         }
         if !skip.west {
-            self.push_quad(
+            self.flat_quad(
                 [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
                 [-1.0, 0.0, 0.0],
                 shade(color, 0.68),
             );
         }
         if !skip.east {
-            self.push_quad(
+            self.flat_quad(
                 [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
                 [1.0, 0.0, 0.0],
                 shade(color, 0.68),
             );
         }
     }
+}
+
+/// The plane a face lies in, and everything about that face which has to match
+/// before two of them may become one quad.
+///
+/// The plane and the winding, so a merged quad lies where both faces lay and
+/// faces the way they faced; the colour, because on an untextured face the
+/// colour *is* the look and the per-tile wobble (`jitter`) lives in it; and the
+/// atlas point, because a merged quad stretches its UVs over the whole run and
+/// only a face that samples a single texel survives that. A face wearing a
+/// sprite — every wall, every built floor, every patch of the ground sheet —
+/// therefore never lands here at all.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Plane {
+    /// Axis 0-2 doubled, plus one when the normal points the negative way.
+    face: u8,
+    /// Where the plane sits on that axis.
+    coord: u32,
+    /// Which extreme of the rectangle each of the four corners took, two bits
+    /// per corner, so a merged quad is wound exactly as its faces were.
+    pattern: u8,
+    color: [u32; 4],
+    uv: [u32; 2],
+}
+
+/// One face as a rectangle in its own plane.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Patch {
+    a0: f32,
+    a1: f32,
+    b0: f32,
+    b1: f32,
+}
+
+/// The two axes a plane runs along, in ascending order.
+fn other_axes(axis: usize) -> (usize, usize) {
+    match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    }
+}
+
+/// The axis and direction of a unit normal, or `None` for anything skewed.
+fn face_code(normal: [f32; 3]) -> Option<u8> {
+    for axis in 0..3 {
+        if normal[axis].abs() == 1.0 && normal[(axis + 1) % 3] == 0.0 && normal[(axis + 2) % 3] == 0.0
+        {
+            return Some(axis as u8 * 2 + u8::from(normal[axis] < 0.0));
+        }
+    }
+    None
+}
+
+impl Plane {
+    fn normal(self) -> [f32; 3] {
+        let mut n = [0.0; 3];
+        n[(self.face / 2) as usize] = if self.face & 1 == 0 { 1.0 } else { -1.0 };
+        n
+    }
+
+    fn color(self) -> [f32; 4] {
+        self.color.map(f32::from_bits)
+    }
+
+    fn uv(self) -> [f32; 2] {
+        self.uv.map(f32::from_bits)
+    }
+
+    /// The corners of a rectangle in this plane, in the winding the faces came
+    /// in with.
+    fn corners(self, p: Patch) -> [[f32; 3]; 4] {
+        let axis = (self.face / 2) as usize;
+        let (a, b) = other_axes(axis);
+        let coord = f32::from_bits(self.coord);
+        std::array::from_fn(|i| {
+            let bits = (self.pattern >> (i * 2)) & 0b11;
+            let mut c = [0.0; 3];
+            c[axis] = coord;
+            c[a] = if bits & 1 == 0 { p.a0 } else { p.a1 };
+            c[b] = if bits & 2 == 0 { p.b0 } else { p.b1 };
+            c
+        })
+    }
+}
+
+/// Greedy merging of the flat-coloured faces of one chunk.
+///
+/// Faces are held back rather than emitted, bucketed by [`Plane`], and joined
+/// where they tile: first into runs along one axis, then runs of equal length
+/// into blocks. That is the classic greedy pass, and because everything that
+/// had to match is in the key, a merged quad draws exactly what the faces it
+/// replaced drew.
+#[derive(Default)]
+pub(crate) struct Merger {
+    planes: std::collections::HashMap<Plane, Vec<Patch>>,
+    /// How many faces are held, for the triangle tally before the merge runs.
+    deferred: usize,
+}
+
+impl Merger {
+    /// Holds a face back, or refuses it — skewed, not planar, or not a
+    /// rectangle — for the caller to emit as it stands.
+    fn push(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        normal: [f32; 3],
+        color: [f32; 4],
+        uv: [f32; 2],
+    ) -> bool {
+        let Some(face) = face_code(normal) else { return false };
+        let axis = (face / 2) as usize;
+        let coord = corners[0][axis];
+        if corners.iter().any(|c| c[axis] != coord) {
+            return false;
+        }
+        let (a, b) = other_axes(axis);
+        let span = |i: usize| {
+            corners.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), c| {
+                (lo.min(c[i]), hi.max(c[i]))
+            })
+        };
+        let (a0, a1) = span(a);
+        let (b0, b1) = span(b);
+        if !(a1 > a0 && b1 > b0) {
+            return false;
+        }
+        let mut pattern = 0u8;
+        for (i, c) in corners.iter().enumerate() {
+            let at = |v: f32, lo: f32, hi: f32| {
+                if v == lo {
+                    Some(0u8)
+                } else if v == hi {
+                    Some(1)
+                } else {
+                    None
+                }
+            };
+            let (Some(ha), Some(hb)) = (at(c[a], a0, a1), at(c[b], b0, b1)) else { return false };
+            pattern |= (ha | (hb << 1)) << (i * 2);
+        }
+        let plane = Plane {
+            face,
+            coord: coord.to_bits(),
+            pattern,
+            color: color.map(f32::to_bits),
+            uv: uv.map(f32::to_bits),
+        };
+        self.planes.entry(plane).or_default().push(Patch { a0, a1, b0, b1 });
+        self.deferred += 1;
+        true
+    }
+
+    /// Every held face, merged, in an order that does not depend on the hash.
+    fn merged(self) -> Vec<(Plane, Patch)> {
+        let mut planes: Vec<(Plane, Vec<Patch>)> = self.planes.into_iter().collect();
+        planes.sort_by_key(|(plane, _)| *plane);
+        let mut out = Vec::new();
+        for (plane, mut patches) in planes {
+            for patch in join(&mut patches) {
+                out.push((plane, patch));
+            }
+        }
+        out
+    }
+}
+
+/// Joins rectangles that tile: runs along `a` first, then runs of equal length
+/// stacked along `b`.
+fn join(patches: &mut Vec<Patch>) -> Vec<Patch> {
+    patches.sort_by(|p, q| {
+        p.b0.total_cmp(&q.b0).then(p.b1.total_cmp(&q.b1)).then(p.a0.total_cmp(&q.a0))
+    });
+    let mut runs: Vec<Patch> = Vec::with_capacity(patches.len());
+    for p in patches.drain(..) {
+        match runs.last_mut() {
+            Some(last) if last.b0 == p.b0 && last.b1 == p.b1 && last.a1 == p.a0 => last.a1 = p.a1,
+            _ => runs.push(p),
+        }
+    }
+    runs.sort_by(|p, q| {
+        p.a0.total_cmp(&q.a0).then(p.a1.total_cmp(&q.a1)).then(p.b0.total_cmp(&q.b0))
+    });
+    let mut blocks: Vec<Patch> = Vec::with_capacity(runs.len());
+    for p in runs {
+        match blocks.last_mut() {
+            Some(last) if last.a0 == p.a0 && last.a1 == p.a1 && last.b1 == p.b0 => last.b1 = p.b1,
+            _ => blocks.push(p),
+        }
+    }
+    blocks
 }
 
 /// Which faces of a cell are hidden by neighbours.
@@ -354,6 +599,9 @@ pub struct Budget {
     pub buildings: usize,
     pub items: usize,
     pub other: usize,
+    /// Triangles the greedy merge took back out. The classes above are counted
+    /// before it runs, so a chunk draws `sum - merged`.
+    pub merged: usize,
 }
 
 /// Buildings and item piles: a second pass over the chunk, drawn on top of
@@ -402,7 +650,7 @@ fn build_furnishings(
                             voxel.building_offset(),
                         )
                     });
-                    let before = mesh.indices.len();
+                    let before = mesh.triangles_pushed();
                     let colour = to_linear(built.color, 1.0);
                     // Grounding: the lid rides the ground at the tile's centre
                     // and the box stretches down to the tile's lowest corner,
@@ -448,14 +696,14 @@ fn build_furnishings(
                             ],
                         );
                     }
-                    budget.buildings += (mesh.indices.len() - before) / 3;
+                    budget.buildings += mesh.triangles_pushed() - before;
                 }
             }
 
             // A stockpile square, and nothing smaller: one dropped sock costs
             // a box for nothing.
             if let Some(pile) = chunk.pile(lx, ly) {
-                let before = mesh.indices.len();
+                let before = mesh.triangles_pushed();
                 let stepped = fy + FLOOR_HEIGHT;
                 let lid = grounded(stepped, surface.and_then(|s| s.height(lx, ly)));
                 let base = grounded(stepped, surface.and_then(|s| s.low(lx, ly)));
@@ -465,7 +713,7 @@ fn build_furnishings(
                     to_linear(pile.color, 1.0),
                     Faces { bottom: true, ..Default::default() },
                 );
-                budget.items += (mesh.indices.len() - before) / 3;
+                budget.items += mesh.triangles_pushed() - before;
             }
         }
     }
@@ -501,9 +749,9 @@ pub fn build_chunk_in(
     budget: &mut Budget,
     ground: Ground,
 ) -> MeshData {
-    let mut mesh = MeshData::default();
+    let mut mesh = MeshData::merging();
     let tally = |mesh: &MeshData, before: usize, slot: &mut usize| {
-        *slot += (mesh.indices.len() - before) / 3;
+        *slot += mesh.triangles_pushed() - before;
     };
     if chunk.z > opts.z_ceiling {
         return mesh;
@@ -583,7 +831,7 @@ pub fn build_chunk_in(
                         // billboard used to stand on.
                         if plan.extent == Extent::Tile && !covered {
                             if let Some(ground) = lib.ground_beneath(voxel.tile_id) {
-                                let before = mesh.indices.len();
+                                let before = mesh.triangles_pushed();
                                 let wobble = jitter(x, y, z);
                                 let tint = if ground.tint {
                                     let base = damp([color[0], color[1], color[2]], 0.35);
@@ -641,7 +889,7 @@ pub fn build_chunk_in(
                             } else {
                                 [wobble, wobble, wobble]
                             };
-                            let before = mesh.indices.len();
+                            let before = mesh.triangles_pushed();
                             mesh.stamp(&model.mesh, [fx, fy, fz], tint);
                             tally(&mesh, before, &mut budget.ramps);
                             continue;
@@ -658,7 +906,7 @@ pub fn build_chunk_in(
                         } else {
                             [wobble, wobble, wobble]
                         };
-                        let before = mesh.indices.len();
+                        let before = mesh.triangles_pushed();
                         mesh.stamp(&ground.mesh, [fx, fy, fz], tint);
                         let rims = rim_faces();
                         mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0], color, Faces { top: true, ..rims });
@@ -679,7 +927,7 @@ pub fn build_chunk_in(
                         } else {
                             [wobble, wobble, wobble]
                         };
-                        let before = mesh.indices.len();
+                        let before = mesh.triangles_pushed();
                         mesh.stamp(&model.mesh, [fx, fy, fz], tint);
                         if lib.mode(voxel.tile_id) == Some(RenderMode::FlatTile) {
                             let rims = rim_faces();
@@ -751,7 +999,7 @@ pub fn build_chunk_in(
                 west: occluded(-1, 0, 0),
             };
 
-            let before = mesh.indices.len();
+            let before = mesh.triangles_pushed();
             match voxel.solid {
                 Solid::Empty => {}
                 Solid::Cube | Solid::Fortification => {
@@ -826,16 +1074,6 @@ pub fn build_chunk_in(
                 Solid::Foliage => tally(&mesh, before, &mut budget.foliage),
                 _ => tally(&mesh, before, &mut budget.other),
             }
-            let before = mesh.indices.len();
-
-            // Magma sits inside the cell at a height set by its fill level and
-            // stays opaque. Water is a surface, meshed apart from here.
-            if voxel.magma > 0 {
-                let h = (voxel.magma as f32 / 7.0).clamp(0.15, 1.0) * Z_SCALE;
-                let tint = to_linear([255, 90, 20], 1.0);
-                mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + h, fz + 1.0], tint, Faces::default());
-            }
-            tally(&mesh, before, &mut budget.liquids);
         }
     }
 
@@ -845,9 +1083,14 @@ pub fn build_chunk_in(
 
     build_furnishings(chunk, opts, library.as_deref(), surface.as_ref(), &mut mesh, budget);
 
-    // Water is a sheet across tiles rather than a box inside one, and it is
-    // meshed whatever else a tile is drawing: a pool's rim tiles are ramps, and
-    // the sprite paths above have already moved on from them.
+    // The flat-coloured faces held back through the whole pass, joined into as
+    // few quads as the rules allow (`Plane`). Everything wearing a sprite went
+    // straight into the buffers and is untouched.
+    budget.merged += mesh.flush_merges();
+
+    // A liquid is a sheet across tiles rather than a box inside one, and both
+    // are meshed whatever else a tile is drawing: a pool's rim tiles are ramps,
+    // and the sprite paths above have already moved on from them.
     let mut water = MeshData::default();
     crate::water::build_chunk(world, chunk, opts, &mut water);
     budget.liquids += water.triangle_count();
@@ -855,5 +1098,152 @@ pub fn build_chunk_in(
         mesh.water = Some(Box::new(water));
     }
 
+    let mut magma = MeshData::default();
+    crate::magma::build_chunk(world, chunk, opts, &mut magma);
+    budget.liquids += magma.triangle_count();
+    if !magma.is_empty() {
+        mesh.magma = Some(Box::new(magma));
+    }
+
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::palette::Palette;
+    use crate::world::{TILES_PER_BLOCK, Voxel};
+    use dfhack_remote::rfr::{MaterialList, TiletypeList};
+    use dwarf_eye_art::atlas::WHITE_UV;
+
+    const UP: [f32; 3] = [0.0, 1.0, 0.0];
+    const GREY: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
+
+    /// One tile's top face, wound the way `cuboid` winds it.
+    fn top(x: f32, z: f32) -> [[f32; 3]; 4] {
+        [[x, 0.0, z], [x, 0.0, z + 1.0], [x + 1.0, 0.0, z + 1.0], [x + 1.0, 0.0, z]]
+    }
+
+    /// Every top face of a 3x3 of tiles, in scan order.
+    fn grid_faces() -> Vec<[[f32; 3]; 4]> {
+        (0..3).flat_map(|z| (0..3).map(move |x| top(x as f32, z as f32))).collect()
+    }
+
+    #[test]
+    fn a_three_by_three_of_one_face_becomes_one_quad() {
+        let mut merger = Merger::default();
+        for face in grid_faces() {
+            assert!(merger.push(face, UP, GREY, WHITE_UV));
+        }
+        let merged = merger.merged();
+        assert_eq!(merged.len(), 1);
+        let (plane, patch) = merged[0];
+        assert_eq!((patch.a0, patch.a1, patch.b0, patch.b1), (0.0, 3.0, 0.0, 3.0));
+        // The winding survives: the merged quad is the 3x3 corner for corner.
+        assert_eq!(plane.corners(patch), top(0.0, 0.0).map(|c| [c[0] * 3.0, c[1], c[2] * 3.0]));
+        assert_eq!(plane.normal(), UP);
+        assert_eq!(plane.color(), GREY);
+        assert_eq!(plane.uv(), WHITE_UV);
+    }
+
+    #[test]
+    fn a_merged_quad_still_samples_one_texel() {
+        let mut mesh = MeshData::merging();
+        mesh.cuboid([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], GREY, Faces::default());
+        mesh.cuboid([1.0, 0.0, 0.0], [2.0, 1.0, 1.0], GREY, Faces::default());
+        mesh.flush_merges();
+        // Whatever merged, no vertex left the white cell, so nothing can
+        // stretch a sprite across a run.
+        assert!(mesh.uvs.iter().all(|&uv| uv == WHITE_UV), "{:?}", mesh.uvs);
+    }
+
+    #[test]
+    fn a_different_tint_does_not_merge() {
+        let mut merger = Merger::default();
+        let other = [0.25, 0.5, 0.5, 1.0];
+        for (i, face) in grid_faces().into_iter().enumerate() {
+            let color = if i == 4 { other } else { GREY };
+            assert!(merger.push(face, UP, color, WHITE_UV));
+        }
+        let merged = merger.merged();
+        // The middle tile stands alone; its row splits either side of it, and
+        // the rows above and below cannot stack across the gap.
+        assert_eq!(merged.len(), 5);
+        let odd = merged.iter().find(|(plane, _)| plane.color() == other).unwrap();
+        assert_eq!((odd.1.a0, odd.1.a1, odd.1.b0, odd.1.b1), (1.0, 2.0, 1.0, 2.0));
+    }
+
+    #[test]
+    fn a_different_atlas_cell_does_not_merge() {
+        let mut merger = Merger::default();
+        assert!(merger.push(top(0.0, 0.0), UP, GREY, WHITE_UV));
+        assert!(merger.push(top(1.0, 0.0), UP, GREY, [0.75, 0.25]));
+        assert_eq!(merger.merged().len(), 2);
+    }
+
+    #[test]
+    fn faces_in_different_planes_do_not_merge() {
+        let mut merger = Merger::default();
+        assert!(merger.push(top(0.0, 0.0), UP, GREY, WHITE_UV));
+        let higher = top(1.0, 0.0).map(|c| [c[0], c[1] + 1.0, c[2]]);
+        assert!(merger.push(higher, UP, GREY, WHITE_UV));
+        // Same colour, same cell, touching in plan, but not the same plane.
+        assert_eq!(merger.merged().len(), 2);
+    }
+
+    #[test]
+    fn opposite_faces_of_one_plane_do_not_merge() {
+        let mut merger = Merger::default();
+        assert!(merger.push(top(0.0, 0.0), UP, GREY, WHITE_UV));
+        assert!(merger.push(top(1.0, 0.0), [0.0, -1.0, 0.0], GREY, WHITE_UV));
+        assert_eq!(merger.merged().len(), 2);
+    }
+
+    /// A world with a 3x3 patch of `tile` at tiles (1,1)..(3,3) on z 0 and
+    /// nothing else.
+    fn patch(tile: Voxel) -> World {
+        let mut world = World::new(Palette::new(TiletypeList::default(), MaterialList::default()));
+        let mut voxels = vec![Voxel::default(); TILES_PER_BLOCK];
+        for dy in 1..4 {
+            for dx in 1..4 {
+                voxels[(dy * BLOCK + dx) as usize] = tile;
+            }
+        }
+        world.restore((0, 0, 0), voxels);
+        world
+    }
+
+    fn meshed(world: &World) -> (usize, Budget) {
+        let mut budget = Budget::default();
+        let mesh = build_chunk_in(
+            world,
+            world.chunk(0, 0, 0).unwrap(),
+            MeshOptions::default(),
+            None,
+            &mut budget,
+            Ground::Stepped,
+        );
+        (mesh.triangle_count(), budget)
+    }
+
+    #[test]
+    fn a_slab_of_one_colour_merges_face_by_face() {
+        let world = patch(Voxel { solid: Solid::Cube, ..Default::default() });
+        let (triangles, budget) = meshed(&world);
+        // Nine lids and twelve exposed sides go in; one lid and one wall a side
+        // come out.
+        assert_eq!(budget.cubes, (9 + 12) * 2);
+        assert_eq!(triangles, 5 * 2);
+        assert_eq!(budget.merged, (9 + 12 - 5) * 2);
+    }
+
+    #[test]
+    fn the_per_tile_wobble_keeps_neighbours_apart() {
+        // The same slab in a colour the jitter can act on: every tile ends up a
+        // shade of its own, so no two faces share a key and nothing merges.
+        let world = patch(Voxel { solid: Solid::Cube, color: [128, 128, 128], ..Default::default() });
+        let (triangles, budget) = meshed(&world);
+        assert_eq!(budget.merged, 0);
+        assert_eq!(triangles, (9 + 12) * 2);
+    }
 }

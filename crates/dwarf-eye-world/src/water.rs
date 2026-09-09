@@ -8,11 +8,12 @@
 //! corner to the ground, which is what tapers a pool to its bank.
 //!
 //! The result is its own mesh on its own translucent material
-//! (`main.rs:WaterMaterial`); magma stays a solid cuboid on the terrain pass.
+//! (`main.rs:WaterMaterial`). Magma is the same surface on its own material
+//! (`magma.rs`), and the corner rule here is what both read.
 
 use crate::mesh::{MeshData, MeshOptions, Z_SCALE, shade, to_linear};
 use crate::palette::{Solid, water_color};
-use crate::world::{BLOCK, Chunk, World};
+use crate::world::{BLOCK, Chunk, Voxel, World};
 
 /// A full tile of liquid, as DF counts it.
 pub const FULL: u8 = 7;
@@ -22,32 +23,49 @@ const DEPTH_LIMIT: i32 = 5;
 
 /// Below this a corner is at ground level and the face there is not worth
 /// drawing.
-const EPSILON: f32 = 1.0e-3;
+pub(crate) const EPSILON: f32 = 1.0e-3;
+
+/// Which of DF's two liquids a surface is made of. The corner rule is one rule;
+/// only the fill level it reads differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Liquid {
+    Water,
+    Magma,
+}
+
+impl Liquid {
+    pub fn fill(self, v: Voxel) -> u8 {
+        match self {
+            Liquid::Water => v.water,
+            Liquid::Magma => v.magma,
+        }
+    }
+}
 
 /// Whether a tile blocks the sheet: a wall neither holds water nor lets it
 /// drain, so it leaves the surface beside it alone.
-fn wall(solid: Solid) -> bool {
+pub(crate) fn wall(solid: Solid) -> bool {
     matches!(solid, Solid::Cube | Solid::Fortification)
 }
 
-/// The fill level at a tile, or `None` where there is no water.
-fn level(world: &World, x: i32, y: i32, z: i32) -> Option<u8> {
-    world.voxel(x, y, z).map(|v| v.water).filter(|&w| w > 0)
+/// The fill level at a tile, or `None` where there is no liquid of that kind.
+pub(crate) fn level(world: &World, x: i32, y: i32, z: i32, of: Liquid) -> Option<u8> {
+    world.voxel(x, y, z).map(|v| of.fill(v)).filter(|&w| w > 0)
 }
 
 /// What one tile contributes to a corner of a surface whose own level is `own`.
 ///
 /// Liquid contributes its own fill. A wall, an unloaded tile, or a column that
 /// carries on above contributes `own`, which leaves the corner where it was.
-/// Anything else — floor, ramp, open air — is somewhere the water is not, and
+/// Anything else — floor, ramp, open air — is somewhere the liquid is not, and
 /// contributes nothing, so the corner sinks toward the ground.
-fn contribution(world: &World, x: i32, y: i32, z: i32, own: u8) -> f32 {
+fn contribution(world: &World, x: i32, y: i32, z: i32, own: u8, of: Liquid) -> f32 {
     let Some(v) = world.voxel(x, y, z) else { return own as f32 };
-    if v.water > 0 {
-        if level(world, x, y, z + 1).is_some() {
+    if of.fill(v) > 0 {
+        if level(world, x, y, z + 1, of).is_some() {
             return own as f32;
         }
-        return v.water as f32;
+        return of.fill(v) as f32;
     }
     if wall(v.solid) {
         return own as f32;
@@ -57,35 +75,54 @@ fn contribution(world: &World, x: i32, y: i32, z: i32, own: u8) -> f32 {
 
 /// Height of one corner of a liquid tile's surface, in cells.
 ///
-/// `cx` and `cy` are 0 or 1 and pick the corner; the four tiles that share it
+/// `corner` is a pair of 0 or 1 and picks the corner; the four tiles that share it
 /// are averaged, so the two tiles either side of an edge compute the same pair
 /// of heights and the sheet has no seam.
-pub fn corner_height(world: &World, x: i32, y: i32, z: i32, own: u8, cx: i32, cy: i32) -> f32 {
+pub fn corner_height_of(
+    world: &World,
+    x: i32,
+    y: i32,
+    z: i32,
+    own: u8,
+    corner: (i32, i32),
+    of: Liquid,
+) -> f32 {
+    let (cx, cy) = corner;
     let mut sum = 0.0;
     for dy in [cy - 1, cy] {
         for dx in [cx - 1, cx] {
-            sum += contribution(world, x + dx, y + dy, z, own);
+            sum += contribution(world, x + dx, y + dy, z, own, of);
         }
     }
     (sum / 4.0 / FULL as f32).clamp(0.0, 1.0) * Z_SCALE
 }
 
-/// The four corner heights of a tile, indexed `[cx][cy]`.
-pub fn corners(world: &World, x: i32, y: i32, z: i32, own: u8) -> [[f32; 2]; 2] {
+/// The four corner heights of a liquid tile, indexed `[cx][cy]`.
+pub fn corners_of(world: &World, x: i32, y: i32, z: i32, own: u8, of: Liquid) -> [[f32; 2]; 2] {
     let mut h = [[0.0; 2]; 2];
     for cx in 0..2 {
         for cy in 0..2 {
-            h[cx as usize][cy as usize] = corner_height(world, x, y, z, own, cx, cy);
+            h[cx as usize][cy as usize] = corner_height_of(world, x, y, z, own, (cx, cy), of);
         }
     }
     h
 }
 
-/// Tiles of water stacked under this one, for how dark the surface reads.
-fn depth_below(world: &World, x: i32, y: i32, z: i32) -> f32 {
+/// [`corner_height_of`] for water.
+pub fn corner_height(world: &World, x: i32, y: i32, z: i32, own: u8, cx: i32, cy: i32) -> f32 {
+    corner_height_of(world, x, y, z, own, (cx, cy), Liquid::Water)
+}
+
+/// [`corners_of`] for water.
+pub fn corners(world: &World, x: i32, y: i32, z: i32, own: u8) -> [[f32; 2]; 2] {
+    corners_of(world, x, y, z, own, Liquid::Water)
+}
+
+/// Tiles of liquid stacked under this one, for how dark the surface reads.
+pub(crate) fn depth_below(world: &World, x: i32, y: i32, z: i32, of: Liquid) -> f32 {
     let mut deep = 0.0;
     for step in 1..=DEPTH_LIMIT {
-        if level(world, x, y, z - step).is_none() {
+        if level(world, x, y, z - step, of).is_none() {
             break;
         }
         deep += 1.0;
@@ -134,7 +171,7 @@ pub fn build_chunk(world: &World, chunk: &Chunk, opts: MeshOptions, mesh: &mut M
                 corners(world, x, y, z, voxel.water)
             };
 
-            let depth = depth_below(world, x, y, z);
+            let depth = depth_below(world, x, y, z, Liquid::Water);
             let corner_depth = |cx: usize, cy: usize| depth + h[cx][cy] / Z_SCALE;
 
             // A lid rests on a full surface, so the two would fight for the

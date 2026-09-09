@@ -77,7 +77,7 @@ fn convert(tree: TreeMesh) -> MeshData {
         normals: tree.normals,
         colors: tree.colors,
         indices: tree.indices,
-        water: None,
+        ..Default::default()
     }
 }
 

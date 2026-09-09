@@ -151,6 +151,7 @@ fn main() {
                 request_blocks,
                 refresh_mask,
                 update_hud,
+                pulse_magma,
             ),
         )
         .add_systems(
@@ -628,9 +629,10 @@ struct ChunkEntities(HashMap<ChunkKey, Spawned>);
 struct Spawned {
     terrain: Option<Entity>,
     water: Option<Entity>,
+    magma: Option<Entity>,
     /// One entry per canopy band, nearest first.
     bands: Vec<Stage>,
-    /// Terrain and water, which every band draws.
+    /// Terrain and its liquids, which every band draws.
     base: usize,
     /// Middle of the chunk, for saying which band is drawing.
     centre: Vec3,
@@ -644,7 +646,7 @@ struct Stage {
 
 impl Spawned {
     fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
-        [self.terrain, self.water]
+        [self.terrain, self.water, self.magma]
             .into_iter()
             .chain(self.bands.iter().flat_map(|s| s.entities))
             .flatten()
@@ -739,6 +741,39 @@ pub struct BlobShadowMaterial(pub Handle<TerrainMat>);
 /// terrain opaque, which is what lets the sorted transparent pass work at all.
 #[derive(Resource)]
 pub struct WaterMaterial(pub Handle<TerrainMat>);
+
+/// Magma surfaces: blended like water, and emissive, so a magma sea lights
+/// itself and blooms without a light per tile. `pulse_magma` breathes the
+/// emissive strength; the colour and how opaque it is are vertex data
+/// (`dwarf_eye_world::magma`).
+#[derive(Resource)]
+pub struct MagmaMaterial(pub Handle<TerrainMat>);
+
+/// How bright magma glows, and how far the pulse takes that either way. The
+/// scale is the renderer's own: the adventurer is lit from inside at 0.5, so
+/// this is a surface several times brighter than anything else underground,
+/// which is what makes it bloom.
+const MAGMA_GLOW: f32 = 3.0;
+const MAGMA_PULSE: f32 = 0.28;
+
+/// The glow of magma, breathing.
+///
+/// Three slow sines with periods that share no factor read as a wandering
+/// noise rather than a heartbeat: a sea brightens and dims over ten or twenty
+/// seconds and never twice the same way. One material for the whole world, so
+/// this is one asset write a frame.
+fn pulse_magma(
+    time: Res<Time>,
+    magma: Res<MagmaMaterial>,
+    mut materials: ResMut<Assets<TerrainMat>>,
+) {
+    let t = time.elapsed_secs();
+    let wave = (t * 0.21).sin() * 0.5 + (t * 0.13 + 1.7).sin() * 0.3 + (t * 0.37 + 4.2).sin() * 0.2;
+    let glow = MAGMA_GLOW * (1.0 + MAGMA_PULSE * wave);
+    if let Some(mut material) = materials.get_mut(&magma.0) {
+        material.base.emissive = LinearRgba::rgb(glow, glow * 0.34, glow * 0.06);
+    }
+}
 
 /// Tree crowns. Their own material so they can be shaded as leaves rather than
 /// as stone, and so cloud shadows still reach them: `clouds::bake_shadow`
@@ -894,6 +929,19 @@ fn setup(
     water.base.perceptual_roughness = 0.1;
     water.base.reflectance = 0.5;
     commands.insert_resource(WaterMaterial(materials.add(water)));
+
+    // Magma: the same blended surface, lighting itself. Rougher and duller than
+    // water, because a molten surface is a skin rather than a mirror, and no
+    // point light anywhere — the emissive is the glow, and the bloom pass turns
+    // it into light spilling onto the rock beside it.
+    let mut magma = terrain(0.0);
+    magma.base.alpha_mode = AlphaMode::Blend;
+    magma.base.double_sided = true;
+    magma.base.cull_mode = None;
+    magma.base.perceptual_roughness = 0.65;
+    magma.base.reflectance = 0.08;
+    magma.base.emissive = LinearRgba::rgb(MAGMA_GLOW, MAGMA_GLOW * 0.34, MAGMA_GLOW * 0.06);
+    commands.insert_resource(MagmaMaterial(materials.add(magma)));
 
     // Leaf faces carry a procedural cutout at Dwarf Fortress's own texel
     // density, which is what lets sky through the crown and dapples the shadow
@@ -1263,6 +1311,7 @@ fn upload_chunks(
     mut meshes: ResMut<Assets<Mesh>>,
     material: Res<TerrainMaterial>,
     water_material: Res<WaterMaterial>,
+    magma_material: Res<MagmaMaterial>,
     canopy_materials: Res<CanopyMaterials>,
     mut entities: ResMut<ChunkEntities>,
     mut status: ResMut<Status>,
@@ -1290,15 +1339,20 @@ fn upload_chunks(
         // Water rides in with the terrain and splits off here: its own entity,
         // its own translucent material.
         let pool = data.take_water();
+        let melt = data.take_magma();
         if let Some(old) = entities.0.remove(&key) {
             for entity in old.entities() {
                 commands.entity(entity).despawn();
             }
         }
-        if data.is_empty() && pool.is_empty() && crowns.iter().all(CanopyMeshes::is_empty) {
+        if data.is_empty()
+            && pool.is_empty()
+            && melt.is_empty()
+            && crowns.iter().all(CanopyMeshes::is_empty)
+        {
             continue;
         }
-        let base = data.triangle_count() + pool.triangle_count();
+        let base = data.triangle_count() + pool.triangle_count() + melt.triangle_count();
         let mut spawn = |mesh: MeshData, material: Handle<TerrainMat>, stage: Option<usize>| {
             (!mesh.is_empty()).then(|| {
                 let mut entity = commands.spawn((
@@ -1318,6 +1372,7 @@ fn upload_chunks(
         };
         let terrain = spawn(data, material.0.clone(), None);
         let water = spawn(pool, water_material.0.clone(), None);
+        let magma = spawn(melt, magma_material.0.clone(), None);
         let mut spawned_bands = Vec::with_capacity(crowns.len());
         for (stage, crown) in crowns.into_iter().enumerate() {
             let Some(&band) = BANDS.get(stage) else { continue };
@@ -1336,7 +1391,9 @@ fn upload_chunks(
             key.2 as f32 * Z_SCALE,
             (key.1 * BLOCK + BLOCK / 2) as f32,
         );
-        entities.0.insert(key, Spawned { terrain, water, bands: spawned_bands, base, centre });
+        entities
+            .0
+            .insert(key, Spawned { terrain, water, magma, bands: spawned_bands, base, centre });
     }
     status.triangles = entities.0.values().map(Spawned::held).sum();
 }
