@@ -247,7 +247,11 @@ draws it.
 
 Every stage wears the canopy's leaf surface on an opaque copy of the canopy
 material with the horizon's block mask over it
-(`main.rs:HorizonCanopyMaterial`). An instanced crown cannot carry world-space
+(`main.rs:HorizonCanopyMaterial`), in two casts: the grown stage takes the
+canopy's sky term, because a grown tree's faces carry no shading of their own,
+and the two box stages do not, because `crown.rs` already bakes a lit top and
+darker sides into their vertex colours and the sky term over that takes a
+crown's sides to nearly black. An instanced crown cannot carry world-space
 UVs in its vertex buffer the way a chunk's mesh does — the instance's scale
 would take them with it and every tree would wear a different texel size — so
 `cloud_shadow.wgsl:horizon_leaf` derives them from the world position instead,
