@@ -15,6 +15,11 @@
 //! drew boxes the size of houses right in front of the eye. Past `REACH`
 //! nothing is placed at all and the ground carries the canopy as colour
 //! instead (`terrace.rs:canopy_at`).
+//!
+//! How a stage is *drawn* is [`super::batch`]'s: the cheap stages are baked
+//! into one mesh per cell, so the swap is per cell rather than per tree, and
+//! the rasterised cuts stay one entity a tree but only where the camera can
+//! reach them. That is why an instance carries its own tile and reach.
 
 use dwarf_eye_trees::Preset;
 
@@ -76,6 +81,13 @@ pub struct CrownInstance {
     pub yaw: f32,
     /// Which of the species' canonical growths the rasterised stages draw.
     pub variant: u32,
+    /// The absolute region tile this tree grew on, which is the cell its cheap
+    /// stages are merged over (`batch::assemble`).
+    pub tile: (i32, i32),
+    /// The nearest the camera can come to this tree's own region tile while it
+    /// stands anywhere in the live window (`batch::reach`). A stage that hands
+    /// over inside this can never be asked for and is never spawned.
+    pub reach: f32,
 }
 
 /// A region tile's worth of forest: what grows there and how thickly.
@@ -195,6 +207,8 @@ pub fn scatter(
     let (ox, oz) = (patch.rx * REGION_TILE - window.origin.0, patch.ry * REGION_TILE - window.origin.1);
     let (cx, cz) = (ox + REGION_TILE / 2, oz + REGION_TILE / 2);
     let radius = terrain.radius(cx, cz) as f32;
+    let tile = (patch.rx, patch.ry);
+    let reach = super::batch::reach(tile, (window.origin.0, window.origin.1), window.live);
     let observed = terrain.fine.nearby_density(cx, cz, BLEND_BLOCKS);
     let count = crown_count_near(patch.vegetation, patch.elevation, radius, observed);
     for k in 0..count {
@@ -224,6 +238,8 @@ pub fn scatter(
                 height: DF_TREE_HEIGHT * jitter,
                 yaw: unit(4) * std::f32::consts::TAU,
                 variant: seed(7) % super::grown::VARIANTS,
+                tile,
+                reach,
             },
         ));
     }
@@ -377,7 +393,8 @@ mod tests {
     fn a_tile_with_no_species_grows_nothing() {
         let field = crate::horizon::field::Field::default();
         let fine = crate::horizon::fine::FineSurface::default();
-        let window = Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (72, 72) };
+        let window =
+            Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (72, 72), live: (0, 0, 144, 144) };
         let skins = crate::horizon::skin::Skins::none();
         let terrain = Terrain {
             field: &field,

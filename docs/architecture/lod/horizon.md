@@ -1,7 +1,8 @@
 # The far band
 
 Status: landed (`crates/dwarf-eye-world/src/horizon/`, issue #31); the tree
-chain is the factory's, shared with the window's canopy bands (issue #5); the
+chain is the factory's, shared with the window's canopy bands (issue #5), and
+drawn a cell at a time rather than a tree at a time (`horizon/batch.rs`); the
 smooth world grid past the region details still joins by a hidden step rather
 than a skirt (issue #9).
 
@@ -236,19 +237,20 @@ stand a few tiles from the eye — the live window is 144 tiles square and the
 camera walks to its edge — and the old rule drew those as boxes the size of
 houses.
 
-Every placed tree is one entity per stage, each carrying its own
-`VisibilityRange` (`main.rs:horizon_ranges`, over `factory::edges` and
-`main.rs:band_fades` — the same two calls the canopy bands use), and Bevy does
-the swapping the way it does for the canopy bands:
+Which stage draws is a `VisibilityRange` (`main.rs:horizon_ranges`, over
+`factory::edges` and `main.rs:band_fades` — the same two calls the canopy bands
+use), and Bevy does the swapping the way it does for the canopy bands. What
+carries that range is a **cell** for the cheap stages and a **tree** for the
+cuts, which is [the batching below](#the-batching):
 
-| stage | mesh | ends at | 720-tall window | shadow |
-|---|---|---|---|---|
-| 4 voxels | `horizon::grown` | `N` | 109 | casts |
-| 3 voxels | `horizon::grown` | `4N/3` | 145 | casts |
-| 2 voxels | `horizon::grown` | `2N` | 217 | casts |
-| 1 voxel | `horizon::grown` | `4N` | 436 | a blob |
-| crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(8 N, 150)` | 872 | a blob |
-| box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | — | a blob |
+| stage | mesh | ends at | 720-tall window | drawn by | shadow |
+|---|---|---|---|---|---|
+| 4 voxels | `horizon::grown` | `N` | 73 | a tree | casts |
+| 3 voxels | `horizon::grown` | `4N/3` | 97 | a tree | casts |
+| 2 voxels | `horizon::grown` | `2N` | 145 | a tree | casts |
+| 1 voxel | `horizon::grown` | `4N` | 291 | a tree | a blob |
+| crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(8 N, 150)` | 583 | a cell | a blob |
+| box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | — | a cell | a blob |
 
 `N` is the canopy's own near band (`canopy::near_band`, 73 tiles at the default threshold into a
 720-tall window), so a longer lens or a taller window pushes the whole chain
@@ -335,12 +337,55 @@ underside where the box below is at least as wide — so a preset costs:
 | shrub, tall grass (one box) | 10 |
 | any preset's `crown_box` | 12 |
 
-Each species and stage is one mesh with one transform per instance, spawned in
-`main.rs` under the `Horizon` marker; Bevy batches entities sharing a mesh and
-material, so a whole forest is a handful of draw calls. They ride the horizon
-material, so the block mask discards any that stand where fine chunks have
-since arrived, and they are `NotShadowCaster`: a tree a thousand tiles off
-contributes nothing to the shadow map but its own cost, four cascades over.
+The crown and the box ride the horizon material, so the block mask discards any
+that stand where fine chunks have since arrived, and they are `NotShadowCaster`:
+a tree a thousand tiles off contributes nothing to the shadow map but its own
+cost, four cascades over.
+
+## The batching
+
+**The geometry was never the bill; the entities were.** One entity per tree per
+stage over a 22.7k-tree scatter is 136k entities, plus a blob each: 159k
+entities whose visibility, range and transform Bevy walked every frame. At eye
+level from open ground that ran at **2 fps** while drawing 3.1M triangles — a
+scene the same window had held at 60 to 120 fps before the chain landed.
+
+`batch.rs` merges instead. A stage whose mesh costs at most
+`MERGE_MAX_TRIANGLES` 64 triangles a tree is **baked**: every tree's yaw, scale
+and position are folded into the vertices and a whole cell becomes one mesh at
+the identity transform. Nothing a texture sees changes —
+`cloud_shadow.wgsl:horizon_leaf` already derives a far crown's UVs from the
+world position, precisely because an instance's own scale would otherwise take
+them with it, so a baked transform is the case it was written for. The range
+stays per merged mesh with `use_aabb`, so a cell hands over at its own distance;
+Bevy measures to the bounding box's centre, so a cell's hand-off is out by half
+its own width, which is why a cell is wider only where it hands over further
+out:
+
+| drawn by | stages | cell | why |
+|---|---|---|---|
+| one mesh a cell, transforms baked | crown (30 triangles a tree), box (12) | 2 and 4 region tiles | every tree carries these, so this is where the entities were |
+| one entity a tree, shared mesh | 4, 3, 2 and 1 voxel (16000 down to 780 triangles a tree) | — | a copy per tree would hold millions of triangles and rebuild them on every window move |
+
+The cuts stay affordable as entities because a tree is only given a stage the
+camera can still ask for. The camera stands somewhere in the live window, so the
+nearest it can ever come to a region tile is that tile's own gap to the window's
+rectangle (`batch.rs:reach`), and `main.rs:stage_is_reachable` drops any stage
+whose range ends inside that gap. Nothing has to be stretched to cover for it:
+the stage behind it starts at the hand-off that was dropped and so already
+covers every distance the camera can reach. `main.rs:opening_stage` still opens
+the first surviving stage at the camera rather than at a hand-off nothing draws,
+which is what keeps a camera flown outside the live window looking at coarse
+trees rather than at a hole.
+
+Blob shadows merge the same way, over 2 region tiles. A blob's shape depends on
+the sun's **elevation** as well as its azimuth — it stretches away from the sun
+by the tree's height over the tangent — so no turn of a transform or a UV can
+re-aim one. `main.rs:aim_blob_shadows` rewrites the merged mesh's positions in
+place on a two-degree move (`batch.rs:aim_blobs`), which is four positions a
+tree and touches nothing else: the indices, normals, colours and UVs are the
+same whatever the sun is doing. That is cheaper than rebuilding the mesh, and it
+is the only option that expresses the stretch.
 
 ## Rivers and sites
 
@@ -373,16 +418,27 @@ itself at every horizon build):
 
 The tree rows are alternatives, not a sum: a tree draws at one stage, and which
 one is its own distance to the camera. Almost every tree is at the crown or the
-box; only the handful inside 217 tiles pay for a cut. What actually reaches the
-GPU is the viewer's own counter, and that is the number to read: **2.27M
-triangles drawn of 4.29M held, at eye level with the camera standing in a
-crown** — against 434k drawn before the chain, when everything past the window
-was a box. Making the finer cuts cheaper is the edge rule's job, not a cap by
-source: `MIN_LEAF_PIXELS` pulls every stage in together, for the window and the
-horizon alike.
+box; only the handful inside the two-voxel edge pay for a cut. Making the finer
+cuts cheaper is the edge rule's job, not a cap by source: `MIN_LEAF_PIXELS`
+pulls every stage in together, for the window and the horizon alike.
 
-Entities are one per tree per stage plus one blob, so a six-stage chain over
-22.7k trees is about 136k entities; only the stage in range draws.
+**Entities are the number that decides the frame rate**, and the viewer reports
+them itself on the horizon line. Over one 14.7k-tree scatter at eye level, the
+same framing throughout:
+
+| | horizon entities | fps | window triangles drawn |
+|---|---|---|---|
+| one entity a tree a stage, 2-pixel leaf | 6 x trees + a blob each | 2 | 3.1M of 5.0M held |
+| merged, 2-pixel leaf | 7966 | 42 | 5.2M of 8.0M held |
+| merged, 3-pixel leaf | 4448 | 59 | 4.4M of 8.0M held |
+
+The first row is a different stand (22.7k trees, open ground) because the game
+is live and the character moves; the last two are the same frame to the tile.
+The two levers are independent and both count: merging and reach-culling took
+159k entities to 8.0k, and the finer `MIN_LEAF_PIXELS` pulled every edge in,
+which takes 3.5k more cuts out of reach. Triangles drawn went **up** across the
+change while the frame rate went up thirty-fold, which is the whole point: the
+geometry was never the bill.
 
 ## Invariants and gotchas
 
@@ -419,6 +475,19 @@ Entities are one per tree per stage plus one blob, so a six-stage chain over
 - A one-level riser is drawn as a vertical face, not as a ramp-like slope. The
   fine map's ramps are a tile wide and a coarse cell is six or more, so a slope
   there would read as a chamfer rather than as a ramp.
+- A blob is now sized from the preset's own `crown_box` — the crown's bounds —
+  rather than from whichever cut happened to be the first non-casting stage.
+  The old width moved with the window's height, because that stage does; this
+  one does not.
+- A stage is dropped for trees the camera cannot reach **while it stands in the
+  live window**. The window follows the fetch centre and the horizon rebuilds
+  when it shifts, so a flier drags it along; between two rebuilds a camera far
+  outside the window sees a stand open at a coarser cut than its distance asks
+  for, never at nothing, because the first surviving stage opens at the camera
+  (`main.rs:opening_stage`).
+- Resizing the window rewrites every range (`main.rs:size_bands`) but does not
+  re-cull: a stage dropped as unreachable stays dropped until the next horizon
+  build. The build follows the window, so this lasts one move.
 - A crown seen from directly underneath shows the inside of its lowest box,
   because that underside is dropped. Two triangles a tree, and the band this
   stage serves is normally at or below the eye; `crown.rs:slabs` sets the flag
