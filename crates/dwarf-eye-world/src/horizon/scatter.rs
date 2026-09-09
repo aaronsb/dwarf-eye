@@ -125,12 +125,15 @@ pub fn crown_count(vegetation: i32, radius: f32) -> usize {
 
 /// The same, blended toward what the fine map is actually growing nearby.
 ///
-/// `observed` is `(crowns per region tile seen in the fine map, distance to
-/// that fine ground in tiles)` from `FineSurface::nearby_density`. A region
-/// tile's `vegetation` is a 48-tile average and says nothing about the clearing
-/// the character is standing in, so right at the window's edge the fine map
-/// wins outright and the survey takes over across [`BLEND`]: a treeless window
-/// edge gives a treeless surround, a dense one continues the forest.
+/// `observed` is `(canopy cover 0..1 seen in the fine map, distance to that
+/// fine ground in tiles)` from `FineSurface::nearby_density`. A region tile's
+/// `vegetation` is a 48-tile average and says nothing about the clearing the
+/// character is standing in, so right at the window's edge the fine map wins
+/// outright and the survey takes over across [`BLEND`]: a treeless window edge
+/// gives a treeless surround, a dense one continues the forest.
+///
+/// Full cover maps to the survey's own full density, so the two ends of the
+/// blend are on one scale and neither can run away with the count.
 ///
 /// Only the count changes, and the count is a prefix of the seeded list, so no
 /// tree moves.
@@ -143,8 +146,8 @@ pub fn crown_count_near(
     let v = ((vegetation as f32 - FLOOR) / (100.0 - FLOOR)).clamp(0.0, 1.0);
     let survey = PER_TILE * v;
     let wanted = match observed {
-        Some((per_tile, distance)) => {
-            let seen = per_tile * (REGION_TILE * REGION_TILE) as f32;
+        Some((cover, distance)) => {
+            let seen = PER_TILE * cover.clamp(0.0, 1.0);
             let t = (distance / BLEND).clamp(0.0, 1.0);
             seen + (survey - seen) * t
         }
@@ -155,7 +158,7 @@ pub fn crown_count_near(
     } else {
         (1.0 - (radius - NEAR) / (REACH - NEAR)).clamp(0.0, 1.0)
     };
-    (wanted.max(0.0) * fade * treeline(elevation)).round() as usize
+    (wanted.clamp(0.0, PER_TILE) * fade * treeline(elevation)).round() as usize
 }
 
 /// A site building's footprint, in render-local tiles, that crowns keep out of.
@@ -336,8 +339,12 @@ mod tests {
         assert_eq!(crown_count_near(90, 100.0, 0.0, Some((0.0, BLEND))), survey);
         assert_eq!(crown_count_near(90, 100.0, 0.0, Some((0.0, BLEND * 4.0))), survey);
         // A dense window edge continues the forest through a thin survey.
-        let dense = crown_count_near(20, 100.0, 0.0, Some((30.0 / (REGION_TILE * REGION_TILE) as f32, 0.0)));
-        assert_eq!(dense, 30);
+        let thin = crown_count_near(20, 100.0, 0.0, None);
+        let dense = crown_count_near(20, 100.0, 0.0, Some((0.9, 0.0)));
+        assert!(dense > thin * 4, "{dense} against {thin}");
+        // And the cue can never ask for more than the survey's own full
+        // density, however wooded the window is.
+        assert!(crown_count_near(20, 100.0, 0.0, Some((5.0, 0.0))) <= PER_TILE as usize);
     }
 
     /// Nothing grows on a site's footprint or in the ground it keeps clear

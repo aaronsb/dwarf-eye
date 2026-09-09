@@ -68,8 +68,8 @@ pub struct Horizon {
     /// Every tree appears once in each stage: which one draws is the camera's
     /// distance to it, decided by the `VisibilityRange` on each entity.
     pub crowns: Vec<CrownBatch>,
-    /// Trees per tile the fine map holds, over the whole window and at its
-    /// edge: the cue the scatter blends away from. Reported, not used.
+    /// Canopy cover the fine map holds, over the whole window and at its
+    /// centre: the cue the scatter blends away from. Reported, not used.
     pub fine_density: f32,
     pub edge_density: f32,
     /// Site footprints the scatter kept clear of.
@@ -725,14 +725,14 @@ mod tests {
         // beside it, with no trees on it.
         let columns: Vec<((i32, i32), i32)> =
             (-12..12).flat_map(|by| (11..16).map(move |bx| ((bx, by), 40))).collect();
-        let bare: Vec<((i32, i32), usize)> = columns.iter().map(|(k, _)| (*k, 0)).collect();
-        let fine = FineSurface::from_columns(&columns).with_trees(&bare);
+        let bare: Vec<((i32, i32), f32)> = columns.iter().map(|(k, _)| (*k, 0.0)).collect();
+        let fine = FineSurface::from_columns(&columns).with_canopy(&bare);
         assert!(!placed(90, &FineSurface::default()).is_empty());
         assert!(placed(90, &fine).is_empty(), "trees grew beside a bare window");
 
         // The same window with a forest on it fills the ring again.
-        let dense: Vec<((i32, i32), usize)> = columns.iter().map(|(k, _)| (*k, 24)).collect();
-        let wooded = FineSurface::from_columns(&columns).with_trees(&dense);
+        let dense: Vec<((i32, i32), f32)> = columns.iter().map(|(k, _)| (*k, 0.9)).collect();
+        let wooded = FineSurface::from_columns(&columns).with_canopy(&dense);
         assert!(!placed(90, &wooded).is_empty(), "a wooded window edge grew nothing");
     }
 

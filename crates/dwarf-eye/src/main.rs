@@ -851,7 +851,7 @@ fn drain_worker(
                     .collect();
                 status.detail = format!(
                     "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances; \
-                     fine map {:.3} trees/tile, {:.3} at the edge, {} clearings",
+                     fine map {:.2} canopy cover, {:.2} at the centre, {} clearings",
                     per_stage.join(" / "),
                     data.fine_density,
                     data.edge_density,
