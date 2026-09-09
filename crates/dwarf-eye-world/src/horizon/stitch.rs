@@ -296,7 +296,7 @@ mod tests {
     }
 
     fn window() -> Window {
-        Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (8, 8) }
+        Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (8, 8), live: (0, 0, 16, 16) }
     }
 
     fn terrain<'a>(field: &'a Field, fine: &'a FineSurface, window: &'a Window) -> Terrain<'a> {
