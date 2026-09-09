@@ -1,7 +1,8 @@
 # Walls from the environment sheets
 
 Status: landed (`crates/dwarf-eye-world/src/wall.rs`,
-`crates/dwarf-eye-world/src/library.rs`, `crates/dwarf-eye-world/src/mesh.rs`).
+`crates/dwarf-eye-world/src/library.rs`, `crates/dwarf-eye-world/src/palette.rs`,
+`crates/dwarf-eye-world/src/mesh.rs`).
 
 ## What it does
 
@@ -41,7 +42,8 @@ walls, one cell of texture per z-level.
 |---|---|---|---|
 | rough stone, feature, glowing barrier | Stone / Feature / Hfs, Normal or Worn1-3 | `wall_stone.png` | `STONE_WALL` |
 | smoothed stone, smoothed vein | Stone / LavaStone / Feature / Hfs / Mineral, Smooth | `wall_stone_smoothed.png` | `SMOOTHED_STONE_WALL` |
-| soil, sand | Soil, any | `wall_soil.png` | `SOIL_WALL` |
+| soil (clay, loam, silt, peat) | Soil, any | `wall_soil.png` | `SOIL_WALL` |
+| soil classified as one of DF's five sands | Soil, any, material id `SAND`/`SAND_TAN`/`SAND_YELLOW`/`SAND_WHITE`/`SAND_BLACK`/`SAND_RED` | `wall_sand.png` | `SAND_WALL`, `SAND_Y_WALL`, `SAND_W_WALL`, `SAND_B_WALL`, `SAND_R_WALL` |
 | mineral vein | Mineral, Normal or Worn1-3 | `wall_ore_vein.png` | `ORE_VEIN_WALL` |
 | constructed wall, pillar, fortification | Construction, any | `wall_rock_blocks.png` | `ROCK_BLOCKS_WALL` |
 | natural ice | FrozenLiquid, Normal or Worn1-3 | `wall_ice.png` | `ICE_WALL` |
@@ -49,8 +51,18 @@ walls, one cell of texture per z-level.
 | semi-molten rock, rough lava stone | Magma any, LavaStone Normal or Worn1-3 | `wall_magma.png` | `MAGMA_WALL` |
 | constructed floor, shoddy floor, track floor | Construction, any, floor shape | `floor_stone_blocks.png` | `FLOOR_STONE_BLOCK` |
 
-Cells: 8 families x (15 variants + 1 side) = 128, taking the atlas from 181 to
-309 of its 1024 (`cargo run -p dwarf-eye-world --example atlas`).
+Cells: 8 families x (15 variants + 1 side) = 128, plus the five sand hues at
+the same 16 cells each = 80 more, taking the wall total to 208
+(`cargo run -p dwarf-eye-world --example atlas`).
+
+`SOIL_WALL`'s own tiletype covers every soil material; which of the sand
+sheets (if any) a specific wall wears is not a tiletype fact but a per-tile
+one, resolved from the material list at decode time
+(`palette.rs:sand_hue`, carried on `world.rs:Voxel::sand`) and applied in
+`library.rs:wall_skin` only when the tile's base family is `SOIL_WALL`. All
+five sand families are packed unconditionally alongside `SOIL_WALL`, the same
+bargain `STONE_RAMP` and the rest make: knowable before the first block
+arrives, whether or not this particular map has any of that colour.
 
 A built floor is the same masonry seen from above, and DF ships it as a sheet of
 its own. `library.rs:construction_floor` gives every constructed floor —
@@ -65,7 +77,12 @@ see the built-floor note in [README.md](README.md).
 
 The first five sheets are near-grey and get the material's colour damped, as the
 ground does; ice and magma carry their own and take only the tile's brightness
-(`Sprite::saturation` against `library.rs:PATTERN_SATURATION`).
+(`Sprite::saturation` against `library.rs:PATTERN_SATURATION`). The sand sheets
+are measured the same way rather than assumed: DF paints tan, yellow and red
+sand with real colour, but its black and white sand art is close enough to
+grey that `pack_walls` finds it below the pattern threshold and damps it by the
+material's own colour instead — its own black or ivory
+(`palette.rs:color`), not the brown every other soil shares.
 
 ## The side-face rule
 
@@ -114,4 +131,5 @@ a four-by-two cliff of each face; it needs a DF install, not a game.
 
 #13 (this), #26 (the grey-base-plus-tint library this follows), #16 (the magma
 sheet's second material, and why a wall face cannot be greedily merged: an atlas
-cell cannot repeat, see [../pipeline/meshing.md](../pipeline/meshing.md)).
+cell cannot repeat, see [../pipeline/meshing.md](../pipeline/meshing.md)),
+#3 (the sand hue this page's `SOIL_WALL` row now resolves per tile).

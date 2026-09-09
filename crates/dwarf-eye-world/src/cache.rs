@@ -20,15 +20,39 @@
 //! ignored outright if that does not match, and a build that knows nothing of
 //! it simply leaves it alone.
 
-use crate::palette::Solid;
+use crate::palette::{SandHue, Solid};
 use crate::world::{Chunk, TILES_PER_BLOCK, Voxel};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"DEC3";
-const VOXEL_BYTES: usize = 24;
+// DEC4 adds one byte for the sand hue; a file written by DEC3 fails the
+// length check below and is deleted rather than misread.
+const MAGIC: &[u8; 4] = b"DEC4";
+const VOXEL_BYTES: usize = 25;
+
+fn sand_to_u8(s: Option<SandHue>) -> u8 {
+    match s {
+        None => 0,
+        Some(SandHue::Tan) => 1,
+        Some(SandHue::Yellow) => 2,
+        Some(SandHue::White) => 3,
+        Some(SandHue::Black) => 4,
+        Some(SandHue::Red) => 5,
+    }
+}
+
+fn sand_from_u8(b: u8) -> Option<SandHue> {
+    match b {
+        1 => Some(SandHue::Tan),
+        2 => Some(SandHue::Yellow),
+        3 => Some(SandHue::White),
+        4 => Some(SandHue::Black),
+        5 => Some(SandHue::Red),
+        _ => None,
+    }
+}
 
 /// Name and version of the column-floor sidecar.
 const FLOORS: &str = "floors";
@@ -101,6 +125,7 @@ impl Cache {
             bytes.extend_from_slice(&v.color);
             bytes.extend_from_slice(&v.tile_id.to_le_bytes());
             bytes.extend_from_slice(&v.mat_index.to_le_bytes());
+            bytes.push(sand_to_u8(v.sand));
             bytes.push(v.tree_dx as u8);
             bytes.push(v.tree_dy as u8);
             bytes.push(v.tree_dz as u8);
@@ -216,6 +241,19 @@ mod tests {
         fs::write(cache.dir().join(FLOORS), "def0\n1 1 5").unwrap();
         assert!(cache.load_floors().is_empty(), "a version we do not know is nothing known");
     }
+
+    #[test]
+    fn a_chunks_sand_hue_survives_a_round_trip() {
+        let cache = scratch("sand");
+        let mut voxels = vec![Voxel::default(); TILES_PER_BLOCK];
+        voxels[0].sand = Some(SandHue::Black);
+        voxels[1].sand = None;
+        let chunk = Chunk { block_x: 0, block_y: 0, z: 0, voxels, ..Default::default() };
+        cache.store((0, 0, 0), &chunk).unwrap();
+        let restored = read_chunk(&cache.path((0, 0, 0))).unwrap();
+        assert_eq!(restored[0].sand, Some(SandHue::Black));
+        assert_eq!(restored[1].sand, None);
+    }
 }
 
 fn read_chunk(path: &Path) -> Result<Vec<Voxel>> {
@@ -234,12 +272,13 @@ fn read_chunk(path: &Path) -> Result<Vec<Voxel>> {
             color: [v[5], v[6], v[7]],
             tile_id: i32::from_le_bytes([v[8], v[9], v[10], v[11]]),
             mat_index: i32::from_le_bytes([v[12], v[13], v[14], v[15]]),
-            tree_dx: v[16] as i8,
-            tree_dy: v[17] as i8,
-            tree_dz: v[18] as i8,
-            building: i16::from_le_bytes([v[19], v[20]]),
-            building_sub: i16::from_le_bytes([v[21], v[22]]),
-            building_at: v[23],
+            sand: sand_from_u8(v[16]),
+            tree_dx: v[17] as i8,
+            tree_dy: v[18] as i8,
+            tree_dz: v[19] as i8,
+            building: i16::from_le_bytes([v[20], v[21]]),
+            building_sub: i16::from_le_bytes([v[22], v[23]]),
+            building_at: v[24],
         });
     }
     Ok(voxels)

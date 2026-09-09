@@ -1,7 +1,8 @@
 # Textures
 
 Status: landed (`crates/dwarf-eye-art/src/{lib.rs,raws.rs,atlas.rs}`,
-`crates/dwarf-eye-world/src/library.rs`, `crates/dwarf-eye/src/texture.rs`).
+`crates/dwarf-eye-world/src/{library.rs,palette.rs,world.rs}`,
+`crates/dwarf-eye/src/texture.rs`).
 
 ## What it does
 
@@ -32,6 +33,33 @@ direction mask, the species undirected, the generic table at that mask, the
 generic table undirected, then the nearest entry by direction bits
 (`raws.rs:nearest`, ties broken on the lowest mask so the choice is the same
 every run).
+
+## Soil families
+
+A tile's `TiletypeMaterial` says `Soil` for clay, loam, silt, peat and every
+named sand alike — DFHack does not carry the distinction the tiletype would
+need to. Only the material index does, and it says so as a raw id
+(`SAND_BLACK`, `CLAY_LOAM`, ...) that only the material list, not the tiletype
+list, carries. `palette.rs:sand_hue_from_id` classifies it once per material,
+at `Palette::new`, into a `SandHue` — `Tan` (DF's unlabelled default),
+`Yellow`, `White`, `Black` or `Red` — or `None` for every other soil material,
+matched by exact id rather than a substring so `SANDY_LOAM` and `SANDSTONE`
+(both contain "SAND") are not mistaken for it. `world.rs:decode` resolves this
+once per voxel from the material pair, the same way it resolves `color`, and
+carries the result on `Voxel::sand`.
+
+A floor, a wall and a ramp all read `Voxel::sand` the same way: a soil tile
+with a hue tries that hue's own sheet first — `SAND_YELLOW_FLOOR`,
+`SAND_Y_WALL`, `SAND_YELLOW_RAMP` — falling back to the generic soil look
+(`DIRT_FLOOR`, `SOIL_WALL`, the flat ground beside the ramp) if that hue was
+somehow never packed. All five hues are packed unconditionally per family, not
+per hue actually seen on the map: which one (if any) a specific tile is comes
+from its material, not its tiletype, so the choice cannot be baked in at
+`TileLibrary::load` the way `STONE_RAMP` or `SOIL_WALL` are — see
+[ramps.md](ramps.md) and [walls.md](walls.md) for the sheets each draws from.
+`Palette::color` makes the matching exception for tint: a sand tile keeps its
+own material colour (real black, real ivory) rather than the flat brown every
+other soil shares, for the hues whose sheet turns out to need tinting at all.
 
 ## Pages
 
@@ -89,5 +117,6 @@ every run).
 
 ## Related issues
 
-#3 (ramp sheets and skirts), #7 (ground cover), #26 (a texture library of our
-own on the same grey-base-plus-tint rule), #13 (closed, walls).
+#3 (closed: ramp sheets and skirts, then the sand hue plumbed into floors,
+walls and ramps alike), #7 (ground cover), #26 (a texture library of our own on
+the same grey-base-plus-tint rule), #13 (closed, walls).

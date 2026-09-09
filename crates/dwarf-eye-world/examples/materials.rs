@@ -49,18 +49,23 @@ fn main() -> Result<()> {
     rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
 
     println!(
-        "{:>7}  {:<26} {:<10} {:<9} {:<28} {}",
-        "count", "tiletype", "shape", "matpair", "material", "colour"
+        "{:>7}  {:<26} {:<10} {:<9} {:<28} {:<9} colour",
+        "count", "tiletype", "shape", "matpair", "material", "sand"
     );
     for ((tile, mat_type, mat_index), n) in rows.into_iter().take(22) {
         let pair = rfr::MatPair { mat_type, mat_index };
         let tt = df.world.palette.tiletype(tile);
         println!(
-            "{n:>7}  {:<26} {:<10} {:<9} {:<28} {:?}",
+            "{n:>7}  {:<26} {:<10} {:<9} {:<28} {:<9} {:?}",
             tt.and_then(|t| t.name.clone()).unwrap_or_else(|| format!("#{tile}")),
             format!("{:?}", df.world.palette.shape(tile)),
             format!("{mat_type}:{mat_index}"),
             df.world.palette.material_name(&pair).unwrap_or("<none>"),
+            df.world
+                .palette
+                .sand_hue(&pair)
+                .map(|h| format!("{h:?}"))
+                .unwrap_or_else(|| "-".to_string()),
             df.world.palette.color(tile, &pair),
         );
     }

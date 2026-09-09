@@ -1,6 +1,6 @@
 //! A voxel view of the fortress, assembled from DFHack map blocks.
 
-use crate::palette::{Palette, Rgb, Solid, solid_for_shape};
+use crate::palette::{Palette, Rgb, SandHue, Solid, solid_for_shape};
 use dfhack_remote::rfr::{BlockList, MapBlock};
 use std::collections::HashMap;
 
@@ -16,6 +16,11 @@ pub struct Voxel {
     pub tile_id: i32,
     /// Material index of the tile, which for plants selects the species.
     pub mat_index: i32,
+    /// The sand hue this tile's material resolves to, or `None` for anything
+    /// that is not one of DF's five named sands — including every other soil.
+    /// Resolved once from the material list at decode time, the same way
+    /// `color` is (`palette.rs:sand_hue`).
+    pub sand: Option<SandHue>,
     pub color: Rgb,
     /// Not yet discovered by the player.
     pub hidden: bool,
@@ -45,6 +50,7 @@ impl Default for Voxel {
             solid: Solid::default(),
             tile_id: 0,
             mat_index: 0,
+            sand: None,
             color: Rgb::default(),
             hidden: false,
             outside: false,
@@ -425,10 +431,12 @@ impl World {
                 Some(pair) => self.palette.color(tile_id, pair),
                 None => self.palette.color(tile_id, &Default::default()),
             };
+            let sand = block.materials.get(i).and_then(|pair| self.palette.sand_hue(pair));
             voxels[i] = Voxel {
                 solid: solid_for_shape(shape),
                 tile_id,
                 mat_index: block.materials.get(i).map(|m| m.mat_index).unwrap_or(-1),
+                sand,
                 color,
                 hidden: block.hidden.get(i).copied().unwrap_or(false),
                 outside: block.outside.get(i).copied().unwrap_or(false),

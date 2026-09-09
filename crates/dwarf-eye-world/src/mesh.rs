@@ -881,7 +881,7 @@ pub fn build_chunk_in(
                                 high |= bit;
                             }
                         }
-                        if let Some(model) = lib.ramp(voxel.tile_id, high) {
+                        if let Some(model) = lib.ramp(voxel.tile_id, high, voxel.sand) {
                             let wobble = jitter(x, y, z);
                             let tint = if model.tint {
                                 let base = damp([color[0], color[1], color[2]], 0.35);
@@ -916,7 +916,7 @@ pub fn build_chunk_in(
                     if covered && lib.mode(voxel.tile_id) == Some(RenderMode::FlatTile) {
                         continue;
                     }
-                    if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, caps) {
+                    if let Some(model) = lib.model(voxel.tile_id, voxel.mat_index, voxel.sand, caps) {
                         let wobble = jitter(x, y, z);
                         // A near-grey sprite is a pattern; the tile's material
                         // supplies the colour, so granite still reads unlike
@@ -986,7 +986,7 @@ pub fn build_chunk_in(
                             mask |= bit;
                         }
                     }
-                    lib.wall_skin(voxel.tile_id, mask)
+                    lib.wall_skin(voxel.tile_id, mask, voxel.sand)
                 })
                 .flatten();
 
