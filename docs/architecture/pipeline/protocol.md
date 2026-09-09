@@ -21,6 +21,28 @@ the disk cache.
 `.proto` files under `crates/dfhack-remote/proto/` are vendored from DFHack at
 tag `53.16-r1.1` and compiled by `crates/dfhack-remote/build.rs`.
 
+## The unit poll
+
+Status: landed (`crates/dwarf-eye/src/units.rs`, issue #15).
+
+Creatures move several times a second and the map does not, so the census gets
+a connection of its own — the third, after the worker's and walk mode's. A poll
+queued behind a slab of blocks is a poll wasted, and a fetch pass waiting on a
+poll is worse.
+
+`UnitFeed::spawn` opens the connection and loops at 250 ms: `GetMapInfo` for
+where the window sits, `GetViewInfo` for `follow_unit_id` (which is the
+adventurer), and `GetUnitList` for everyone. `units.rs:parse_units` turns the
+reply into absolute tiles, which is the only form worth sending: DF reports a
+unit in window-local tiles, the same as a map block, so the same creature is at
+two different positions either side of a re-centring. `main.rs:poll_units` and
+`main.rs:draw_units` place the census against the render origin and ease each
+unit from the last one to this one over a poll period.
+
+Three RPCs at 4 Hz, none of them large: `GetUnitList` for 176 units is tens of
+kilobytes. Nothing about the map pass changes, because nothing about it is
+shared.
+
 ## Invariants and gotchas
 
 - Both headers are raw C structs. The handshake is 12 bytes, `DFHack?\n` plus a
@@ -44,6 +66,21 @@ tag `53.16-r1.1` and compiled by `crates/dfhack-remote/build.rs`.
   decoded chunk with an empty one.
 - Console output from `run_command` lands in `Client::last_notices`, which is
   how the Lua clock probe is read back (`worker.rs`, `clock.rs:PROBE`).
+- **`MapBlock.buildings` is not the block's buildings.** Every reply carries
+  every building whose footprint falls inside the box that was *asked for*,
+  hung off one arbitrary block of the reply — 106 instances on one block, and
+  none on the other 199 — in the same window-local tiles the blocks are placed
+  by. `world.rs:read_buildings` reads the list off the whole reply and
+  `world.rs:stamp_buildings` writes it onto that reply's chunks, whose box is
+  the same box. A building repeats across blocks, so `BuildingInstance::index`
+  is what makes it one building, and `building_flags & 1` (`EXISTS`) separates
+  a building from a plan.
+- **`UnitDefinition::isValid` is declared and never filled.** Filtering on it
+  drops every unit on the map. Only an explicit `false` means anything.
+- **`GetCreatureRaws` does not decode.** DFHack writes creature descriptions
+  straight out of the raws and some of them are not UTF-8, which fails the
+  whole reply in prost. Race colours fall back to a stable hash per creature
+  index (`units.rs:hashed_color`).
 
 ## Claims to verify
 

@@ -43,6 +43,10 @@ pub struct SpriteRef {
 /// Seasonal suffixes that name a variant rather than a direction.
 const SEASONS: &[&str] = &["SPRING", "SUMMER", "AUTUMN", "WINTER"];
 
+/// The build stage a workshop tile is drawn at when the shop is finished.
+/// DF counts down from it as the shop is put up.
+const FINISHED: u32 = 3;
+
 fn is_direction_group(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|c| matches!(c, 'N' | 'S' | 'W' | 'E'))
 }
@@ -276,6 +280,27 @@ impl GraphicsIndex {
                         let (Ok(col), Ok(row)) = (col.parse(), row.parse()) else { continue };
                         self.generic
                             .insert(parse_part(part), SpriteRef { page: page_index, col, row });
+                    }
+                    // A workshop is one sprite per tile of its footprint, and
+                    // DF spells the tile out after the name: a build stage,
+                    // then the offset inside the shop. Only the finished stage
+                    // is kept, and each tile lands under its own family so the
+                    // mesher can ask for one square of a three-square shop.
+                    ["TILE_GRAPHICS", page_name, col, row, part, stage, sub_x, sub_y] => {
+                        let Some(&page_index) = self.page_by_name.get(*page_name) else {
+                            continue;
+                        };
+                        let (Ok(col), Ok(row)) = (col.parse(), row.parse()) else { continue };
+                        let (Ok(stage), Ok(sub_x), Ok(sub_y)) =
+                            (stage.parse::<u32>(), sub_x.parse::<u32>(), sub_y.parse::<u32>())
+                        else {
+                            continue;
+                        };
+                        if stage != FINISHED {
+                            continue;
+                        }
+                        let key = parse_part(&format!("{part}_{sub_x}_{sub_y}"));
+                        self.generic.insert(key, SpriteRef { page: page_index, col, row });
                     }
                     _ => {}
                 }

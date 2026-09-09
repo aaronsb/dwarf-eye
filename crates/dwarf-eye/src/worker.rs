@@ -65,6 +65,9 @@ pub struct Bridge {
     pub origin: Arc<OnceLock<(i32, i32, i32)>>,
     /// Walk mode's own connection, which must never wait behind a map pass.
     pub pilot: Pilot,
+    /// The unit census, on a third connection. Creatures move several times a
+    /// second and a poll queued behind a slab of blocks is a poll wasted.
+    pub units: crate::units::UnitFeed,
 }
 
 impl Bridge {
@@ -82,7 +85,7 @@ impl Bridge {
                 }
             })
             .expect("spawning the DFHack worker thread");
-        Self { tx, rx, origin, pilot: Pilot::spawn() }
+        Self { tx, rx, origin, pilot: Pilot::spawn(), units: crate::units::UnitFeed::spawn() }
     }
 }
 

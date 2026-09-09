@@ -40,6 +40,25 @@ pub struct WallSkin {
     pub tint: bool,
 }
 
+/// One packed building sprite: which building, and which of its faces.
+///
+/// A workshop keys on its subtype and the square of its footprint; everything
+/// else keys on the material sheet it was found on, and carries [`NOT_A_SHOP`]
+/// where a shop would carry its offset.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BuildingCell {
+    building: i32,
+    subtype: i32,
+    at: u8,
+}
+
+/// The `at` a building that is not a workshop carries.
+const NOT_A_SHOP: u8 = 0xff;
+
+/// How many workshop and furnace subtypes are asked for. DF has 25 and 8;
+/// asking past them costs a failed lookup and nothing else.
+const WORKSHOP_SUBTYPES: i32 = 32;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ModelKey {
     tile: i32,
@@ -303,6 +322,8 @@ pub struct TileLibrary {
     wall_side: HashMap<&'static str, (Rect, bool)>,
     /// Built floor -> the wall family whose side strip skirts its slab.
     floor_rim: HashMap<i32, &'static str>,
+    /// Building sprites, by which building wears them.
+    building_uv: HashMap<BuildingCell, (Rect, bool)>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
@@ -436,6 +457,7 @@ impl TileLibrary {
             wall_top: HashMap::new(),
             wall_side: HashMap::new(),
             floor_rim,
+            building_uv: HashMap::new(),
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
             built,
@@ -445,6 +467,7 @@ impl TileLibrary {
         library.pack_under();
         library.pack_ramps();
         library.pack_walls();
+        library.pack_buildings();
         Ok(library)
     }
 
@@ -701,6 +724,94 @@ impl TileLibrary {
                 }
             }
         }
+    }
+
+    /// Packs one sprite per building look DF's raws actually carry.
+    ///
+    /// Every building type is asked for once per material sheet, and every
+    /// workshop and furnace once per square of its footprint, so the set is
+    /// knowable before the first block arrives and the atlas can be finished
+    /// with the rest of it. A stem the raws do not carry costs one failed
+    /// lookup and no cell.
+    fn pack_buildings(&mut self) {
+        use factory::{BUILDING_SHEETS, BuildingKind, WORKSHOP_SPAN, building_families};
+        let mut wanted: Vec<(BuildingCell, Vec<String>)> = Vec::new();
+        for building in 0..=factory::building_type::OFFERING_PLACE {
+            let kind = factory::building_kind(building);
+            if !kind.drawn() {
+                continue;
+            }
+            if kind == BuildingKind::Workshop {
+                for subtype in 0..WORKSHOP_SUBTYPES {
+                    for y in 0..WORKSHOP_SPAN {
+                        for x in 0..WORKSHOP_SPAN {
+                            let cell = BuildingCell {
+                                building,
+                                subtype,
+                                at: ((x as u8) << 4) | y as u8,
+                            };
+                            let families = building_families(building, subtype, 0, (x, y));
+                            if !families.is_empty() {
+                                wanted.push((cell, families));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            for sheet in 0..BUILDING_SHEETS.len() {
+                let cell = BuildingCell { building, subtype: sheet as i32, at: NOT_A_SHOP };
+                let families = building_families(building, -1, sheet, (0, 0));
+                if !families.is_empty() {
+                    wanted.push((cell, families));
+                }
+            }
+        }
+
+        for (cell, families) in wanted {
+            let found = families.iter().find_map(|family| {
+                let key = raws::parse_part(family);
+                self.art.tree_sprite("", &key.family, key.dirs).cloned().map(|s| (family.clone(), s))
+            });
+            let Some((family, sprite)) = found else { continue };
+            let pattern = sprite.saturation() < PATTERN_SATURATION;
+            if let Some(rect) = self.atlas.insert(atlas_key(&family, 0, ""), &sprite, None) {
+                self.building_uv.insert(cell, (rect, pattern));
+            }
+        }
+    }
+
+    /// Where a building tile's lid samples the atlas, and whether that sheet is
+    /// a near-grey pattern for the material colour to carry.
+    ///
+    /// `sheet` is the material sheet the decoder picked from DF's name for the
+    /// material; a building whose own sheet is missing falls through the rest
+    /// in order, so a wax door is a wooden one rather than nothing.
+    pub fn building_cell(
+        &self,
+        building: i32,
+        subtype: i32,
+        sheet: u8,
+        at: (i32, i32),
+    ) -> Option<(Rect, bool)> {
+        if factory::building_kind(building) == factory::BuildingKind::Workshop {
+            let span = factory::WORKSHOP_SPAN;
+            let at = ((at.0.clamp(0, span - 1) as u8) << 4) | at.1.clamp(0, span - 1) as u8;
+            return self.building_uv.get(&BuildingCell { building, subtype, at }).copied();
+        }
+        let first = sheet as usize;
+        std::iter::once(first)
+            .chain((0..factory::BUILDING_SHEETS.len()).filter(move |&s| s != first))
+            .find_map(|sheet| {
+                self.building_uv
+                    .get(&BuildingCell { building, subtype: sheet as i32, at: NOT_A_SHOP })
+                    .copied()
+            })
+    }
+
+    /// How many atlas cells the building sheets took.
+    pub fn building_cells(&self) -> usize {
+        self.building_uv.len()
     }
 
     /// Whether a tiletype draws from one of DF's wall sheets.

@@ -12,6 +12,7 @@ mod shadow;
 mod sky;
 mod stars;
 mod texture;
+mod units;
 mod walk;
 mod worker;
 
@@ -73,6 +74,21 @@ fn forced_weather() -> Option<Weather> {
 
 /// One line naming the world and the game's date, printed once both are known,
 /// so an unattended shot can be labelled with what it caught.
+/// Where the camera looks relative to the player, in DF tiles and levels.
+///
+/// `DWARF_EYE_AIM=dx,dy,dz`. The camera starts looking at the character, which
+/// is the right default and no use at all for a screenshot of a hall sixty
+/// tiles away.
+fn aim_offset() -> (f32, f32, f32) {
+    let Ok(spec) = std::env::var("DWARF_EYE_AIM") else { return (0.0, 0.0, 0.0) };
+    let n: Vec<f32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    match n.as_slice() {
+        [x, y, z] => (*x, *y, *z),
+        [x, y] => (*x, *y, 0.0),
+        _ => (0.0, 0.0, 0.0),
+    }
+}
+
 fn log_scene(clock: Res<Clock>, status: Res<Status>, mut said: Local<bool>) {
     if *said || status.world.is_empty() || clock.year == 0 {
         return;
@@ -104,6 +120,7 @@ fn main() {
         .init_resource::<NeedsFetch>()
         .init_resource::<Clock>()
         .init_resource::<SunAim>()
+        .init_resource::<Crowd>()
         .init_resource::<walk::WalkMode>()
         .insert_resource(forced_weather().unwrap_or_default())
         .insert_non_send(Bridge::spawn())
@@ -132,6 +149,7 @@ fn main() {
             (
                 walk::toggle,
                 aim_blob_shadows,
+                (poll_units, draw_units).chain(),
                 (walk::receive, walk::walk).chain().run_if(walk::walking),
             ),
         )
@@ -427,6 +445,167 @@ struct HorizonSpawn<'w, 's> {
 
 fn occlusion_culling() -> bool {
     std::env::var("DWARF_EYE_OCCLUSION").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Everyone on the map, and the two censuses the drawn positions sit between.
+///
+/// The poll is four a second and DF steps faster than that, so a capsule
+/// placed at the last census would jump. Each unit is eased from where it was
+/// to where it is over one poll period, which is the whole of the animation.
+#[derive(Resource, Default)]
+struct Crowd {
+    previous: HashMap<i32, units::Unit>,
+    current: HashMap<i32, units::Unit>,
+    /// Seconds since the last census arrived.
+    since: f32,
+    entities: HashMap<i32, Entity>,
+    /// One material per colour, and a brighter one for the adventurer.
+    paint: HashMap<([u8; 3], bool), Handle<StandardMaterial>>,
+    /// The capsule every unit is a scaled copy of.
+    capsule: Option<Handle<Mesh>>,
+}
+
+/// Radius and half-length of the shared capsule, so a scale of one is a
+/// creature one tile wide and two tall.
+const CAPSULE_RADIUS: f32 = 0.5;
+const CAPSULE_LENGTH: f32 = 1.0;
+
+#[derive(Component)]
+struct UnitTag(#[allow(dead_code)] i32);
+
+/// Drains the census and starts a new easing window.
+fn poll_units(bridge: NonSend<Bridge>, mut crowd: ResMut<Crowd>, time: Res<Time>) {
+    let mut arrived = false;
+    while let Ok(census) = bridge.units.rx.try_recv() {
+        let next: HashMap<i32, units::Unit> = census.units.into_iter().map(|u| (u.id, u)).collect();
+        crowd.previous = std::mem::replace(&mut crowd.current, next);
+        arrived = true;
+    }
+    if arrived {
+        crowd.since = 0.0;
+    } else {
+        crowd.since += time.delta_secs();
+    }
+}
+
+/// Spawns, moves and retires the capsules.
+///
+/// The factory says a unit is drawn as a capsule and DF says how big it is;
+/// nothing here decides either. A creature above the cut plane is hidden the
+/// same way the tiles above it are.
+fn draw_units(
+    mut commands: Commands,
+    mut crowd: ResMut<Crowd>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut transforms: Query<(&mut Transform, &mut Visibility), With<UnitTag>>,
+    settings: Res<ViewSettings>,
+    bridge: NonSend<Bridge>,
+) {
+    let Some(&origin) = bridge.origin.get() else { return };
+    if crowd.current.is_empty() && crowd.entities.is_empty() {
+        return;
+    }
+    let capsule = match crowd.capsule.clone() {
+        Some(handle) => handle,
+        None => {
+            let handle = meshes.add(Capsule3d::new(CAPSULE_RADIUS, CAPSULE_LENGTH));
+            crowd.capsule = Some(handle.clone());
+            handle
+        }
+    };
+
+    // Where between the two censuses we are. A unit that has just appeared has
+    // no previous position and simply stands where it is.
+    let t = (crowd.since / units::POLL.as_secs_f32()).clamp(0.0, 1.0);
+
+    let live: Vec<units::Unit> = crowd.current.values().copied().collect();
+    for unit in live {
+        let was = crowd.previous.get(&unit.id).copied().unwrap_or(unit);
+        // A jump of more than a few tiles is a teleport or a re-centring, not
+        // a step; easing through it would be a long slide through the ground.
+        let far = (was.at.0 - unit.at.0).abs().max((was.at.1 - unit.at.1).abs()) > 4.0
+            || (was.at.2 - unit.at.2).abs() > 1.0;
+        let at = if far {
+            unit.at
+        } else {
+            (
+                was.at.0 + (unit.at.0 - was.at.0) * t,
+                was.at.1 + (unit.at.1 - was.at.1) * t,
+                was.at.2 + (unit.at.2 - was.at.2) * t,
+            )
+        };
+        // DF is x-east / y-south / z-up; Bevy is y-up, so y and z swap.
+        let transform = Transform {
+            translation: Vec3::new(
+                at.0 - origin.0 as f32,
+                (at.2 - origin.2 as f32) * Z_SCALE + unit.height * 0.5 * Z_SCALE,
+                at.1 - origin.1 as f32,
+            ),
+            scale: Vec3::new(
+                unit.radius * 2.0,
+                unit.height / (CAPSULE_LENGTH + CAPSULE_RADIUS * 2.0),
+                unit.radius * 2.0,
+            ),
+            ..default()
+        };
+        let seen = if (at.2 - origin.2 as f32) as i32 <= settings.z_ceiling {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+
+        if let Some(&entity) = crowd.entities.get(&unit.id) {
+            if let Ok((mut existing, mut visible)) = transforms.get_mut(entity) {
+                *existing = transform;
+                *visible = seen;
+                continue;
+            }
+        }
+        let key = (unit.color, unit.adventurer);
+        let paint = match crowd.paint.get(&key) {
+            Some(handle) => handle.clone(),
+            None => {
+                let base = Color::srgb_u8(unit.color[0], unit.color[1], unit.color[2]);
+                let handle = materials.add(StandardMaterial {
+                    base_color: base,
+                    perceptual_roughness: 0.85,
+                    // The player's own character, lit from inside so it is
+                    // findable in a crowd of livestock.
+                    emissive: if unit.adventurer {
+                        LinearRgba::rgb(0.5, 0.45, 0.15)
+                    } else {
+                        LinearRgba::BLACK
+                    },
+                    ..default()
+                });
+                crowd.paint.insert(key, handle.clone());
+                handle
+            }
+        };
+        let entity = commands
+            .spawn((
+                Mesh3d(capsule.clone()),
+                MeshMaterial3d(paint),
+                transform,
+                seen,
+                UnitTag(unit.id),
+            ))
+            .id();
+        crowd.entities.insert(unit.id, entity);
+    }
+
+    let gone: Vec<i32> = crowd
+        .entities
+        .keys()
+        .filter(|id| !crowd.current.contains_key(id))
+        .copied()
+        .collect();
+    for id in gone {
+        if let Some(entity) = crowd.entities.remove(&id) {
+            commands.entity(entity).despawn();
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -856,10 +1035,14 @@ fn drain_worker(
                 // Drop the camera just above and south of the player's position.
                 if let Ok((mut transform, mut fly)) = camera.single_mut() {
                     capture::apply_view(&mut fly);
+                    // DWARF_EYE_AIM=dx,dy,dz moves what the camera looks at, in
+                    // DF tiles and levels off the player's position, for
+                    // framing something the character is not standing in.
+                    let aim = aim_offset();
                     let target = Vec3::new(
-                        center.0 as f32,
-                        center.2 as f32 * Z_SCALE,
-                        center.1 as f32,
+                        center.0 as f32 + aim.0,
+                        (center.2 as f32 + aim.2) * Z_SCALE,
+                        center.1 as f32 + aim.1,
                     );
                     // DWARF_EYE_CAM scales how far back the camera starts, for
                     // getting down among the tiles.

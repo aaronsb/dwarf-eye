@@ -1255,7 +1255,7 @@ mod tests {
     use super::*;
 
     fn test_chunk(block_x: i32, block_y: i32, z: i32) -> Chunk {
-        Chunk { block_x, block_y, z, voxels: Vec::new() }
+        Chunk { block_x, block_y, z, ..Default::default() }
     }
 
     /// Open air everywhere: nothing for a strand to hang into.

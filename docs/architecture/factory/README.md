@@ -2,8 +2,9 @@
 
 Status: the registry is landed for vegetation
 (`crates/dwarf-eye-world/src/factory.rs`); trees, shrubs, saplings, dead plants
-and tufts route through it (issue #1). Items, units and buildings are still
-unclassified (issues #15, #5).
+and tufts route through it (issue #1). Units, buildings and item piles are
+classified and drawn as placeholders (issue #15); the prefabs that replace
+those placeholders are still to come (issue #5).
 
 ## What it does
 
@@ -19,10 +20,14 @@ flowchart LR
   C --> R[resolve -> Treatment]
   R --> D[default: sprite-derived model]
   R --> P[plant: dwarf-eye-trees grammar]
+  R --> B[massing box with DF's sprite on its lid]
+  R --> U[capsule at DF's body size]
   R --> V[prefab: vox-uristi .vox]
   D --> M[chunk mesh]
   P --> M
+  B --> M
   V --> M
+  U --> S[one entity per unit, eased between polls]
 ```
 
 ## The overlay idea
@@ -50,11 +55,57 @@ and a seed; the grammar in `dwarf-eye-trees` supplies the shape
 
 ```
 classify(Tile, Near) -> Class      // Tree, Shrub, Sapling, DeadTree, TallGrass, Boulder, Built, Other
+classify_building(type) -> Class   // Building(type), from DF's own building_type
+classify_unit() -> Class           // Unit
+classify_items(count) -> Class     // ItemPile once enough of them share a tile
 extent(Tile) -> Extent             // Tile or Tree: how much room DF gives it
-resolve(Class, Style) -> Treatment // Sprite, Grown(VegetationKind, TreeParams), Billboard
+resolve(Class, Style) -> Treatment // Sprite, Grown(...), Billboard, Massing(height), Capsule
 plan(Tile, Near) -> Plan           // the pair, decided once per tiletype
 seed(x, y, z, species) -> u64      // absolute tile and species, nothing else
 ```
+
+## What comes out of the tile stream, and what does not
+
+Tiles are classified once per tiletype and cached; the other three are not
+tiles at all and each has its own entry point.
+
+| Class | Where it comes from | Treatment |
+|---|---|---|
+| `Building(type)` | `MapBlock.buildings`, stamped onto the tiles of its footprint (`world.rs:stamp_buildings`) | `Massing(h)` |
+| `Unit` | `GetUnitList` on its own connection, four times a second (`units.rs`) | `Capsule` |
+| `ItemPile` | `MapBlock.items`, once `PILE_ITEMS` of them share a tile | `Massing(0.22)` |
+
+`Massing(h)` is a box of the entity's footprint, `h` of a z-level tall, in the
+material's colour, wearing DF's own top-down sprite on its lid where the raws
+name one. `mesh.rs:build_furnishings` draws it as a second pass over the chunk,
+*on top of* whatever the tile itself drew: a building is a thing standing in a
+tile, not a tile, and the floor under a door is still a floor. It is the
+placeholder the `.vox` prefabs replace ([prefabs.md](prefabs.md)); the extent
+is DF's, so a prefab dropping in changes the look and nothing else.
+
+`BuildingKind` groups DF's fifty-five building types into the ten looks they
+want, and decides the height: a door fills its tile, a hatch is a lid, a
+workshop is a slab reading its own sprite. `BuildingKind::Zone` is a
+designation rather than a thing — a stockpile, an activity zone, a road — and
+draws nothing at all; it never even reaches a tile, because an activity zone
+can cover a meadow and marking that as built work would stop a tree growing in
+it.
+
+`library.rs:pack_buildings` packs the lids into the same atlas the ground and
+walls use, before the first frame: one cell per building type per material
+sheet (`ITEM_DOOR_WOOD`, `ITEM_DOOR_STONE`), and one per square of a workshop's
+footprint (`WORKSHOP_CARPENTER_0_1`). 294 cells of the 1024, on top of the 305
+the ground, ramps and walls already took. `library.rs:building_cell` is the
+lookup, falling through the sheets in `factory::sheet_order` so a wax door is a
+wooden one rather than nothing.
+
+A unit's capsule takes DF's own body size, scaled against an adult human, and
+its colour from the creature raws where those decode and a stable hash per
+creature index where they do not (see
+[pipeline/protocol.md](../pipeline/protocol.md)). The adventurer — DF's
+`follow_unit_id` — is lit from inside so it is findable in a crowd of
+livestock. Positions are eased between polls, and a jump of more than a few
+tiles is taken outright rather than slid through the ground.
 
 `Tile` is what DF says about a tiletype: shape, material, special, DFHack's
 name, and the species standing there. `Near` carries only what the tile cannot
@@ -71,6 +122,9 @@ once, which puts standing plants back on crossed sprites for comparison.
 Sprite geometry is unchanged underneath: `library.rs:mode_for` still maps a
 `TiletypeShape` to one of five `RenderMode` values for everything the factory
 leaves alone.
+
+Buildings, units and item piles never enter `mode_for`: they are not tiles, and
+their geometry is the massing box and the capsule above.
 
 | `RenderMode` | Tiles | Geometry |
 |---|---|---|
@@ -95,6 +149,8 @@ resolved `FlatTile` to an atlas cell since the ground atlas landed.
   tile is, not only how to draw it.
 - `Class::Built` is what someone raised: nothing vegetal is grown into it, and
   a crown's envelope is clipped by it (`tree.rs:Envelope::blocked`).
+  `Class::Building(_)` counts the same way — `factory::built` covers both — so
+  a tree beside a hall no longer grows through its roof.
 
 ## The treatment is a chain
 
