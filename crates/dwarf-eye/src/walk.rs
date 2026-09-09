@@ -475,9 +475,11 @@ impl Heading {
         *self = Self::default();
     }
 
-    /// The yaw the run points at, weighted toward the newest moves, or `None`
-    /// while nothing is live.
-    fn aim(&self) -> Option<f32> {
+    /// The way the run points on the ground plan — render x east, render z
+    /// south — weighted toward the newest moves, or `None` while nothing is
+    /// live. This is the smoothing: the newest move counts 1 and each older one
+    /// `RUN_DECAY` as much, so a corner is followed rather than averaged away.
+    fn vector(&self) -> Option<Vec2> {
         if !self.live {
             return None;
         }
@@ -488,12 +490,13 @@ impl Heading {
             weight *= RUN_DECAY;
         }
         let sum = sum.normalize_or_zero();
-        if sum == Vec2::ZERO {
-            return None;
-        }
-        // Render x runs east and render z runs south, while yaw has north at
-        // zero and swings west as it grows.
-        Some((-sum.x).atan2(-sum.y))
+        (sum != Vec2::ZERO).then_some(sum)
+    }
+
+    /// The yaw the run points at, or `None` while nothing is live.
+    fn aim(&self) -> Option<f32> {
+        // Yaw has north at zero and swings west as it grows.
+        self.vector().map(|sum| (-sum.x).atan2(-sum.y))
     }
 }
 
@@ -560,6 +563,11 @@ pub struct WalkMode {
     fix: Option<(IVec3, Ground)>,
     /// The direction of travel while the game is doing the driving.
     heading: Heading,
+    /// The direction of travel whoever is driving: the same run of tile
+    /// crossings, but kept when the player takes the wheel, because the world
+    /// ahead has to be fetched either way. Only the camera cares which of us
+    /// asked for the step.
+    travel: Heading,
     /// Scripted legs still to walk, from the environment. Current first.
     drive: Vec<Leg>,
     /// Set once the environment has been read.
@@ -704,10 +712,21 @@ impl WalkMode {
     }
 
     /// The character moved, wherever the move came from, so nothing is stuck.
+    /// The crossing feeds the travel vector: the preload wants the direction of
+    /// the last few tiles whether the game or the player drove them.
     fn moved(&mut self, tile: IVec3) {
+        if let Some(from) = self.confirmed {
+            self.travel.drove(IVec2::new(tile.x - from.x, tile.y - from.y));
+        }
         self.confirmed = Some(tile);
         self.strikes = 0;
         self.stalled = 0.0;
+    }
+
+    /// Which way the character is travelling on the ground plan, as a unit
+    /// vector east and south, or `None` outside a run.
+    pub fn travel(&self) -> Option<Vec2> {
+        self.active.then(|| self.travel.vector()).flatten()
     }
 
     /// Calls a scripted walk off and says why, once, in a line the live test
@@ -839,6 +858,7 @@ pub fn walk(
     // Ageing the run before the new report is read is what makes a gap end it:
     // a report that arrives in time resets the clock straight afterwards.
     walk.heading.tick(dt);
+    walk.travel.tick(dt);
     reconcile(&mut walk);
 
     let (Some(confirmed), Some(origin)) = (walk.confirmed, walk.origin) else {

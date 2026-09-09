@@ -24,8 +24,15 @@ pub type ChunkKey = (i32, i32, i32);
 pub enum Command {
     /// Pull blocks around a tile position and remesh what they touch.
     /// Collect what the live window holds. `center` is where the camera is, in
-    /// render tiles and level, for retiring far chunks.
-    Fetch { center: (i32, i32, i32), opts: MeshOptions, force: bool },
+    /// render tiles and level, for retiring far chunks. `heading` is which way
+    /// it is travelling on the ground plan, as a unit vector east and south,
+    /// which decides what is fetched, meshed and kept first.
+    Fetch {
+        center: (i32, i32, i32),
+        opts: MeshOptions,
+        force: bool,
+        heading: Option<(f32, f32)>,
+    },
     /// Remesh what is already loaded, without going back to DFHack.
     Remesh { opts: MeshOptions },
     /// Run a DFHack console command, for driving the world while testing.
@@ -138,7 +145,7 @@ fn run(
     // The window we last asked for. DFHack answers with only the blocks it
     // thinks changed, so any chunk we prune has to be re-requested outright or
     // it never comes back.
-    let mut last_window: Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))> = None;
+    let mut last_window: Option<Window> = None;
 
     // Trees are grown once each and kept, so a chunk never regrows one.
     let mut forest = Forest::default();
@@ -222,6 +229,8 @@ fn run(
     let mut first_pass = true;
 
     let mut horizon_sent = false;
+    // The last preload order said out loud, so a steady walk does not repeat it.
+    let mut spoke = String::new();
     loop {
         let command = match commands.try_recv() {
             Ok(c) => c,
@@ -244,13 +253,13 @@ fn run(
                     Err(e) => events.send(Event::Status(format!("`{command}` failed: {e}")))?,
                 }
             }
-            Command::Fetch { center, opts, force } => {
+            Command::Fetch { center, opts, force, heading } => {
                 let pass_started = std::time::Instant::now();
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
                 let cost = match collect(
-                    &mut df, center, opts, force, &mut last_window, &mut horizon_sent,
-                    library.as_mut(), &mut forest, events,
+                    &mut df, center, opts, force, heading, &mut last_window, &mut horizon_sent,
+                    &mut spoke, library.as_mut(), &mut forest, events,
                 ) {
                     Ok(cost) => cost,
                     Err(err) => {
@@ -331,6 +340,14 @@ fn build_horizon(
 const COLLECT_ABOVE: i32 = 200;
 const COLLECT_BELOW: i32 = 32;
 
+/// The box one pass covered, in render space, and the window frame it was read
+/// in. Two passes in the same frame with the same box cover the same land.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Window {
+    bounds: BlockBounds,
+    shift: (i32, i32, i32),
+}
+
 /// One collection pass: pull what the live window holds, cache it, mesh what
 /// changed, and keep the horizon in step.
 #[allow(clippy::too_many_arguments)]
@@ -339,26 +356,57 @@ fn collect(
     center: (i32, i32, i32),
     opts: MeshOptions,
     force: bool,
-    last_window: &mut Option<(i32, i32, i32, i32, i32, i32, (i32, i32, i32))>,
+    heading: Option<(f32, f32)>,
+    last_window: &mut Option<Window>,
     horizon_sent: &mut bool,
+    spoke: &mut String,
     mut library: Option<&mut TileLibrary>,
     forest: &mut Forest,
     events: &Sender<Event>,
 ) -> Result<std::collections::HashMap<ChunkKey, usize>> {
     // The game's window follows the character; a move changes what every
-    // local coordinate means, so the next request must be a full one.
-    let window_moved = df.refresh_window()?;
+    // local coordinate means, and it uncovers a strip of land at the leading
+    // edge that this viewer has never seen.
+    df.refresh_window()?;
     let view = df.view_center()?;
     df.watch_from(view);
+    df.travel_toward(heading);
     let bounds = df.window_bounds(view.2 - COLLECT_BELOW, view.2 + COLLECT_ABOVE);
-    let window = (
-        bounds.min_x, bounds.max_x, bounds.min_y,
-        bounds.max_y, bounds.min_z, bounds.max_z, df.shift(),
-    );
-    let moved = *last_window != Some(window);
-    *last_window = Some(window);
+    let window = Window { bounds, shift: df.shift() };
+    let was = last_window.replace(window);
+    let window_moved = was.is_some_and(|w| w.shift != window.shift);
 
-    let arrived = df.fetch(bounds, force || moved)?;
+    // What this box covers and the last one did not. DFHack answers an unforced
+    // request with the blocks whose hash has moved since it last sent them, and
+    // the hash it holds for a block at the window's new edge is the hash of the
+    // land that used to be there, so the strip can read as unchanged and never
+    // arrive. It is asked for forced, and the blocks ahead of the character
+    // first.
+    let here = (center.0.div_euclid(BLOCK), center.1.div_euclid(BLOCK));
+    let mut leading = match was {
+        Some(w) if !force => newly_covered(w.bounds, bounds),
+        _ => Vec::new(),
+    };
+    ahead_first(&mut leading, here, heading);
+    let strips = leading.len();
+
+    let arrived = df.fetch_leading(bounds, force, &leading)?;
+
+    // The order the pass chose, said once per change rather than three times a
+    // second: which way the character is going, how the window was cut for it,
+    // and what the shift made this pass force.
+    let said = format!("{} bands{}", df.last_pass.bands, describe(heading));
+    if said != *spoke || strips > 0 {
+        *spoke = said.clone();
+        bevy::log::info!(
+            "preload: {said}; window {}, {strips} forced leading {} of {} blocks, \
+             then the unforced sweep of {}",
+            if window_moved { "shifted" } else { "held" },
+            if strips == 1 { "box" } else { "boxes" },
+            df.last_pass.leading,
+            df.last_pass.asked - df.last_pass.leading,
+        );
+    }
 
     // Land the forced pass proved is no longer there. The chunks are already
     // out of the world and the cache; the meshes and any tree grown off those
@@ -390,16 +438,7 @@ fn collect(
     // camera's height is not a reason to lose the crowns above it, and a
     // dropped chunk does not come back, since DFHack's unforced pass sends
     // only blocks that changed on its side.
-    let (bx, by) = (center.0.div_euclid(BLOCK), center.1.div_euclid(BLOCK));
-    let keep = BlockBounds {
-        min_x: bx - RETAIN_RADIUS,
-        max_x: bx + RETAIN_RADIUS + 1,
-        min_y: by - RETAIN_RADIUS,
-        max_y: by + RETAIN_RADIUS + 1,
-        min_z: i32::MIN / 2,
-        max_z: i32::MAX / 2,
-    };
-    let dropped = df.world.retain_within(keep);
+    let dropped = df.world.retain_within(retention_box(here, heading));
     if !dropped.is_empty() {
         events.send(Event::Chunks(
             dropped
@@ -441,7 +480,9 @@ fn collect(
         // not see, so those trees are grown again rather than reused.
         forest.retire_near(&arrived);
         let touched: Vec<_> = arrived.iter().chain(stale.iter()).copied().collect();
-        cost = remesh_touched(df, library.as_deref_mut(), forest, opts, events, &touched)?;
+        cost = remesh_touched(
+            df, library.as_deref_mut(), forest, opts, events, &touched, here, heading,
+        )?;
     }
 
     // The outer terrain needs the map's own surface to meet it, so it waits
@@ -552,7 +593,124 @@ fn grounded_blocks(world: &dwarf_eye_world::World) -> Vec<(i32, i32)> {
 /// walk leaves the land behind it standing.
 const RETAIN_RADIUS: i32 = 40;
 
-/// Remeshes the chunks that arrived and every loaded neighbour of theirs.
+/// How far along the heading the retention box is pushed. The box is the
+/// budget, and this is what spends it forwards: the land behind falls out of it
+/// this many blocks early so the land ahead can stay in it that much longer.
+const RETAIN_BIAS: i32 = 8;
+
+/// What is kept in the world: `RETAIN_RADIUS` blocks around the camera,
+/// horizontally only, pushed `RETAIN_BIAS` blocks along the heading.
+///
+/// The box never grows, so the count of chunks held is what it always was. What
+/// changes is which of them go when it is full: a chunk behind the character
+/// drops before one the same distance ahead, and a dropped chunk costs a forced
+/// request to come back — which is the trade, paid where they are least likely
+/// to turn round and look.
+fn retention_box(here: (i32, i32), heading: Option<(f32, f32)>) -> BlockBounds {
+    let (dx, dy) = match heading {
+        Some((hx, hy)) => (
+            (hx * RETAIN_BIAS as f32).round() as i32,
+            (hy * RETAIN_BIAS as f32).round() as i32,
+        ),
+        None => (0, 0),
+    };
+    BlockBounds {
+        min_x: here.0 + dx - RETAIN_RADIUS,
+        max_x: here.0 + dx + RETAIN_RADIUS + 1,
+        min_y: here.1 + dy - RETAIN_RADIUS,
+        max_y: here.1 + dy + RETAIN_RADIUS + 1,
+        min_z: i32::MIN / 2,
+        max_z: i32::MAX / 2,
+    }
+}
+
+/// How far along the heading something sits, in blocks, from the camera's own
+/// block. Behind is negative; with no heading everything is level and only the
+/// distance from the camera tells them apart.
+fn ahead_of(here: (i32, i32), at: (i32, i32), heading: Option<(f32, f32)>) -> f32 {
+    let (dx, dy) = ((at.0 - here.0) as f32, (at.1 - here.1) as f32);
+    match heading {
+        Some((hx, hy)) => dx * hx + dy * hy,
+        None => 0.0,
+    }
+}
+
+/// Puts boxes in the order a travelling character wants them: the one furthest
+/// along the heading first, so the leading edge is asked for before the strip
+/// beside or behind it. Ties, and no heading at all, go to the nearest.
+fn ahead_first(boxes: &mut [BlockBounds], here: (i32, i32), heading: Option<(f32, f32)>) {
+    let rank = |b: &BlockBounds| {
+        let mid = ((b.min_x + b.max_x - 1) / 2, (b.min_y + b.max_y - 1) / 2);
+        let near = ((mid.0 - here.0).pow(2) + (mid.1 - here.1).pow(2)) as f32;
+        (-ahead_of(here, mid, heading), near)
+    };
+    boxes.sort_by(|a, b| {
+        rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// The parts of `now` that `was` did not cover: the strip a window shift
+/// uncovers at its leading edge, or the levels a change of depth adds.
+///
+/// Up to six slabs, cut so they never overlap: the two x sides over the whole
+/// of the new box, then the y sides over what the two boxes share in x, then
+/// the z ends over what they share in both.
+fn newly_covered(was: BlockBounds, now: BlockBounds) -> Vec<BlockBounds> {
+    let mut out = Vec::new();
+    if now.min_x >= now.max_x || now.min_y >= now.max_y || now.min_z >= now.max_z {
+        return out;
+    }
+    if now.min_x < was.min_x {
+        out.push(BlockBounds { max_x: was.min_x.min(now.max_x), ..now });
+    }
+    if now.max_x > was.max_x {
+        out.push(BlockBounds { min_x: was.max_x.max(now.min_x), ..now });
+    }
+    let (x_lo, x_hi) = (now.min_x.max(was.min_x), now.max_x.min(was.max_x));
+    if x_lo >= x_hi {
+        return out;
+    }
+    let shared = BlockBounds { min_x: x_lo, max_x: x_hi, ..now };
+    if now.min_y < was.min_y {
+        out.push(BlockBounds { max_y: was.min_y.min(now.max_y), ..shared });
+    }
+    if now.max_y > was.max_y {
+        out.push(BlockBounds { min_y: was.max_y.max(now.min_y), ..shared });
+    }
+    let (y_lo, y_hi) = (now.min_y.max(was.min_y), now.max_y.min(was.max_y));
+    if y_lo >= y_hi {
+        return out;
+    }
+    let shared = BlockBounds { min_y: y_lo, max_y: y_hi, ..shared };
+    if now.min_z < was.min_z {
+        out.push(BlockBounds { max_z: was.min_z.min(now.max_z), ..shared });
+    }
+    if now.max_z > was.max_z {
+        out.push(BlockBounds { min_z: was.max_z.max(now.min_z), ..shared });
+    }
+    out
+}
+
+/// A heading in words, for the log.
+fn describe(heading: Option<(f32, f32)>) -> String {
+    match heading {
+        None => ", nothing travelling".to_string(),
+        Some((x, y)) => {
+            let compass = match (x.abs() >= y.abs(), x >= 0.0, y >= 0.0) {
+                (true, true, _) => "east",
+                (true, false, _) => "west",
+                (false, _, true) => "south",
+                (false, _, false) => "north",
+            };
+            format!(", travelling {compass} ({x:+.2}, {y:+.2})")
+        }
+    }
+}
+
+/// Remeshes the chunks that arrived and every loaded neighbour of theirs,
+/// leading edge first: the chunk furthest along the heading is the one the
+/// character is walking into, and the meshes leave in the order they are built.
+#[allow(clippy::too_many_arguments)]
 fn remesh_touched(
     df: &Session,
     mut library: Option<&mut TileLibrary>,
@@ -560,6 +718,8 @@ fn remesh_touched(
     opts: MeshOptions,
     events: &Sender<Event>,
     arrived: &[(i32, i32, i32)],
+    here: (i32, i32),
+    heading: Option<(f32, f32)>,
 ) -> Result<std::collections::HashMap<ChunkKey, usize>> {
     const BATCH: usize = 48;
     let mut cost = std::collections::HashMap::new();
@@ -569,6 +729,7 @@ fn remesh_touched(
             keys.insert((x + dx, y + dy, z + dz));
         }
     }
+    let keys = leading_first(keys, here, heading);
     let mut batch = Vec::with_capacity(BATCH);
     for key in keys {
         let Some(chunk) = df.world.chunk(key.0, key.1, key.2) else { continue };
@@ -593,6 +754,25 @@ fn remesh_touched(
         events.send(Event::Chunks(batch))?;
     }
     Ok(cost)
+}
+
+/// The chunks to remesh, furthest along the heading first, nearest the camera
+/// after that. With nothing travelling it is simply nearest first, which is the
+/// order the renderer uploads in anyway.
+fn leading_first(
+    keys: std::collections::HashSet<ChunkKey>,
+    here: (i32, i32),
+    heading: Option<(f32, f32)>,
+) -> Vec<ChunkKey> {
+    let mut keys: Vec<ChunkKey> = keys.into_iter().collect();
+    let rank = |k: &ChunkKey| {
+        let near = ((k.0 - here.0).pow(2) + (k.1 - here.1).pow(2)) as f32;
+        (-ahead_of(here, (k.0, k.1), heading), near, k.2)
+    };
+    keys.sort_by(|a, b| {
+        rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    keys
 }
 
 /// Meshes every loaded chunk, returning what each cost in triangles.
@@ -630,4 +810,104 @@ fn remesh_all(
         events.send(Event::Chunks(batch))?;
     }
     Ok(cost)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A window box: nine blocks square, eight levels deep.
+    fn window(x: i32, y: i32, z: i32) -> BlockBounds {
+        BlockBounds { min_x: x, max_x: x + 9, min_y: y, max_y: y + 9, min_z: z, max_z: z + 8 }
+    }
+
+    #[test]
+    fn a_window_that_has_not_moved_uncovers_nothing() {
+        assert!(newly_covered(window(0, 0, 100), window(0, 0, 100)).is_empty());
+    }
+
+    #[test]
+    fn a_shift_uncovers_the_strip_at_its_leading_edge() {
+        // The window followed the character three blocks east.
+        let strip = newly_covered(window(0, 0, 100), window(3, 0, 100));
+        assert_eq!(strip.len(), 1);
+        let it = strip[0];
+        assert_eq!((it.min_x, it.max_x), (9, 12), "the three columns the old box never held");
+        assert_eq!((it.min_y, it.max_y, it.min_z, it.max_z), (0, 9, 100, 108));
+    }
+
+    #[test]
+    fn a_diagonal_shift_uncovers_two_strips_that_do_not_overlap() {
+        let strips = newly_covered(window(0, 0, 100), window(3, 2, 100));
+        assert_eq!(strips.len(), 2);
+        let blocks: usize = strips
+            .iter()
+            .map(|b| ((b.max_x - b.min_x) * (b.max_y - b.min_y)) as usize)
+            .sum();
+        let mut seen = std::collections::HashSet::new();
+        for b in &strips {
+            for bx in b.min_x..b.max_x {
+                for by in b.min_y..b.max_y {
+                    seen.insert((bx, by));
+                }
+            }
+        }
+        assert_eq!(seen.len(), blocks, "the strips overlap");
+        // Nine columns wide: three columns the old box never held, and two rows
+        // over the six columns it did.
+        assert_eq!(blocks, 9 * 3 + 6 * 2);
+    }
+
+    #[test]
+    fn dropping_a_level_uncovers_the_levels_under_the_old_box() {
+        let deeper = newly_covered(window(0, 0, 100), window(0, 0, 98));
+        assert_eq!(deeper.len(), 1);
+        assert_eq!((deeper[0].min_z, deeper[0].max_z), (98, 100));
+    }
+
+    #[test]
+    fn the_strip_ahead_is_forced_before_the_one_behind() {
+        let mut strips = newly_covered(window(0, 0, 100), window(3, 2, 100));
+        // Travelling east: the eastern columns before the southern rows.
+        ahead_first(&mut strips, (7, 6), Some((1.0, 0.0)));
+        assert_eq!((strips[0].min_x, strips[0].max_x), (9, 12));
+        // Travelling south turns the order round.
+        ahead_first(&mut strips, (7, 6), Some((0.0, 1.0)));
+        assert_eq!((strips[0].min_y, strips[0].max_y), (9, 11));
+    }
+
+    #[test]
+    fn retention_drops_the_land_behind_before_the_land_ahead() {
+        let here = (0, 0);
+        let level = retention_box(here, None);
+        assert!(level.contains_block(RETAIN_RADIUS, 0, 0));
+        assert!(level.contains_block(-RETAIN_RADIUS, 0, 0));
+
+        // Walking east, at the same distance from the camera: the block ahead
+        // stays and the one behind goes.
+        let east = retention_box(here, Some((1.0, 0.0)));
+        assert!(east.contains_block(RETAIN_RADIUS + RETAIN_BIAS, 0, 0), "the land ahead is kept");
+        assert!(!east.contains_block(-RETAIN_RADIUS, 0, 0), "the land behind is dropped");
+        assert!(east.contains_block(-RETAIN_RADIUS + RETAIN_BIAS, 0, 0));
+        // The box never grows: the same count of columns, moved.
+        let columns = |b: BlockBounds| (b.max_x - b.min_x) * (b.max_y - b.min_y);
+        assert_eq!(columns(east), columns(level));
+        // And it never clips vertically.
+        assert!(east.contains_block(0, 0, -10_000));
+        assert!(east.contains_block(0, 0, 10_000));
+    }
+
+    #[test]
+    fn the_leading_edge_is_meshed_first() {
+        let keys: std::collections::HashSet<ChunkKey> =
+            [(2, 0, 5), (-2, 0, 5), (0, 0, 5), (0, 3, 5)].into_iter().collect();
+        let order = leading_first(keys.clone(), (0, 0), Some((1.0, 0.0)));
+        assert_eq!(order[0], (2, 0, 5), "the chunk furthest east goes first");
+        assert_eq!(order[3], (-2, 0, 5), "the one behind goes last");
+        // Nothing travelling: nearest the camera first, and the same order
+        // every time for the same set.
+        let still = leading_first(keys.clone(), (0, 0), None);
+        assert_eq!(still[0], (0, 0, 5));
+        assert_eq!(still, leading_first(keys, (0, 0), None));
+    }
 }

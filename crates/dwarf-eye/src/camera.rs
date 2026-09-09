@@ -3,17 +3,38 @@
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 
+/// How long the travel vector takes to swing onto a new direction. Long enough
+/// that a tap of a key, or a sidestep around a tree, does not turn the preload
+/// round; short enough that a real change of course is followed inside a pass.
+const TRAVEL_EASE: f32 = 0.6;
+
+/// How much of a full-speed run the eased vector must hold before it counts as
+/// travel. Below this the camera is drifting or stopping, and there is no
+/// direction worth fetching ahead on.
+const TRAVELLING: f32 = 0.35;
+
 #[derive(Component)]
 pub struct FlyCamera {
     pub speed: f32,
     pub sensitivity: f32,
     pub yaw: f32,
     pub pitch: f32,
+    /// Where the camera is going on the ground plan — render x east, render z
+    /// south — eased over `TRAVEL_EASE`. Zero while it stands still.
+    pub travel: Vec2,
 }
 
 impl Default for FlyCamera {
     fn default() -> Self {
-        Self { speed: 24.0, sensitivity: 0.0025, yaw: 0.0, pitch: -0.6 }
+        Self { speed: 24.0, sensitivity: 0.0025, yaw: 0.0, pitch: -0.6, travel: Vec2::ZERO }
+    }
+}
+
+impl FlyCamera {
+    /// The direction of travel as a unit vector, or `None` while the camera is
+    /// not really going anywhere.
+    pub fn travelling(&self) -> Option<Vec2> {
+        (self.travel.length() >= TRAVELLING).then(|| self.travel.normalize())
     }
 }
 
@@ -59,8 +80,15 @@ pub fn fly(
         direction -= Vec3::Y;
     }
 
+    let dt = time.delta_secs();
     if direction != Vec3::ZERO {
         let boost = if keys.pressed(KeyCode::ShiftLeft) { 4.0 } else { 1.0 };
-        transform.translation += direction.normalize() * fly.speed * boost * time.delta_secs();
+        transform.translation += direction.normalize() * fly.speed * boost * dt;
     }
+
+    // The ground plan of where the keys are pushing, eased. Standing still eases
+    // it back to zero, which is how the preload stops leaning.
+    let flat = Vec2::new(direction.x, direction.z).normalize_or_zero();
+    let caught = 1.0 - (-dt / TRAVEL_EASE).exp();
+    fly.travel = fly.travel.lerp(flat, caught);
 }
