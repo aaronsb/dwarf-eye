@@ -238,3 +238,6 @@ wind into the cloud drift), #18 (region rainfall and temperature onto
 `WeatherReport`), #16 (water
 and magma transparency would interact with the same medium), #14 (lightning
 would need the night light rig).
+
+
+Rainfall and temperature reach the haze from the probe's own region tile fields (`Reading.rainfall`, `Reading.temperature`, `WeatherReport.climate`); `DWARF_EYE_HAZE=rainfall=..,temp=..` pins them and the poll then leaves them alone.

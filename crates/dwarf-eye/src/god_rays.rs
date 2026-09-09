@@ -367,11 +367,14 @@ pub struct Climate {
     pub rainfall: f32,
     pub temperature: f32,
     pub water: f32,
+    /// True when `DWARF_EYE_HAZE` set rainfall or temperature by hand; the
+    /// weather poll then leaves them alone.
+    pub pinned: bool,
 }
 
 impl Default for Climate {
     fn default() -> Self {
-        Self { rainfall: 0.5, temperature: 0.5, water: 0.0 }
+        Self { rainfall: 0.5, temperature: 0.5, water: 0.0, pinned: false }
     }
 }
 
@@ -383,8 +386,14 @@ impl Climate {
             let Some((name, value)) = part.split_once('=') else { continue };
             let Ok(value) = value.trim().parse::<f32>() else { continue };
             match name.trim() {
-                "rainfall" | "rain" => climate.rainfall = value,
-                "temp" | "temperature" => climate.temperature = value,
+                "rainfall" | "rain" => {
+                    climate.rainfall = value;
+                    climate.pinned = true;
+                }
+                "temp" | "temperature" => {
+                    climate.temperature = value;
+                    climate.pinned = true;
+                }
                 "water" => climate.water = value,
                 _ => {}
             }

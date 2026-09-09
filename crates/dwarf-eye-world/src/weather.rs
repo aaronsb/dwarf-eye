@@ -31,7 +31,7 @@ pub const PROBE: &str = concat!(
     "w[#w + 1] = n(df.weather_type, g.current_weather[x][y]) end end ",
     "local cx, cy = 2, 2 ",
     "local cum, str, cir, fog, fr, cd = 0, 0, 0, 0, 0, 0 ",
-    "local wx, wy, ax, ay, sn, tp, mp, ma = 0, 0, 0, 0, 0, 0, -1, 0 ",
+    "local wx, wy, ax, ay, sn, tp, mp, ma, rf = 0, 0, 0, 0, 0, 0, -1, 0, -1 ",
     "pcall(function() ",
     "  local m = g.world.map ",
     "  local u = dfhack.world.getAdventurer and dfhack.world.getAdventurer() ",
@@ -54,11 +54,11 @@ pub const PROBE: &str = concat!(
         - (d.west_1 and 1 or 0) - (d.west_2 and 1 or 0) ",
     "  wy = (d.south_1 and 1 or 0) + (d.south_2 and 1 or 0) \
         - (d.north_1 and 1 or 0) - (d.north_2 and 1 or 0) ",
-    "  ax, ay, sn, tp = e.air_x, e.air_y, e.snowfall, e.temperature ",
+    "  ax, ay, sn, tp, rf = e.air_x, e.air_y, e.snowfall, e.temperature, e.rainfall ",
     "end) ",
     "print('dwarfeye-weather ' .. table.concat(w, ' ') .. string.format(",
-    "' %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d', ",
-    "cx, cy, cum, str, cir, fog, fr, cd, wx, wy, ax, ay, sn, tp, mp, ma, g.weathertimer))",
+    "' %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d', ",
+    "cx, cy, cum, str, cir, fog, fr, cd, wx, wy, ax, ay, sn, tp, mp, ma, g.weathertimer, rf))",
 );
 
 const TAG: &str = "dwarfeye-weather";
@@ -144,6 +144,9 @@ pub struct Reading {
     pub moon_angle: i32,
     /// Ticks until the weather is rerolled.
     pub timer: i32,
+    /// The region tile's rainfall, 0 to 100, or negative where the probe did
+    /// not carry it (older probe lines end at the timer).
+    pub rainfall: i32,
 }
 
 impl Reading {
@@ -290,6 +293,7 @@ pub fn parse(text: &str) -> Option<Reading> {
     let moon_phase = next()?;
     let moon_angle = next()?;
     let timer = next()?;
+    let rainfall = next().unwrap_or(-1);
     Some(Reading {
         grid,
         cell,
@@ -303,6 +307,7 @@ pub fn parse(text: &str) -> Option<Reading> {
         air,
         snowfall,
         temperature,
+        rainfall,
         moon_phase,
         moon_angle,
         timer,

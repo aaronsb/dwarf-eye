@@ -1052,6 +1052,7 @@ struct WeatherState<'w> {
     weather: ResMut<'w, Weather>,
     precip: ResMut<'w, precipitation::Precipitation>,
     cover: ResMut<'w, precipitation::SnowCover>,
+    climate: ResMut<'w, god_rays::Climate>,
 }
 
 /// Pulls everything the worker has produced since the last frame.
@@ -1079,6 +1080,14 @@ fn drain_worker(
                 sky.precip.report(report.precip, report.intensity, report.outdoors);
                 sky.cover.target =
                     precipitation::SnowCover::override_from_env().unwrap_or(report.snow);
+                // The region's own rainfall and temperature feed the haze,
+                // unless DWARF_EYE_HAZE pinned them.
+                if let (false, Some((rainfall, temperature))) =
+                    (sky.climate.pinned, report.climate)
+                {
+                    sky.climate.rainfall = rainfall;
+                    sky.climate.temperature = temperature;
+                }
                 // DF's own moon, which the protocol never sends. Absent, the
                 // clock's 28-day derivation stays in charge.
                 if report.moon.is_some() {

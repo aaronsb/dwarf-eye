@@ -57,6 +57,9 @@ pub struct WeatherReport {
     pub moon: Option<f32>,
     /// False when the loaded map has something solid over the camera.
     pub outdoors: bool,
+    /// The region tile's rainfall and temperature at the character, each
+    /// 0..1, where the probe carried them.
+    pub climate: Option<(f32, f32)>,
 }
 
 impl Default for WeatherReport {
@@ -68,6 +71,7 @@ impl Default for WeatherReport {
             snow: 0.0,
             moon: None,
             outdoors: true,
+            climate: None,
         }
     }
 }

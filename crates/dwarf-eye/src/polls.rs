@@ -256,6 +256,10 @@ fn read_weather(client: &mut Client, sky: &SkyOpen) -> Option<WeatherReport> {
                 snow: r.snow_cover(),
                 moon: r.moon(),
                 outdoors,
+                climate: (r.rainfall >= 0).then(|| {
+                    ((r.rainfall as f32 / 100.0).clamp(0.0, 1.0),
+                        (r.temperature as f32 / 100.0).clamp(0.0, 1.0))
+                }),
             })
         }
         // No script interpreter, or no world data: the world map still carries
