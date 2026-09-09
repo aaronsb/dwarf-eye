@@ -16,6 +16,10 @@
 //! transform gives it its height and its yaw. One growth feeds every cut, so a
 //! tree keeps its shape as it hands over. Grown once and kept for the process,
 //! since the set is small and a window move rebuilds the scatter around it.
+//!
+//! These cuts are the stages [`super::batch`] leaves instanced: a copy per tree
+//! runs to hundreds of thousands of triangles, so the transform stays on the
+//! entity rather than being baked into the vertices.
 
 use std::sync::{Mutex, OnceLock};
 

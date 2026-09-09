@@ -22,7 +22,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::ecs::system::SystemParam;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::prelude::*;
 use bevy::camera::Exposure;
@@ -48,6 +48,7 @@ use bevy::render::occlusion_culling::OcclusionCulling;
 use bevy::render::{RenderApp, RenderStartup};
 use dwarf_eye_world::canopy::{BANDS, Band, CanopyMeshes, Coat, Surface};
 use dwarf_eye_world::factory::{self, Detail as TreeStage};
+use dwarf_eye_world::horizon::batch;
 use dwarf_eye_world::horizon::scatter::stages as horizon_stages;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
@@ -329,10 +330,44 @@ fn lod_skip() -> usize {
 #[derive(Component, Clone, Copy, PartialEq)]
 struct CanopyBand(usize);
 
-/// Which stage of the far band's tree chain an instance is, by its place in
+/// Which stage of the far band's tree chain an entity draws, by its place in
 /// `horizon::scatter::stages`.
+///
+/// `opens` says this is the first stage its own trees kept: everything nearer
+/// in the chain hands over inside the gap between those trees and the live
+/// window, so the camera can never ask for it and it was not spawned. This one
+/// therefore starts at the camera rather than at a hand-off nothing draws.
 #[derive(Component, Clone, Copy, PartialEq)]
-struct HorizonStage(usize);
+struct HorizonStage {
+    stage: usize,
+    opens: bool,
+}
+
+/// The `VisibilityRange` a stage carries, given whether it opens the chain for
+/// its own trees.
+fn staged_range(ranges: &[VisibilityRange], stage: HorizonStage) -> VisibilityRange {
+    let mut range = ranges[stage.stage.min(ranges.len() - 1)].clone();
+    if stage.opens {
+        range.start_margin = 0.0..0.0;
+    }
+    range
+}
+
+/// Whether a stage is worth spawning for trees the camera can never come
+/// closer to than `reach` tiles.
+///
+/// The camera stands somewhere in the live window and `reach` is the gap
+/// between that window and the trees' own region tile, so a stage whose range
+/// ends inside it is never drawn. The last stage runs to the far plane and
+/// always stands.
+fn stage_is_reachable(ranges: &[VisibilityRange], stage: usize, reach: f32) -> bool {
+    stage + 1 >= ranges.len() || ranges[stage].end_margin.end >= reach
+}
+
+/// The first stage of the chain the camera can ask for at `reach`.
+fn opening_stage(ranges: &[VisibilityRange], reach: f32) -> usize {
+    (0..ranges.len()).find(|&i| stage_is_reachable(ranges, i, reach)).unwrap_or(0)
+}
 
 /// How far the sun's shadow cascades reach, mirroring Bevy's own default
 /// `CascadeShadowConfig`. The chain's own copy is the floor under the crown
@@ -391,25 +426,20 @@ fn stage_label(stage: TreeStage, triangles: usize) -> String {
     format!("{name} {}k", triangles / 1000)
 }
 
-/// A blob shadow: the ground shadow of a tree past the cascades, as one quad.
+/// One merge cell's blob shadows: the ground shadows of the trees past the
+/// cascades, as two triangles each in one mesh.
 ///
 /// Beyond `SHADOW_DISTANCE` the shadow map has nothing left to resolve a tree
-/// with, and a far band with no shadows at all reads as flat. One dark quad on
-/// the ground per instance costs two triangles and re-aims when the sun moves.
-#[derive(Component, Clone, Copy)]
-struct BlobShadow {
-    pos: [f32; 3],
-    /// The crown's own half-width in tiles, after the instance's scale.
-    radius: f32,
-    /// How tall the tree stands, which is what the sun's slant multiplies.
-    height: f32,
-}
-
-/// Where the blob sits above the ground it lies on, and how far it may stretch
-/// as a multiple of the crown's width. Uncapped, a sun near the horizon would
-/// throw a shadow across half the map.
-const BLOB_LIFT: f32 = 0.06;
-const BLOB_MAX_STRETCH: f32 = 4.0;
+/// with, and a far band with no shadows at all reads as flat. The quads are
+/// merged like the crowns over them, so a cell is one entity; what they were
+/// made from is kept here because a blob's shape depends on the sun's
+/// elevation as well as its azimuth — it stretches away from the sun by the
+/// tree's height over the tangent — so no turn of a transform or a UV can
+/// re-aim one. `aim_blob_shadows` rewrites the positions in place instead,
+/// which is the only buffer that moves: the indices, normals, colours and UVs
+/// are the same whatever the sun is doing.
+#[derive(Component)]
+struct BlobShadows(Vec<batch::Blob>);
 
 /// The direction the sun's light travels, kept so a blob spawned between two
 /// aiming passes still points the right way.
@@ -422,54 +452,32 @@ impl Default for SunAim {
     }
 }
 
-/// The unit quad a blob shadow is drawn with, in the ground plane.
-fn blob_quad() -> MeshData {
-    let mut mesh = MeshData::default();
-    mesh.push_quad(
-        [[-0.5, 0.0, -0.5], [-0.5, 0.0, 0.5], [0.5, 0.0, 0.5], [0.5, 0.0, -0.5]],
-        [0.0, 1.0, 0.0],
-        [1.0, 1.0, 1.0, 1.0],
-    );
-    mesh
-}
-
-/// Lays one blob on the ground under its tree, turned to the sun's azimuth and
-/// stretched along it by the tree's height over the tangent of the sun's
-/// elevation.
-fn blob_transform(shadow: &BlobShadow, aim: Vec3) -> Transform {
-    let width = shadow.radius * 2.0;
-    let flat = Vec2::new(aim.x, aim.z);
-    let centre = Vec3::new(shadow.pos[0], shadow.pos[1] + BLOB_LIFT, shadow.pos[2]);
-    let overhead = Transform::from_translation(centre).with_scale(Vec3::new(width, 1.0, width));
-    if aim.y >= -0.02 || flat.length_squared() < 1e-8 {
-        return overhead;
-    }
-    let dir = flat.normalize();
-    let cast = (shadow.height * flat.length() / -aim.y).min(width * BLOB_MAX_STRETCH);
-    Transform::from_translation(centre + Vec3::new(dir.x, 0.0, dir.y) * (cast * 0.5))
-        .with_rotation(Quat::from_rotation_y(dir.x.atan2(dir.y)))
-        .with_scale(Vec3::new(width, 1.0, width + cast))
-}
-
 /// Turns the blob shadows when the sun has moved more than a couple of degrees,
 /// and fades them out as it sets.
 fn aim_blob_shadows(
-    sun: Query<&Transform, (With<sky::Sun>, Without<BlobShadow>)>,
-    mut blobs: Query<(&BlobShadow, &mut Transform)>,
+    sun: Query<&Transform, With<sky::Sun>>,
+    blobs: Query<(&BlobShadows, &Mesh3d)>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut aim: ResMut<SunAim>,
     mut materials: ResMut<Assets<TerrainMat>>,
     blob_material: Res<BlobShadowMaterial>,
 ) {
     let Ok(transform) = sun.single() else { return };
     let now = transform.forward().as_vec3().normalize_or(Vec3::NEG_Y);
-    // Two degrees, so a slow noon does not rewrite ten thousand transforms a
+    // Two degrees, so a slow noon does not rewrite twenty thousand quads a
     // frame and a sunset still swings the shadows visibly.
     if now.dot(aim.0) > 2.0f32.to_radians().cos() {
         return;
     }
     aim.0 = now;
-    for (shadow, mut transform) in &mut blobs {
-        *transform = blob_transform(shadow, now);
+    for (shadows, mesh) in &blobs {
+        let Some(mut mesh) = meshes.get_mut(&mesh.0) else { continue };
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        else {
+            continue;
+        };
+        batch::aim_blobs(&shadows.0, [now.x, now.y, now.z], positions);
     }
     if let Some(mut m) = materials.get_mut(&blob_material.0) {
         // Nothing casts a shadow once the sun is down.
@@ -1198,13 +1206,117 @@ fn drain_worker(
                 }
                 let ranges = horizon_ranges(far.bands.near);
                 let ground = data.mesh.triangle_count();
-                let (trees, instances) = (data.instance_count(), data.entity_count());
+                let trees = data.instance_count();
                 let per_stage: Vec<String> = horizon_stages()
                     .iter()
                     .map(|s| stage_label(s.detail, data.stage_triangles(s.detail)))
                     .collect();
+                commands.spawn((
+                    Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),
+                    MeshMaterial3d(far.ground.0.clone()),
+                    Transform::IDENTITY,
+                    Horizon,
+                ));
+                let blob_from = horizon_blob_from(far.bands.near);
+                let blob_range = horizon_blob_range(far.bands.near);
+                let stage_of =
+                    |stage| horizon_stages().iter().position(|s| s.detail == stage).unwrap_or(0);
+                let mut spawned = 1;
+
+                // The cheap stages come merged: one mesh per cell per stage,
+                // every tree's transform already baked into the vertices, so a
+                // few hundred trees are one entity at the identity transform.
+                // The range measures from the mesh's own bounds, so a cell
+                // hands over at its own distance.
+                for cell in data.merged {
+                    let at = stage_of(cell.stage);
+                    if !stage_is_reachable(&ranges, at, cell.reach) {
+                        continue;
+                    }
+                    let stage =
+                        HorizonStage { stage: at, opens: opening_stage(&ranges, cell.reach) == at };
+                    // A rasterised cut carries no shading of its own and takes
+                    // the canopy's sky term; `crown.rs` bakes a lit top and
+                    // darker sides into the crown and box stages' vertex
+                    // colours, and the sky term over that would take their
+                    // sides to nearly black.
+                    let coat = if cell.stage.per_tile().is_some() {
+                        far.canopy.grown.clone()
+                    } else {
+                        far.canopy.boxes.clone()
+                    };
+                    let mut entity = commands.spawn((
+                        Mesh3d(meshes.add(to_bevy_mesh(cell.mesh))),
+                        MeshMaterial3d(coat),
+                        Transform::IDENTITY,
+                        staged_range(&ranges, stage),
+                        stage,
+                        Horizon,
+                    ));
+                    if at >= blob_from {
+                        entity.insert(NotShadowCaster);
+                    }
+                    spawned += 1;
+                }
+
+                // The rasterised cuts are hundreds to thousands of triangles a
+                // tree, too big to copy per tree, so they stay one entity a
+                // tree over a shared mesh — but only for the trees near enough
+                // to the live window that the camera can still ask for that
+                // cut. A rasterised cut carries no shading of its own and takes
+                // the canopy's sky term.
+                for batch in data.crowns {
+                    let at = stage_of(batch.stage);
+                    let unit = batch.mesh_height;
+                    let mesh = meshes.add(to_bevy_mesh(batch.mesh));
+                    for tree in &batch.instances {
+                        if !stage_is_reachable(&ranges, at, tree.reach) {
+                            continue;
+                        }
+                        let stage =
+                            HorizonStage { stage: at, opens: opening_stage(&ranges, tree.reach) == at };
+                        let mut entity = commands.spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(far.canopy.grown.clone()),
+                            Transform::from_translation(Vec3::from(tree.pos))
+                                .with_rotation(Quat::from_rotation_y(tree.yaw))
+                                .with_scale(Vec3::splat(tree.height / unit)),
+                            staged_range(&ranges, stage),
+                            stage,
+                            Horizon,
+                        ));
+                        // Everything inside the sun's cascades casts a real
+                        // shadow. Past them a shadow map has nothing left to
+                        // resolve a tree with, so every stage whose near edge
+                        // is at or beyond `SHADOW_DISTANCE` casts a blob.
+                        if at >= blob_from {
+                            entity.insert(NotShadowCaster);
+                        }
+                        spawned += 1;
+                    }
+                }
+
+                // One blob a tree, merged a cell at a time: the ground under a
+                // far wood is shaded once however many stages stand over it in
+                // turn.
+                for cell in data.blobs {
+                    let aim = [far.aim.0.x, far.aim.0.y, far.aim.0.z];
+                    let mesh = batch::blob_mesh(&cell.shadows, aim);
+                    commands.spawn((
+                        Mesh3d(meshes.add(to_bevy_mesh(mesh))),
+                        MeshMaterial3d(far.blob.0.clone()),
+                        Transform::IDENTITY,
+                        blob_range.clone(),
+                        HorizonStage { stage: blob_from, opens: false },
+                        BlobShadows(cell.shadows),
+                        Horizon,
+                        NotShadowCaster,
+                    ));
+                    spawned += 1;
+                }
+
                 status.detail = format!(
-                    "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances; \
+                    "horizon: {ground} ground triangles, {trees} trees ({}), {spawned} entities; \
                      fine map {:.2} canopy cover, {:.2} at the centre, {} clearings",
                     per_stage.join(" / "),
                     data.fine_density,
@@ -1214,90 +1326,6 @@ fn drain_worker(
                 // The same line in the log, so an unattended shot still says
                 // what the chain cost.
                 info!("{}", status.detail);
-                commands.spawn((
-                    Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),
-                    MeshMaterial3d(far.ground.0.clone()),
-                    Transform::IDENTITY,
-                    Horizon,
-                ));
-                // One mesh per species, growth variant and stage; one entity
-                // per tree per stage. Bevy batches entities that share a mesh
-                // and a material, so a whole forest costs a handful of draw
-                // calls, and each entity's own `VisibilityRange` decides which
-                // stage draws from the camera's distance to that tree.
-                let blob = meshes.add(to_bevy_mesh(blob_quad()));
-                let blob_from = horizon_blob_from(far.bands.near);
-                let blob_range = horizon_blob_range(far.bands.near);
-                for batch in data.crowns {
-                    let stage =
-                        horizon_stages().iter().position(|s| s.detail == batch.stage).unwrap_or(0);
-                    let range = ranges[stage].clone();
-                    // The mesh's own size, so an instance is scaled to the
-                    // height the scatter gave it and a blob is sized from the
-                    // crown that casts it.
-                    let unit = batch.mesh_height;
-                    let radius = batch
-                        .mesh
-                        .positions
-                        .iter()
-                        .map(|p| p[0].abs().max(p[2].abs()))
-                        .fold(0.5f32, f32::max);
-                    let mesh = meshes.add(to_bevy_mesh(batch.mesh));
-                    // A rasterised cut carries no shading of its own and takes
-                    // the canopy's sky term; `crown.rs` bakes a lit top and
-                    // darker sides into the crown and box stages' vertex
-                    // colours, and the sky term over that takes their sides to
-                    // nearly black.
-                    let coat = if batch.stage.per_tile().is_some() {
-                        far.canopy.grown.clone()
-                    } else {
-                        far.canopy.boxes.clone()
-                    };
-                    for tree in &batch.instances {
-                        let scale = tree.height / unit;
-                        let mut entity = commands.spawn((
-                            Mesh3d(mesh.clone()),
-                            MeshMaterial3d(coat.clone()),
-                            Transform::from_translation(Vec3::from(tree.pos))
-                                .with_rotation(Quat::from_rotation_y(tree.yaw))
-                                .with_scale(Vec3::splat(scale)),
-                            range.clone(),
-                            HorizonStage(stage),
-                            Horizon,
-                        ));
-                        // Everything inside the sun's cascades casts a real
-                        // shadow. Past them a shadow map has nothing left to
-                        // resolve a tree with, so every stage whose near edge is
-                        // at or beyond `SHADOW_DISTANCE` casts a blob instead —
-                        // one blob a tree, on the first of them.
-                        if stage >= blob_from {
-                            entity.insert(NotShadowCaster);
-                        }
-                        if stage == blob_from {
-                            commands.spawn((
-                                Mesh3d(blob.clone()),
-                                MeshMaterial3d(far.blob.0.clone()),
-                                blob_transform(
-                                    &BlobShadow {
-                                        pos: tree.pos,
-                                        radius: radius * scale,
-                                        height: tree.height,
-                                    },
-                                    far.aim.0,
-                                ),
-                                blob_range.clone(),
-                                HorizonStage(stage),
-                                BlobShadow {
-                                    pos: tree.pos,
-                                    radius: radius * scale,
-                                    height: tree.height,
-                                },
-                                Horizon,
-                                NotShadowCaster,
-                            ));
-                        }
-                    }
-                }
             }
             Event::Coverage(blocks) => {
                 mask.blocks = blocks;
@@ -1330,7 +1358,7 @@ fn size_bands(
     camera: Query<&Projection, With<FlyCamera>>,
     mut ranged: Query<(&CanopyBand, &mut VisibilityRange), Without<HorizonStage>>,
     mut staged: Query<
-        (&HorizonStage, Option<&BlobShadow>, &mut VisibilityRange),
+        (&HorizonStage, Option<&BlobShadows>, &mut VisibilityRange),
         Without<CanopyBand>,
     >,
 ) {
@@ -1357,8 +1385,8 @@ fn size_bands(
         // stage starts to the far plane, whatever the window is now.
         if is_blob.is_some() {
             *range = blob.clone();
-        } else if let Some(wanted) = stages.get(stage.0) {
-            *range = wanted.clone();
+        } else if stage.stage < stages.len() {
+            *range = staged_range(&stages, *stage);
         }
     }
     let edges = band_edges(near);
@@ -1828,5 +1856,74 @@ mod tests {
         let range = horizon_blob_range(n);
         assert_eq!(range.start_margin, horizon_ranges(n)[at].start_margin);
         assert_eq!(range.end_margin, BAND_FAR..BAND_FAR);
+    }
+
+    /// A stage that hands over nearer than the camera can ever come to a tree
+    /// is not spawned, and the chain the tree keeps opens at the camera rather
+    /// than at a hand-off nothing draws.
+    #[test]
+    fn a_stage_the_camera_cannot_reach_is_never_spawned() {
+        let n = near();
+        let ranges = horizon_ranges(n);
+        let edges = horizon_edges(n);
+        let last = ranges.len() - 1;
+
+        // A tree in the window's lap keeps the whole chain.
+        assert_eq!(opening_stage(&ranges, 0.0), 0);
+        assert!((0..ranges.len()).all(|i| stage_is_reachable(&ranges, i, 0.0)));
+
+        // A tree past the finest cut's own fade loses it, and the next stage
+        // opens the chain.
+        let past = ranges[0].end_margin.end + 1.0;
+        assert!(!stage_is_reachable(&ranges, 0, past), "the finest cut survived {past}");
+        assert!(stage_is_reachable(&ranges, 1, past));
+        assert_eq!(opening_stage(&ranges, past), 1);
+
+        // Past every hand-off only the last stage stands, and it runs to the
+        // far plane whatever the reach.
+        let far = edges.last().unwrap() * 4.0;
+        assert_eq!(opening_stage(&ranges, far), last);
+        assert!(stage_is_reachable(&ranges, last, far));
+        assert!((0..last).all(|i| !stage_is_reachable(&ranges, i, far)));
+
+        // A stage that opens the chain starts at the camera; one that does not
+        // keeps its predecessor's hand-off.
+        let opening = HorizonStage { stage: last, opens: true };
+        assert_eq!(staged_range(&ranges, opening).start_margin, 0.0..0.0);
+        let following = HorizonStage { stage: last, opens: false };
+        assert_eq!(staged_range(&ranges, following).start_margin, ranges[last].start_margin);
+        assert_eq!(staged_range(&ranges, following).end_margin, ranges[last].end_margin);
+    }
+
+    /// What the far band costs in entities: one per merged cell per reachable
+    /// stage, one per blob cell, one per tree per reachable cut — and never one
+    /// per tree per stage, which is where the 136k came from.
+    #[test]
+    fn the_entity_count_is_cells_plus_the_cuts_in_reach() {
+        let ranges = horizon_ranges(near());
+        // A stand of trees, all on one region tile a given distance out.
+        let entities = |trees: usize, cells: usize, blob_cells: usize, reach: f32| {
+            let cuts = (0..ranges.len())
+                .filter(|&i| horizon_stages()[i].detail.per_tile().is_some())
+                .filter(|&i| stage_is_reachable(&ranges, i, reach))
+                .count();
+            let merged = (0..ranges.len())
+                .filter(|&i| horizon_stages()[i].detail.per_tile().is_none())
+                .filter(|&i| stage_is_reachable(&ranges, i, reach))
+                .count();
+            trees * cuts + cells * merged + blob_cells
+        };
+        // Near the window every cut is in reach, so the trees are still one
+        // entity each per cut — but the crown and the box are two cells, not
+        // two entities a tree.
+        let near_cost = entities(100, 1, 1, 0.0);
+        assert_eq!(near_cost, 100 * 4 + 2 + 1);
+        // Far out nothing but the box cell and its blob is left, whatever the
+        // stand holds.
+        assert_eq!(entities(100, 1, 1, 100_000.0), 2);
+        assert_eq!(entities(10_000, 1, 1, 100_000.0), 2);
+        // The old rule was one entity a tree a stage, plus a blob each.
+        let old = 100 * (horizon_stages().len() + 1);
+        assert!(near_cost < old, "{near_cost} is no better than {old}");
     }
 }
