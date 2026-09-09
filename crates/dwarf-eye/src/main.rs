@@ -292,16 +292,36 @@ fn band_ranges(near: f32) -> Vec<VisibilityRange> {
 fn stage_ranges(edges: &[f32]) -> Vec<VisibilityRange> {
     let fades = band_fades(edges);
     let fade = |stage: usize| fades[stage].clone();
+    // `DWARF_EYE_LOD_SKIP=k` drops the k finest stages and starts the next at
+    // the camera: an experiment knob for judging a coarser cut up close.
+    let skip = lod_skip().min(edges.len());
     (0..=edges.len())
         .map(|stage| VisibilityRange {
-            start_margin: if stage == 0 { 0.0..0.0 } else { fade(stage - 1) },
-            end_margin: if stage < edges.len() { fade(stage) } else { BAND_FAR..BAND_FAR },
+            start_margin: if stage < skip {
+                BAND_FAR..BAND_FAR
+            } else if stage == skip {
+                0.0..0.0
+            } else {
+                fade(stage - 1)
+            },
+            end_margin: if stage < skip {
+                BAND_FAR..BAND_FAR
+            } else if stage < edges.len() {
+                fade(stage)
+            } else {
+                BAND_FAR..BAND_FAR
+            },
             // Chunk meshes hold world-space vertices at an identity transform,
             // so the range has to measure from the mesh's own bounds, not its
             // origin.
             use_aabb: true,
         })
         .collect()
+}
+
+/// How many of the finest stages `DWARF_EYE_LOD_SKIP` hides.
+fn lod_skip() -> usize {
+    std::env::var("DWARF_EYE_LOD_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Which band a canopy entity belongs to, by its place in `canopy::BANDS`, so a
