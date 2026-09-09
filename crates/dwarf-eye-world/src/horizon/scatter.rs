@@ -8,9 +8,9 @@
 //! the tail of the list, so the trees that remain do not move.
 //!
 //! Which stage of the tree chain an instance draws at is **not** decided here.
-//! Every placed tree carries all three stages and Bevy swaps between them by
-//! the camera's own distance to that tree (`main.rs:horizon_ranges`), the way
-//! the canopy bands do: a region-sourced tree can stand a few tiles from the
+//! Every placed tree carries every stage and Bevy swaps between them by the
+//! camera's own distance to that tree (`main.rs:horizon_ranges`), the way the
+//! canopy bands do: a region-sourced tree can stand a few tiles from the
 //! camera, and deciding its stage from its distance to the window's centre
 //! drew boxes the size of houses right in front of the eye. Past `REACH`
 //! nothing is placed at all and the ground carries the canopy as colour
@@ -18,6 +18,7 @@
 
 use dwarf_eye_trees::Preset;
 
+use crate::factory;
 use super::field::hash;
 use super::terrace::Terrain;
 use super::{REGION_TILE, Window};
@@ -50,22 +51,20 @@ const STRAY: f32 = 0.07;
 const CONTRAST: f32 = 0.03;
 const CONTRAST_FROM: f32 = 1200.0;
 const CONTRASTS: [Preset; 2] = [Preset::Spruce, Preset::DeadTree];
-/// The stages of the far band's tree chain, nearest first. Each is one entity
-/// per tree carrying its own `VisibilityRange`, so the swap is Bevy's and the
-/// measure is the camera's distance to that tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Stage {
-    /// A grown tree at one voxel to a tile: `horizon::grown`.
-    Grown,
-    /// The canonical crown, a trunk under one to three boxes:
-    /// `dwarf_eye_trees::crown`.
-    Crown,
-    /// Its bounding box in the crown's mean colour: `dwarf_eye_trees::crown_box`.
-    Box,
-}
+/// How one stage of the far band's tree chain is drawn: the factory's own
+/// vocabulary, so the window's bands and these instances name the same things.
+pub type Stage = factory::Detail;
 
-/// Nearest first, which is the order `main.rs` builds the ranges in.
-pub const STAGES: [Stage; 3] = [Stage::Grown, Stage::Crown, Stage::Box];
+/// The stages of the far band's tree chain, nearest first: the whole of the
+/// factory's tree chain, which opens with the whole of the window's.
+///
+/// Each is one entity per tree carrying its own `VisibilityRange`, so the swap
+/// is Bevy's and the measure is the camera's distance to that tree. Detail is
+/// that distance and nothing else — never which survey the tree came from —
+/// which is what keeps the window's boundary out of the canopy.
+pub fn stages() -> &'static [factory::Stage] {
+    factory::tree_chain().instanced()
+}
 
 /// One placed tree, in render space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,7 +74,7 @@ pub struct CrownInstance {
     /// own, so the transform's scale is this over that.
     pub height: f32,
     pub yaw: f32,
-    /// Which of the species' canonical growths the nearest stage draws.
+    /// Which of the species' canonical growths the rasterised stages draw.
     pub variant: u32,
 }
 

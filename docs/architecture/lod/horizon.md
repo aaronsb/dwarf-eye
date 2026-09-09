@@ -1,8 +1,9 @@
 # The far band
 
-Status: landed (`crates/dwarf-eye-world/src/horizon/`, issue #31); the smooth
-world grid past the region details still joins by a hidden step rather than a
-skirt (issue #9).
+Status: landed (`crates/dwarf-eye-world/src/horizon/`, issue #31); the tree
+chain is the factory's, shared with the window's canopy bands (issue #5); the
+smooth world grid past the region details still joins by a hidden step rather
+than a skirt (issue #9).
 
 ## What it does
 
@@ -221,6 +222,14 @@ single-storey look. All of it off the same `hash(rx, ry, k)`.
 
 ## The tree chain
 
+**The far band draws the window's own chain.** `factory::chain(Class::Tree, ..)`
+is one list of six stages and the horizon takes all of them
+(`scatter.rs:stages`), so detail out here is the camera's distance to a tree and
+nothing else. It used to be the survey the tree came from: the horizon opened at
+one voxel to a tile while the window had four, three and two voxels first, and a
+tree ten tiles outside the live window was visibly cruder than one ten tiles
+inside it. The window's boundary showed in the canopy.
+
 Which stage an instance draws at is decided by **the camera's distance to that
 tree**, not by its distance from the window's centre. A region-sourced tree can
 stand a few tiles from the eye — the live window is 144 tiles square and the
@@ -228,45 +237,59 @@ camera walks to its edge — and the old rule drew those as boxes the size of
 houses.
 
 Every placed tree is one entity per stage, each carrying its own
-`VisibilityRange` (`main.rs:horizon_ranges`), and Bevy does the swapping the way
-it does for the canopy bands:
+`VisibilityRange` (`main.rs:horizon_ranges`, over `factory::edges` and
+`main.rs:band_fades` — the same two calls the canopy bands use), and Bevy does
+the swapping the way it does for the canopy bands:
 
-| stage | mesh | ends at | shadow |
-|---|---|---|---|
-| grown | `horizon::grown`, a grown tree at one voxel to a tile | `1.5 N` | casts |
-| crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(3 N, 150)` | casts |
-| box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | a blob |
+| stage | mesh | ends at | 720-tall window | shadow |
+|---|---|---|---|---|
+| 4 voxels | `horizon::grown` | `N` | 109 | casts |
+| 3 voxels | `horizon::grown` | `4N/3` | 145 | casts |
+| 2 voxels | `horizon::grown` | `2N` | 217 | casts |
+| 1 voxel | `horizon::grown` | `4N` | 436 | a blob |
+| crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(8 N, 150)` | 872 | a blob |
+| box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | — | a blob |
 
 `N` is the canopy's own near band (`canopy::near_band`, 109 tiles into a
 720-tall window), so a longer lens or a taller window pushes the whole chain
-out. The projected-size rule would put the grown stage at `4 N` — a one-tile
-leaf voxel is two pixels four times further out than a quarter-tile one — and
-the triangle budget will not carry it: a grown far tree is about eight hundred
-triangles and the count goes with the square of the reach. `1.5 N`
-(`main.rs:GROWN_REACH`) is where a box crown starts reading as a box, which is
-what the stage exists to push back. Hand-offs dither across
-`HORIZON_CROSSFADE` 0.35 of the edge, wider than the canopy's 0.15, because the
-shapes either side differ more and there is no cutout to pay for.
+out. The first four edges are the window's, to the bit
+(`main.rs:the_horizon_hands_over_where_the_window_does`), and every one of them
+is the projected-size rule on that cut's own leaf voxel — including the
+one-voxel cut, which now runs to `4 N` rather than the `1.5 N` a separate
+`GROWN_REACH` used to cap it at. The crown holds twice as far as the cut it
+replaces, which is the ratio the band shipped with (`3 N` behind `1.5 N`), and
+never gives way inside the shadow cascades. Hand-offs dither across
+`main.rs:CROSSFADE` 0.45 of the log gap either side of the edge — the canopy's
+own rule, in place of a separate `HORIZON_CROSSFADE`.
 
 Past 1920 tiles nothing is placed at all — `terrace.rs:canopy_at` hands the
 foliage back to the ground as colour over the same interval, so the two never
 double-count.
 
 Growth is the expensive half and there is no per-tree data out here to preserve,
-so `grown.rs` grows `VARIANTS` 6 canonical shapes per species at
-`GROWN_HEIGHT` 7 tiles, caches them for the process, and lets the instance
-transform give each tree its height and its yaw. A batch is one species, one
-variant and one stage; a batch's mesh has a height of its own and an instance is
-scaled by its own height over that, so a tree is the same size whichever stage
-draws it.
+so `grown.rs` grows `VARIANTS` 6 canonical skeletons per species at
+`GROWN_HEIGHT` 7 tiles and rasterises **every cut off the one growth**, so a
+tree keeps its shape as it hands over. They are held in a
+`factory::StageCache` keyed by (preset and variant, stage) for the process, and
+the instance transform gives each tree its height and its yaw. A batch is one
+species, one variant and one stage; a batch's mesh has a height of its own and
+an instance is scaled by its own height over that, so a tree is the same size
+whichever stage draws it. Each cut asks the rasteriser for the near band's limb
+widths (`trees::Cut::wood_like`), the same correction the canopy bands make.
 
 Every stage wears the canopy's leaf surface on an opaque copy of the canopy
 material with the horizon's block mask over it
-(`main.rs:HorizonCanopyMaterial`), in two casts: the grown stage takes the
-canopy's sky term, because a grown tree's faces carry no shading of their own,
-and the two box stages do not, because `crown.rs` already bakes a lit top and
+(`main.rs:HorizonCanopyMaterial`), in two casts: the rasterised cuts take the
+canopy's sky term, because their faces carry no shading of their own, and the
+crown and box stages do not, because `crown.rs` already bakes a lit top and
 darker sides into their vertex colours and the sky term over that takes a
-crown's sides to nearly black. An instanced crown cannot carry world-space
+crown's sides to nearly black. The cuts stay **opaque** where the window's would
+wear the leaf cutout: an instanced mesh's vertex UVs are scaled by its transform
+and the main pass recovers them from the world position, which the depth prepass
+cannot do, so a masked instance would discard a different set of fragments in
+each pass. That is the one way a horizon tree still differs from a window tree
+at the same distance, and closing it means deriving the same UVs in
+`cloud_shadow_prepass.wgsl`. An instanced crown cannot carry world-space
 UVs in its vertex buffer the way a chunk's mesh does — the instance's scale
 would take them with it and every tree would wear a different texel size — so
 `cloud_shadow.wgsl:horizon_leaf` derives them from the world position instead,
@@ -278,19 +301,23 @@ is pure sparkle at this range.
 ## Shadows
 
 Everything inside the sun's cascades casts one. Bevy's default
-`CascadeShadowConfig` reaches 150 tiles (`main.rs:SHADOW_DISTANCE`), the grown
-and crown stages are wholly inside that, and the box stage's near edge is held
-at or beyond it, so nothing inside cascade range is shadowless.
+`CascadeShadowConfig` reaches 150 tiles (`factory::SHADOW_DISTANCE`), and the
+three finest cuts are inside or across that.
 
 Past the cascades a shadow map has nothing left to resolve a tree with, and a
-far band with no shadows at all reads as flat, so the box stage casts a **blob**
-instead: one dark translucent quad per instance lying on the ground, two
-triangles, turned to the sun's azimuth and stretched along it by the tree's
-height over the tangent of the sun's elevation, capped at
-`BLOB_MAX_STRETCH` 4 crown widths. `main.rs:aim_blob_shadows` re-aims them when
-the sun has moved more than two degrees and fades them out as it sets. They
-carry the box stage's own `VisibilityRange`, so they appear exactly where the
-box stage does.
+far band with no shadows at all reads as flat, so **every stage whose near edge
+is at or beyond `SHADOW_DISTANCE` casts a blob instead** — today the one-voxel
+cut outward, from 217 tiles (`main.rs:horizon_blob_from`). A blob is one dark
+translucent quad lying on the ground, two triangles, turned to the sun's azimuth
+and stretched along it by the tree's height over the tangent of the sun's
+elevation, capped at `BLOB_MAX_STRETCH` 4 crown widths.
+`main.rs:aim_blob_shadows` re-aims them when the sun has moved more than two
+degrees and fades them out as it sets. There is **one blob a tree**, not one a
+stage: it carries a range that starts where the first non-casting stage does and
+runs to the far plane (`main.rs:horizon_blob_range`), so the ground under a far
+wood is shaded once however many stages stand over it in turn. Before the chain
+landed the crown stage ran from 164 to 327 tiles casting into cascades that
+stopped at 150, which left a shadowless ring the blobs did not cover.
 
 The canonical crown is **axis-aligned boxes**, not a faceted ellipsoid: at this
 range a rounded solid is only ever a dozen flat facets, and their angled edges
@@ -331,25 +358,31 @@ itself, since a walked-and-cached tile still needs its coarse building drawn.
 Measured against the shipped world (`The Dimension of Griffons`, five world
 tiles of region details):
 
+Since the chain landed, over a 22.7k-tree scatter (the viewer reports this line
+itself at every horizon build):
+
 | | triangles |
 |---|---|
-| ground: terraces, stitch fans, world grid, rivers, sites | 136k |
-| 8.3k trees, if every one drew grown | 6.5M |
-| 8.3k trees, if every one drew its canonical crown | 247k |
-| 8.3k trees, if every one drew its box | 99k |
-| blob shadows, two triangles a tree | 17k |
+| ground: terraces, stitch fans, world grid, rivers, sites | 110k |
+| 22.7k trees, if every one drew at 4 voxels a tile | 363M |
+| 22.7k trees, if every one drew at 3 voxels | 171M |
+| 22.7k trees, if every one drew at 2 voxels | 66M |
+| 22.7k trees, if every one drew at 1 voxel | 17.7M |
+| 22.7k trees, if every one drew its canonical crown | 679k |
+| 22.7k trees, if every one drew its box | 272k |
 
-The three tree rows are alternatives, not a sum: a tree draws at one stage, and
-which one is its own distance to the camera. What actually reaches the GPU in a
-frame is far less than the grown row — about 320 trees are inside `1.5 N` at
-720p from a camera at eye level — and the viewer's own counter is the number to
-read. Measured drawn totals, scene-wide: **434k triangles at 60 fps at eye
-level, 994k at 54 fps from 320 tiles up**, against 810k at 95 fps and 383k at 61
-fps for the band this replaces (the two are not the same scene: the earlier one
-drew far fewer horizon trees near the eye, which is the fault this pass fixed).
+The tree rows are alternatives, not a sum: a tree draws at one stage, and which
+one is its own distance to the camera. Almost every tree is at the crown or the
+box; only the handful inside 217 tiles pay for a cut. What actually reaches the
+GPU is the viewer's own counter, and that is the number to read: **2.27M
+triangles drawn of 4.29M held, at eye level with the camera standing in a
+crown** — against 434k drawn before the chain, when everything past the window
+was a box. Making the finer cuts cheaper is the edge rule's job, not a cap by
+source: `MIN_LEAF_PIXELS` pulls every stage in together, for the window and the
+horizon alike.
 
-Entities are three per tree plus one blob on the box stage, so 8.3k trees is
-about 33k entities; only the stage in range draws.
+Entities are one per tree per stage plus one blob, so a six-stage chain over
+22.7k trees is about 136k entities; only the stage in range draws.
 
 ## Invariants and gotchas
 
