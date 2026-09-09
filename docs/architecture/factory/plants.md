@@ -1,8 +1,9 @@
 # Plants: an L-system in place of a stock entity
 
 Status: landed (`crates/dwarf-eye-world/src/{factory.rs,tree.rs,canopy.rs}`,
-`crates/dwarf-eye-trees/`) — trees, shrubs, saplings, dead plants, tufts and
-in-game streamers (issue #1); ground cover planned (issue #7).
+`crates/dwarf-eye-trees/`) — trees, shrubs, saplings, dead plants, tufts,
+in-game streamers (issue #1) and whole trees under the cut plane (issue #8);
+ground cover planned (issue #7).
 
 ## What it does
 
@@ -74,6 +75,14 @@ cover.
   cannot change its shape.
 - `canopy.rs:OVERHEAD` 24 lets the top chunk of a column carry voxels above it,
   so a crown is not shorn off at the ceiling of what has been sent.
+- The cut plane (`[` `]`, `DWARF_EYE_Z_OFFSET`) reuses the same headroom: a
+  tree whose base is at or below the ceiling draws whole rather than being
+  flattened where the plane cuts its canopy, because the chunk sitting on the
+  ceiling gets `OVERHEAD`'s reach too, as if it were the top of the loaded
+  column. A tree based above the ceiling is filtered out of `build_budgeted`'s
+  `origins` before it is grown, so it never appears at all.
+  `canopy.rs:cut_treatment` is the whole decision; `DWARF_EYE_CUT_TREES=slice`
+  turns it off and restores the old flat cut (issue #8).
 - A tree whose top level sits against the edge of the loaded map is not short,
   it is unfinished: `Envelope::read` marks it `truncated` and carries the last
   footprint up to the height the raws give the species.

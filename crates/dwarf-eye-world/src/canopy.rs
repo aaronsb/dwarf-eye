@@ -63,7 +63,56 @@ const REACH: i32 = 2;
 
 /// Z-levels above the top of a loaded column that its chunk still draws, so a
 /// crown is never shorn off at the ceiling of what has been sent.
+///
+/// The cut plane (issue #8) reuses this same headroom: the chunk sitting at
+/// `opts.z_ceiling` is the last one ever built while the plane sits there, so
+/// it is treated as if it were the top of the loaded column and allowed the
+/// same reach upward, which is what lets a whole tree clear the plane instead
+/// of being shorn off at it.
 const OVERHEAD: i32 = 24;
+
+/// Whether the cut plane draws a tree whole rather than slicing its canopy
+/// flat at the ceiling. `DWARF_EYE_CUT_TREES=slice` restores the old slicing;
+/// anything else, including unset, is whole.
+fn cut_trees_whole() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var("DWARF_EYE_CUT_TREES").ok().as_deref() != Some("slice"))
+}
+
+/// How the cut plane treats one tree, given the tile its trunk stands on and
+/// the ceiling (`i32::MAX` when there is no cut plane).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CutTreatment {
+    /// No cut plane, or `DWARF_EYE_CUT_TREES=slice`: chunks above the ceiling
+    /// simply are never built, which flattens whatever crown reached them.
+    Slice,
+    /// The cut plane is active, whole-tree mode is on, and this tree's base is
+    /// at or below the ceiling: it draws entire, in the chunk sitting at the
+    /// ceiling, instead of being flattened there.
+    Whole,
+    /// The cut plane is active, whole-tree mode is on, and this tree's base is
+    /// above the ceiling: a tree that has not sprouted yet, from here, so none
+    /// of it is drawn.
+    Hidden,
+}
+
+/// Decides [`CutTreatment`] for a tree rooted at `base_z`, under a cut plane
+/// at `ceiling`. `whole` is [`cut_trees_whole`], threaded through rather than
+/// read here so the decision stays a pure function to test.
+fn cut_treatment(base_z: i32, ceiling: i32, whole: bool) -> CutTreatment {
+    if ceiling == i32::MAX || !whole {
+        return CutTreatment::Slice;
+    }
+    if base_z > ceiling { CutTreatment::Hidden } else { CutTreatment::Whole }
+}
+
+/// How many z-levels beyond its own a chunk's tree volume reaches: past the
+/// top of the loaded column as before, and now also past the cut plane's
+/// ceiling when whole-tree mode needs the same headroom there.
+fn chunk_above(top_of_load: bool, chunk_z: i32, ceiling: i32, whole: bool) -> i32 {
+    let top_of_cut = ceiling != i32::MAX && chunk_z == ceiling && whole;
+    if top_of_load || top_of_cut { OVERHEAD } else { 0 }
+}
 
 /// Sub-voxels per tile the close band cuts a tree into: one step down from
 /// [`DETAIL`], so no hand-off doubles the voxel size and the first one — the
@@ -724,9 +773,23 @@ impl Forest {
         origins.dedup();
         timing::PHASES.nearby.since(started);
 
-        // Only the top of a column carries what rises above it.
+        let whole = cut_trees_whole();
+
+        // A tree that has not sprouted yet from here — its base above the cut
+        // plane — never draws, whole-tree mode or not. No-op when there is no
+        // cut plane or the plane is in slice mode: `cut_treatment` only ever
+        // says `Hidden` under whole-tree mode with an active ceiling.
+        origins
+            .retain(|(origin, _)| cut_treatment(origin.2, opts.z_ceiling, whole) != CutTreatment::Hidden);
+
+        // Only the top of a column carries what rises above it. The chunk
+        // sitting at the cut plane's ceiling is, while the plane is there, the
+        // last one that will ever be built above it, so a tree drawn whole
+        // needs the same reach there as the true top of the loaded column
+        // gets.
         let (cx, cy) = (chunk.block_x, chunk.block_y);
-        let above = if world.chunk(cx, cy, chunk.z + 1).is_some() { 0 } else { OVERHEAD };
+        let top_of_load = world.chunk(cx, cy, chunk.z + 1).is_none();
+        let above = chunk_above(top_of_load, chunk.z, opts.z_ceiling, whole);
 
         if band.undergrowth() {
             // A plant stands on the ground, and under the smooth model the
@@ -1272,6 +1335,113 @@ mod tests {
 
     fn test_chunk(block_x: i32, block_y: i32, z: i32) -> Chunk {
         Chunk { block_x, block_y, z, ..Default::default() }
+    }
+
+    /// One tree's worth of bark voxels, `height` sub-voxels tall, one wide,
+    /// its base at global voxel y `base_y` (one sub-voxel a tile, so this is
+    /// also its base z).
+    fn straight_trunk(base_y: i32, height: i32) -> TreeVoxels {
+        TreeVoxels {
+            detail: 1,
+            gx: 0,
+            gy: base_y,
+            gz: 0,
+            nx: 1,
+            ny: height,
+            nz: 1,
+            cells: vec![1u8; height as usize],
+            tones: vec![Tone { color: [0.5, 0.3, 0.1], surface: Surface::Bark }],
+            streamers: TreeMesh::default(),
+            leaf_voxels: 0,
+            bark_voxels: height as usize,
+        }
+    }
+
+    fn count_filled(volume: &Volume) -> usize {
+        let mut n = 0;
+        for i in 0..volume.nx {
+            for j in 0..volume.ny {
+                for k in 0..volume.nx {
+                    if volume.get(i, j, k) != 0 {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn a_tree_rooted_at_or_below_the_ceiling_draws_whole() {
+        assert_eq!(cut_treatment(5, 10, true), CutTreatment::Whole);
+        assert_eq!(cut_treatment(10, 10, true), CutTreatment::Whole, "at the ceiling still counts");
+    }
+
+    #[test]
+    fn a_tree_rooted_above_the_ceiling_is_hidden_entirely() {
+        assert_eq!(cut_treatment(11, 10, true), CutTreatment::Hidden);
+    }
+
+    #[test]
+    fn slice_mode_is_unchanged() {
+        // Slice mode never exempts and never hides by itself: a tree above the
+        // ceiling is kept off-screen the old way, by its chunk never being
+        // built at all, not by this decision.
+        assert_eq!(cut_treatment(5, 10, false), CutTreatment::Slice);
+        assert_eq!(cut_treatment(15, 10, false), CutTreatment::Slice);
+        assert_eq!(chunk_above(false, 10, 10, false), 0, "slice mode reaches only its own chunk");
+        // The true top of the loaded column is untouched by either mode.
+        assert_eq!(chunk_above(true, 10, 10, false), OVERHEAD);
+        assert_eq!(chunk_above(true, 10, 10, true), OVERHEAD);
+    }
+
+    #[test]
+    fn no_cut_plane_never_hides_or_reaches_further() {
+        assert_eq!(cut_treatment(50, i32::MAX, true), CutTreatment::Slice);
+        assert_eq!(chunk_above(false, 10, i32::MAX, true), 0);
+    }
+
+    #[test]
+    fn a_tree_rooted_below_the_ceiling_keeps_all_its_voxels() {
+        // A trunk ten sub-voxels tall, based right at the ceiling: whole-tree
+        // mode has to reach all the way up it from the chunk sitting there.
+        let ceiling = 0;
+        let tree = straight_trunk(ceiling, 10);
+        let chunk = test_chunk(0, 0, ceiling);
+        let above = chunk_above(false, chunk.z, ceiling, true);
+        assert_eq!(above, OVERHEAD, "the ceiling chunk did not get the extra reach");
+
+        let mut volume = Volume::new(&chunk, above, Band::Near);
+        volume.absorb(&tree);
+        assert_eq!(
+            count_filled(&volume),
+            tree.bark_voxels + tree.leaf_voxels,
+            "whole-tree mode lost voxels that a full-height volume should hold"
+        );
+    }
+
+    #[test]
+    fn a_tree_rooted_above_the_ceiling_emits_no_voxels() {
+        // Its base is one level above the ceiling: `Hidden` is what makes
+        // `build_budgeted` drop it from `origins` before it is ever grown or
+        // absorbed. That filtering is load-bearing — the ceiling chunk's own
+        // headroom reaches OVERHEAD levels past the ceiling for the trees that
+        // do qualify, comfortably far enough to have swallowed this one too
+        // had it not been filtered out first.
+        let ceiling = 0;
+        let base_z = 1;
+        assert_eq!(cut_treatment(base_z, ceiling, true), CutTreatment::Hidden);
+
+        let tree = straight_trunk(base_z, 10);
+        let chunk = test_chunk(0, 0, ceiling);
+        let above = chunk_above(false, chunk.z, ceiling, true);
+        let mut volume = Volume::new(&chunk, above, Band::Near);
+        volume.absorb(&tree);
+        assert!(
+            count_filled(&volume) > 0,
+            "the volume's own headroom would have drawn this tree anyway; \
+             only the origin filter keeps a tree rooted above the ceiling off-screen"
+        );
     }
 
     /// Open air everywhere: nothing for a strand to hang into.
