@@ -85,6 +85,8 @@ pub struct Patch {
     pub rx: i32,
     pub ry: i32,
     pub vegetation: i32,
+    /// The tile's elevation on DF's own scale, for the tree line.
+    pub elevation: f32,
     /// The species mix, in the order DF listed the tile's tree materials.
     pub presets: Vec<Preset>,
     /// Species from the neighbouring region tiles that this tile does not
@@ -92,28 +94,110 @@ pub struct Patch {
     pub neighbours: Vec<Preset>,
 }
 
+/// Over how many tiles the density blends from what the fine map actually
+/// grows at the window's edge to what the region survey says.
+pub const BLEND: f32 = 200.0;
+/// How far out the fine map is searched for that cue, in 16-tile blocks: a
+/// little past the blend, so a region tile inside it always finds one.
+pub const BLEND_BLOCKS: i32 = 14;
+/// How far a crown keeps clear of a site building's footprint, in tiles. A
+/// fortress or a tower stands in a clearing, not in a thicket.
+pub const CLEARING: f32 = 6.0;
+
+/// Where the tree line is, on DF's own elevation scale: 0 to 99 ocean, 100 to
+/// 149 normal biomes, 150 and up mountains
+/// (`docs/dfhack-horizon-notes.md`). Nothing grows at or above it, and the
+/// density tapers to nothing over the levels below so the line is soft rather
+/// than a ring drawn round a peak.
+pub const TREELINE: f32 = 150.0;
+pub const TREELINE_TAPER: f32 = 10.0;
+
+/// How much of a region tile's density survives its elevation.
+pub fn treeline(elevation: f32) -> f32 {
+    ((TREELINE - elevation) / TREELINE_TAPER).clamp(0.0, 1.0)
+}
+
 /// How many crowns a region tile carries: linear in vegetation above the floor,
 /// faded to nothing between `NEAR` and `REACH`.
 pub fn crown_count(vegetation: i32, radius: f32) -> usize {
+    crown_count_near(vegetation, 100.0, radius, None)
+}
+
+/// The same, blended toward what the fine map is actually growing nearby.
+///
+/// `observed` is `(canopy cover 0..1 seen in the fine map, distance to that
+/// fine ground in tiles)` from `FineSurface::nearby_density`. A region tile's
+/// `vegetation` is a 48-tile average and says nothing about the clearing the
+/// character is standing in, so right at the window's edge the fine map wins
+/// outright and the survey takes over across [`BLEND`]: a treeless window edge
+/// gives a treeless surround, a dense one continues the forest.
+///
+/// Full cover maps to the survey's own full density, so the two ends of the
+/// blend are on one scale and neither can run away with the count.
+///
+/// Only the count changes, and the count is a prefix of the seeded list, so no
+/// tree moves.
+pub fn crown_count_near(
+    vegetation: i32,
+    elevation: f32,
+    radius: f32,
+    observed: Option<(f32, f32)>,
+) -> usize {
     let v = ((vegetation as f32 - FLOOR) / (100.0 - FLOOR)).clamp(0.0, 1.0);
+    let survey = PER_TILE * v;
+    let wanted = match observed {
+        Some((cover, distance)) => {
+            let seen = PER_TILE * cover.clamp(0.0, 1.0);
+            let t = (distance / BLEND).clamp(0.0, 1.0);
+            seen + (survey - seen) * t
+        }
+        None => survey,
+    };
     let fade = if radius <= NEAR {
         1.0
     } else {
         (1.0 - (radius - NEAR) / (REACH - NEAR)).clamp(0.0, 1.0)
     };
-    (PER_TILE * v * fade).round() as usize
+    (wanted.clamp(0.0, PER_TILE) * fade * treeline(elevation)).round() as usize
+}
+
+/// A site building's footprint, in render-local tiles, that crowns keep out of.
+#[derive(Clone, Copy, Debug)]
+pub struct Clearing {
+    pub x0: f32,
+    pub z0: f32,
+    pub x1: f32,
+    pub z1: f32,
+}
+
+impl Clearing {
+    /// Whether a point is inside the footprint or within [`CLEARING`] of it.
+    pub fn holds(&self, x: f32, z: f32) -> bool {
+        x >= self.x0 - CLEARING
+            && x <= self.x1 + CLEARING
+            && z >= self.z0 - CLEARING
+            && z <= self.z1 + CLEARING
+    }
 }
 
 /// Places a region tile's crowns, skipping any that fall where the fine map
 /// stands. Positions come out in a fixed order, so a smaller count is a prefix
 /// of a larger one.
-pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<(Preset, CrownInstance)>) {
+pub fn scatter(
+    patch: &Patch,
+    terrain: &Terrain,
+    window: &Window,
+    clearings: &[Clearing],
+    out: &mut Vec<(Preset, CrownInstance)>,
+) {
     if patch.presets.is_empty() {
         return;
     }
     let (ox, oz) = (patch.rx * REGION_TILE - window.origin.0, patch.ry * REGION_TILE - window.origin.1);
-    let radius = terrain.radius(ox + REGION_TILE / 2, oz + REGION_TILE / 2) as f32;
-    let count = crown_count(patch.vegetation, radius);
+    let (cx, cz) = (ox + REGION_TILE / 2, oz + REGION_TILE / 2);
+    let radius = terrain.radius(cx, cz) as f32;
+    let observed = terrain.fine.nearby_density(cx, cz, BLEND_BLOCKS);
+    let count = crown_count_near(patch.vegetation, patch.elevation, radius, observed);
     for k in 0..count {
         let seed = |salt: u32| hash(patch.rx, patch.ry, k as u32 * 8 + salt);
         let unit = |salt: u32| seed(salt) as f32 / u32::MAX as f32;
@@ -121,6 +205,11 @@ pub fn scatter(patch: &Patch, terrain: &Terrain, window: &Window, out: &mut Vec<
         let tz = oz + (unit(1) * REGION_TILE as f32) as i32;
         // The fine map draws its own trees here.
         if terrain.fine.covers(tx, tz) {
+            continue;
+        }
+        // A site stands in a clearing: nothing grows on its footprint or in
+        // the ground it keeps around itself.
+        if clearings.iter().any(|c| c.holds(tx as f32 + 0.5, tz as f32 + 0.5)) {
             continue;
         }
         let Some(level) = terrain.level_at(tx, tz) else { continue };
@@ -205,7 +294,7 @@ mod tests {
     }
 
     fn patch(presets: Vec<Preset>, neighbours: Vec<Preset>) -> Patch {
-        Patch { rx: 0, ry: 0, vegetation: 60, presets, neighbours }
+        Patch { rx: 0, ry: 0, vegetation: 60, elevation: 120.0, presets, neighbours }
     }
 
     /// Nearly every tree is the tile's own species; a few per cent stray in
@@ -231,6 +320,92 @@ mod tests {
             let got = pick(&p, 0.0, i as f32 / 2000.0, i);
             assert!(matches!(got, Preset::Oak | Preset::Birch), "{got:?} near the window");
         }
+    }
+
+    /// A treeless window edge gives a treeless surround: what the fine map
+    /// actually grows wins over the region tile's 48-tile average right at the
+    /// boundary, and the survey takes over across `BLEND`.
+    #[test]
+    fn the_fine_map_sets_the_density_at_its_own_edge() {
+        // A well vegetated region tile, so the survey alone would fill it.
+        let survey = crown_count(90, 0.0);
+        assert!(survey > 15, "{survey}");
+        // Fine ground right here, with nothing growing on it.
+        assert_eq!(crown_count_near(90, 100.0, 0.0, Some((0.0, 0.0))), 0);
+        // Half way out the two are mixed, and past the blend the survey is
+        // back in charge.
+        let midway = crown_count_near(90, 100.0, 0.0, Some((0.0, BLEND * 0.5)));
+        assert!(midway > 0 && midway < survey, "{midway} of {survey}");
+        assert_eq!(crown_count_near(90, 100.0, 0.0, Some((0.0, BLEND))), survey);
+        assert_eq!(crown_count_near(90, 100.0, 0.0, Some((0.0, BLEND * 4.0))), survey);
+        // A dense window edge continues the forest through a thin survey.
+        let thin = crown_count_near(20, 100.0, 0.0, None);
+        let dense = crown_count_near(20, 100.0, 0.0, Some((0.9, 0.0)));
+        assert!(dense > thin * 4, "{dense} against {thin}");
+        // And the cue can never ask for more than the survey's own full
+        // density, however wooded the window is.
+        assert!(crown_count_near(20, 100.0, 0.0, Some((5.0, 0.0))) <= PER_TILE as usize);
+    }
+
+    /// Nothing grows on a site's footprint or in the ground it keeps clear
+    /// around itself.
+    #[test]
+    fn a_site_footprint_is_a_clearing() {
+        let clearing = Clearing { x0: 10.0, z0: 20.0, x1: 30.0, z1: 40.0 };
+        assert!(clearing.holds(20.0, 30.0), "inside the footprint");
+        assert!(clearing.holds(10.0 - CLEARING + 0.5, 30.0), "just inside the margin");
+        assert!(!clearing.holds(10.0 - CLEARING - 1.0, 30.0), "clear of the margin");
+        assert!(!clearing.holds(20.0, 40.0 + CLEARING + 1.0), "clear to the south");
+    }
+
+    /// Nothing grows at the tree line, and the density tapers into it rather
+    /// than stopping on a contour.
+    #[test]
+    fn the_tree_line_is_soft() {
+        let at = |e: f32| crown_count_near(90, e, 0.0, None);
+        let lowland = at(100.0);
+        assert!(lowland > 0);
+        assert_eq!(at(TREELINE), 0, "trees grew on the mountain");
+        assert_eq!(at(TREELINE + 40.0), 0, "trees grew above the mountain");
+        assert_eq!(at(TREELINE - TREELINE_TAPER), lowland, "the taper reached too low");
+        let midway = at(TREELINE - TREELINE_TAPER * 0.5);
+        assert!(midway > 0 && midway < lowland, "{midway} of {lowland} halfway up");
+    }
+
+    /// A region tile that names no tree materials grows nothing, whatever its
+    /// vegetation says: `vegetation` counts grass and shrubs too.
+    #[test]
+    fn a_tile_with_no_species_grows_nothing() {
+        let field = crate::horizon::field::Field::default();
+        let fine = crate::horizon::fine::FineSurface::default();
+        let window = Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (72, 72) };
+        let skins = crate::horizon::skin::Skins::none();
+        let terrain = Terrain {
+            field: &field,
+            fine: &fine,
+            window: &window,
+            skins: &skins,
+            crown_near: NEAR,
+            crown_reach: REACH,
+        };
+        let mut out = Vec::new();
+        scatter(
+            &Patch {
+                rx: 0,
+                ry: 0,
+                vegetation: 100,
+                elevation: 120.0,
+                presets: Vec::new(),
+                // Even with wooded neighbours, a tile that names no species of
+                // its own stays bare.
+                neighbours: vec![Preset::Oak],
+            },
+            &terrain,
+            &window,
+            &[],
+            &mut out,
+        );
+        assert!(out.is_empty(), "{} crowns grew where DF names no trees", out.len());
     }
 
     #[test]

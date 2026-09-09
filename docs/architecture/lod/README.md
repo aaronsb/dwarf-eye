@@ -50,6 +50,12 @@ by projected tile size on screen, not by which source fed it.
 The three coarse bands are terraced to whole z-levels, so they step the way fine
 tiles do; only the world grid, where a level is under a pixel, stays smooth.
 
+The far band has a tree chain of its own, three stages deep, swapped by the
+camera's distance to each tree rather than by the window's centre
+([horizon.md](horizon.md)): a grown tree at one voxel to a tile, the canonical
+crown, then its box. It is the same rule as the canopy bands and the same
+`VisibilityRange` machinery; only the meshes differ.
+
 Canopy bands, all built from the same growth and spawned together. The edge is
 where that band's own leaf voxel falls to two pixels (`canopy.rs:Band::edge`);
 the crossfade is that edge widened to the distance the dither needs
@@ -184,14 +190,15 @@ tiles beyond `world.map.block_index`
 
 | Page | |
 |---|---|
-| [horizon.md](horizon.md) | the terraced far band: region and world maps, crowns, rivers, sites, the block mask and the stitch |
+| [horizon.md](horizon.md) | the terraced far band: region and world maps, the ground sprites it wears, its own three-stage tree chain, rivers, sites, the block mask and the stitched seam |
 
 ## Invariants and gotchas
 
 - The block mask is the whole of the arbitration between tiers. Fine geometry
   never yields; the coarse mesh discards over any block whose fine chunks reach
-  the ground, and at the rim of it a coarse cell snaps to the fine column's own
-  z-level (`horizon/terrace.rs:cell_level`), so the two surfaces are one plane.
+  the ground, and at the rim of it a coarse cell is drawn as a fan whose
+  fine-facing edge follows the fine tiles' own z-levels tile by tile
+  (`horizon/stitch.rs`), so the two surfaces are one plane.
 - `worker.rs:grounded_blocks` decides that: the lowest loaded chunk of a column
   must be at least half non-empty. A sparse lowest chunk is canopy with no
   ground under it.

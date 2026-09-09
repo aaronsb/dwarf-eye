@@ -282,6 +282,16 @@ struct HorizonStage(usize);
 /// — may begin.
 const SHADOW_DISTANCE: f32 = 150.0;
 
+/// How far the grown stage runs, as a multiple of the canopy's near band.
+///
+/// The projected-size rule would put it at four times that — a one-tile leaf
+/// voxel is two pixels out to four times where a quarter-tile one is — and the
+/// triangle budget will not carry it: a grown far tree is about eight hundred
+/// triangles and the count goes with the square of the reach. Half again is
+/// where a box crown starts reading as a box, which is what this stage exists
+/// to push back.
+const GROWN_REACH: f32 = 1.5;
+
 /// How much of a hand-off the far band's tree stages dither across. Wider than
 /// the canopy's, because the shapes either side differ more: a grown tree into
 /// a handful of boxes wants a long fade, and there is no cutout to pay for.
@@ -296,7 +306,7 @@ const HORIZON_CROSSFADE: f32 = 0.35;
 /// stage runs three times as far, and never stops short of the shadow
 /// cascades, so the one stage that casts no shadow is wholly outside them.
 fn horizon_ranges(near: f32) -> Vec<VisibilityRange> {
-    let edges = [near, (near * 3.0).max(SHADOW_DISTANCE)];
+    let edges = [near * GROWN_REACH, (near * 3.0).max(SHADOW_DISTANCE)];
     let fade = |at: f32| at..at * (1.0 + HORIZON_CROSSFADE);
     (0..=edges.len())
         .map(|stage| VisibilityRange {
@@ -522,7 +532,15 @@ pub struct HorizonMaterial(pub Handle<TerrainMat>);
 /// instead, which puts the same texel density on a box crown as on the near
 /// canopy whatever size the instance is (`cloud_shadow.wgsl:horizon_leaf`).
 #[derive(Resource)]
-pub struct HorizonCanopyMaterial(pub Handle<TerrainMat>);
+pub struct HorizonCanopyMaterial {
+    /// The grown stage: the canopy's own leaf shading, sky term and all, since
+    /// a grown tree's faces carry no shading of their own.
+    pub grown: Handle<TerrainMat>,
+    /// The two box stages. `crown.rs` already bakes a lit top and darker sides
+    /// into their vertex colours, and the sky term over that takes a box's
+    /// sides to nearly black.
+    pub boxes: Handle<TerrainMat>,
+}
 
 /// The blob shadows the box stage casts in place of a shadow-map shadow.
 #[derive(Resource)]
@@ -751,7 +769,15 @@ fn setup(
     far_leaf.base.diffuse_transmission = 0.0;
     // 2: a horizon material whose UVs the shader derives from world position.
     far_leaf.extension.uniform.horizon = 2.0;
-    commands.insert_resource(HorizonCanopyMaterial(materials.add(far_leaf)));
+    // A canonical crown is boxes with a lit top and darker sides already in
+    // their vertex colours; the sky term over that dims the sides twice and
+    // leaves a far crown reading as a black block.
+    let mut far_boxes = far_leaf.clone();
+    far_boxes.extension.uniform.canopy = 0.0;
+    commands.insert_resource(HorizonCanopyMaterial {
+        grown: materials.add(far_leaf),
+        boxes: materials.add(far_boxes),
+    });
 
     let mut blob = terrain(1.0);
     blob.base.base_color = Color::srgba(0.05, 0.06, 0.04, BLOB_ALPHA);
@@ -871,8 +897,12 @@ fn drain_worker(
                     .map(|s| format!("{:?} {}k", s, data.stage_triangles(*s) / 1000))
                     .collect();
                 status.detail = format!(
-                    "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances",
-                    per_stage.join(" / ")
+                    "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances; \
+                     fine map {:.2} canopy cover, {:.2} at the centre, {} clearings",
+                    per_stage.join(" / "),
+                    data.fine_density,
+                    data.edge_density,
+                    data.clearings,
                 );
                 commands.spawn((
                     Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),
@@ -900,11 +930,16 @@ fn drain_worker(
                         .map(|p| p[0].abs().max(p[2].abs()))
                         .fold(0.5f32, f32::max);
                     let mesh = meshes.add(to_bevy_mesh(batch.mesh));
+                    let coat = if batch.stage == TreeStage::Grown {
+                        far.canopy.grown.clone()
+                    } else {
+                        far.canopy.boxes.clone()
+                    };
                     for tree in &batch.instances {
                         let scale = tree.height / unit;
                         let mut entity = commands.spawn((
                             Mesh3d(mesh.clone()),
-                            MeshMaterial3d(far.canopy.0.clone()),
+                            MeshMaterial3d(coat.clone()),
                             Transform::from_translation(Vec3::from(tree.pos))
                                 .with_rotation(Quat::from_rotation_y(tree.yaw))
                                 .with_scale(Vec3::splat(scale)),

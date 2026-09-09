@@ -10,9 +10,14 @@ pub const WATER: Rgb = [60, 110, 190];
 /// reads against the darker ground shadow it sits on.
 pub const RIVER: Rgb = [70, 122, 198];
 pub const GRASS: Rgb = [96, 142, 62];
-/// Rainfall drives the grass hue between these two, so the midpoint lands on
+/// Rainfall drives the grass hue between these two, so the midpoint lands near
 /// `GRASS` and the fine map's tone is matched on average.
-const DRY_GRASS: Rgb = [150, 156, 90];
+///
+/// The dry end was measured against the fine window rather than guessed: at
+/// [150, 156, 90] a low-rainfall region tile beside the window rendered some
+/// thirty-five levels brighter than the fine grass it abutted, which is the
+/// colour step the seam used to show.
+const DRY_GRASS: Rgb = [128, 138, 76];
 const WET_GRASS: Rgb = [58, 138, 52];
 pub const CANOPY: Rgb = [66, 106, 52];
 pub const SNOW: Rgb = [226, 232, 240];

@@ -37,7 +37,18 @@ const SURFACE_PERCENTILE: usize = 30;
 pub struct FineSurface {
     tops: HashMap<(i32, i32), i32>,
     tiles: HashMap<(i32, i32), i32>,
+    canopy: HashMap<(i32, i32), f32>,
 }
+
+/// How far above its column's own ground a tile has to stand before it counts
+/// as canopy rather than as relief. A DF tree clears several levels before it
+/// forks; a hillock inside one block rarely does.
+const CANOPY_LIFT: i32 = 4;
+
+/// How far above the column's level the ground is looked for, in levels. High
+/// enough that a hill inside one block still resolves, low enough that a crown
+/// over the tile is passed by.
+const GROUND_MARGIN: i32 = 12;
 
 impl FineSurface {
     pub fn survey(world: &World) -> Self {
@@ -54,6 +65,7 @@ impl FineSurface {
 
         let mut tops = HashMap::new();
         let mut tiles = HashMap::new();
+        let mut canopy = HashMap::new();
         for (key, floor) in lowest {
             let Some(chunk) = world.chunk(key.0, key.1, floor) else { continue };
             let filled = chunk.voxels.iter().filter(|v| !v.solid.is_empty()).count();
@@ -61,8 +73,11 @@ impl FineSurface {
                 continue;
             }
             let (z_lo, z_hi) = levels[&key];
+            // First pass: the highest solid over every tile. Over a wood that
+            // is the canopy, which is exactly why the column's own level is a
+            // low percentile of it.
             let mut surface = Vec::with_capacity((BLOCK * BLOCK) as usize);
-            let mut found = Vec::with_capacity((BLOCK * BLOCK) as usize);
+            let mut highest = Vec::with_capacity((BLOCK * BLOCK) as usize);
             for y in 0..BLOCK {
                 for x in 0..BLOCK {
                     let (tx, ty) = (key.0 * BLOCK + x, key.1 * BLOCK + y);
@@ -71,7 +86,7 @@ impl FineSurface {
                             && v.solid != Solid::Empty
                         {
                             surface.push(z);
-                            found.push(((tx, ty), z));
+                            highest.push(((tx, ty), z));
                             break;
                         }
                     }
@@ -80,11 +95,37 @@ impl FineSurface {
             if surface.is_empty() {
                 continue;
             }
-            tiles.extend(found);
             surface.sort_unstable();
-            tops.insert(key, surface[surface.len() * SURFACE_PERCENTILE / 100]);
+            let level = surface[surface.len() * SURFACE_PERCENTILE / 100];
+            tops.insert(key, level);
+
+            // Second pass: the ground under each tile, searched from a little
+            // above the column's own level rather than from the sky, so a
+            // crown standing over the tile is passed by. Searching from the
+            // top put the stitch on the treetops.
+            let ceiling = z_hi.min(level + GROUND_MARGIN);
+            for y in 0..BLOCK {
+                for x in 0..BLOCK {
+                    let (tx, ty) = (key.0 * BLOCK + x, key.1 * BLOCK + y);
+                    for z in (z_lo..=ceiling).rev() {
+                        if let Some(v) = world.voxel(tx, ty, z)
+                            && v.solid != Solid::Empty
+                        {
+                            tiles.insert((tx, ty), z);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // How much of the column stands well above its own ground: the
+            // canopy's shadow on the map, and the only cue to how wooded this
+            // ground is that needs no tiletype table.
+            let covered =
+                highest.iter().filter(|(_, z)| *z >= level + CANOPY_LIFT).count();
+            canopy.insert(key, covered as f32 / highest.len().max(1) as f32);
         }
-        Self { tops, tiles }
+        Self { tops, tiles, canopy }
     }
 
     /// Whether the fine map covers the block column holding a render-local
@@ -139,6 +180,57 @@ impl FineSurface {
         self.tiles.len()
     }
 
+    /// How wooded the fine map is near a coarse point, and how far off that
+    /// fine ground is.
+    ///
+    /// The far band's density comes from a region tile's `vegetation`, which is
+    /// a 48-tile average and says nothing about the clearing the character is
+    /// standing in. This is the cue that does: the fraction of the nearest
+    /// block columns standing `CANOPY_LIFT` levels or more above their own
+    /// ground, and the distance to them, so a scatter can blend from what is
+    /// really there at the window's edge to what the survey says further out.
+    ///
+    /// Canopy cover rather than a tree count, because counting trees needs a
+    /// tiletype table this does not have: `Voxel`'s tree offsets are only
+    /// meaningful on tiles that are already known to be part of a tree, and
+    /// read as a predicate they call most of the map a forest.
+    ///
+    /// Returned as a cover fraction 0..1 and a distance in tiles. The search is
+    /// a widening ring of block columns and stops at `reach` blocks.
+    pub fn nearby_density(&self, tx: i32, tz: i32, reach: i32) -> Option<(f32, f32)> {
+        if self.canopy.is_empty() {
+            return None;
+        }
+        let (bx, bz) = (tx.div_euclid(BLOCK), tz.div_euclid(BLOCK));
+        for r in 0..=reach {
+            let (mut sum, mut n) = (0.0f32, 0usize);
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dz.abs() != r {
+                        continue;
+                    }
+                    if let Some(cover) = self.canopy.get(&(bx + dx, bz + dz)) {
+                        sum += *cover;
+                        n += 1;
+                    }
+                }
+            }
+            if n > 0 {
+                let distance = ((r - 1).max(0) * BLOCK) as f32;
+                return Some((sum / n as f32, distance));
+            }
+        }
+        None
+    }
+
+    /// Canopy cover over the whole fine map, for a report.
+    pub fn mean_density(&self) -> f32 {
+        if self.canopy.is_empty() {
+            return 0.0;
+        }
+        self.canopy.values().sum::<f32>() / self.canopy.len() as f32
+    }
+
     #[cfg(test)]
     pub fn from_columns(columns: &[((i32, i32), i32)]) -> Self {
         let mut tiles = HashMap::new();
@@ -149,7 +241,15 @@ impl FineSurface {
                 }
             }
         }
-        Self { tops: columns.iter().copied().collect(), tiles }
+        Self { tops: columns.iter().copied().collect(), tiles, canopy: HashMap::new() }
+    }
+
+    /// Sets the canopy cover of some block columns, for a test that needs a
+    /// wooded or a bare window edge.
+    #[cfg(test)]
+    pub fn with_canopy(mut self, cover: &[((i32, i32), f32)]) -> Self {
+        self.canopy = cover.iter().copied().collect();
+        self
     }
 
     #[cfg(test)]
