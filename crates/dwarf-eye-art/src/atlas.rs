@@ -50,6 +50,9 @@ pub struct Atlas {
     slots: HashMap<u64, Rect>,
     next: u32,
     white: Rect,
+    /// Set the first time [`Atlas::insert`] is refused for want of room, so
+    /// the warning fires once instead of once per sprite past the cap.
+    overflowed: bool,
 }
 
 impl Atlas {
@@ -62,6 +65,7 @@ impl Atlas {
             slots: HashMap::new(),
             next: 0,
             white: Rect { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0 },
+            overflowed: false,
         };
         // Slot zero is opaque white, so untextured geometry can share the
         // material without being tinted by it.
@@ -78,6 +82,13 @@ impl Atlas {
 
     pub fn capacity_used(&self) -> u32 {
         self.next
+    }
+
+    /// Whether a pack has already been refused for want of room. A caller
+    /// that skips a missing [`Rect`] silently can check this once, after
+    /// filling the atlas, to tell a genuine miss from a full atlas.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     fn claim(&mut self) -> u32 {
@@ -134,6 +145,14 @@ impl Atlas {
             return Some(*found);
         }
         if self.next >= GRID * GRID {
+            if !self.overflowed {
+                self.overflowed = true;
+                log::warn!(
+                    "atlas: capacity of {} cells reached; further sprites will not appear \
+                     (raise GRID or pack fewer sprites)",
+                    GRID * GRID
+                );
+            }
             return None;
         }
 
@@ -181,5 +200,43 @@ impl Atlas {
 impl Default for Atlas {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Sprite;
+
+    fn blank_sprite() -> Sprite {
+        Sprite {
+            width: CELL,
+            height: CELL,
+            pixels: vec![[255, 255, 255, 255]; (CELL * CELL) as usize],
+        }
+    }
+
+    /// A synthetic overflow: fill every slot [`Atlas::new`] left, past the
+    /// white one, then ask for one more. Issue #25 — this used to fail
+    /// silently with no signal a caller could tell from a genuine miss.
+    #[test]
+    fn insert_refuses_past_capacity_and_warns_once() {
+        let mut atlas = Atlas::new();
+        assert!(!atlas.overflowed());
+        // Slot 0 is already claimed by the white cell.
+        for key in 0..(GRID * GRID - 1) as u64 {
+            assert!(atlas.insert(key, &blank_sprite(), None).is_some(), "slot {key} should fit");
+        }
+        assert!(!atlas.overflowed(), "the atlas is exactly full, not yet refused");
+
+        assert!(atlas.insert(u64::MAX, &blank_sprite(), None).is_none());
+        assert!(atlas.overflowed());
+
+        // A second refusal must not panic or double-count; the flag just stays set.
+        assert!(atlas.insert(u64::MAX - 1, &blank_sprite(), None).is_none());
+        assert!(atlas.overflowed());
+
+        // A key already packed is still served from cache once full.
+        assert!(atlas.insert(0, &blank_sprite(), None).is_some());
     }
 }

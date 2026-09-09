@@ -40,10 +40,12 @@ per-family wall report; the worker's status line prints the count alone.
 | walls: 8 sheets x (15 neighbour variants + 1 side face) | 128 |
 | total, of a 1024 cap | 309 |
 
-`texture.rs:atlas_image` builds `MIP_LEVELS` 4 levels below the base by 2x2 box
+`texture.rs:atlas_image` builds `MIP_LEVELS` levels below the base by 2x2 box
 filtering in linear light with alpha-weighted colour (`texture.rs:downsample`),
 so transparent texels do not darken a sprite's edge. The sampler clamps,
-magnifies nearest and minifies linear with linear mip filtering.
+magnifies nearest and minifies linear with linear mip filtering. `MIP_LEVELS`
+is `atlas::PAD.trailing_zeros()` rather than its own literal, so it is 4 today
+because `PAD` is 16, and follows if `PAD` ever changes (issue #25).
 
 ## Texel density
 
@@ -61,11 +63,17 @@ over it, clamped to 4..128. Voxel resolution is separate:
 ## Invariants and gotchas
 
 - Capacity is 1024 cells and `Atlas::insert` returns `None` past that. Every
-  caller skips silently, so sprites simply stop appearing. Ramps cost 47 cells
-  per family and walls 16 per sheet.
-- `PAD` 16 in `dwarf-eye-art` and `MIP_LEVELS` 4 in `dwarf-eye` encode the same
-  invariant in two crates. Four halvings leave a 4-pixel cell with a pixel of
-  its own bleed each side; more levels, or less padding, bleeds neighbours in.
+  caller still skips a `None` silently, so a sprite past the cap simply stops
+  appearing, but `insert` itself now logs a `warn!` the first time it refuses
+  a pack and latches `Atlas::overflowed()`, so the cap being hit is visible in
+  the log and queryable after `TileLibrary::load` even though no caller checks
+  it yet (issue #25). Ramps cost 47 cells per family and walls 16 per sheet.
+- `PAD` 16 in `dwarf-eye-art` and `MIP_LEVELS` in `dwarf-eye` encode one
+  invariant: `MIP_LEVELS` is derived as `PAD.trailing_zeros()`, so there is
+  nothing left to fall out of sync. Four halvings leave a 4-pixel cell with a
+  pixel of its own bleed each side; more levels, or less padding, bleeds
+  neighbours in. `dwarf-eye/src/texture.rs::tests::pad_covers_the_mip_chain`
+  pins `PAD >= 2^MIP_LEVELS`.
 - `DWARF_EYE_NO_MIPS` triggers on presence, so `DWARF_EYE_NO_MIPS=0` still
   disables mipmaps.
 - The atlas is uploaded once. Anything packed after `TileLibrary::load` never
@@ -85,4 +93,6 @@ over it, clamped to 4..128. Voxel resolution is separate:
 
 ## Related issues
 
-#13 (closed, the 128 wall cells; [walls.md](walls.md)).
+#13 (closed, the 128 wall cells; [walls.md](walls.md)). #25 (streamer UVs, the
+`PAD`/`MIP_LEVELS` split, and this overflow warning; see also
+[canopy.md](canopy.md)).

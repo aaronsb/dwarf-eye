@@ -50,7 +50,7 @@ pub mod texture;
 pub use crown::{crown, crown_box, crown_triangles};
 pub use grow::{LeafCluster, Segment, Skeleton, Streamer, grow};
 pub use math::{IVec3, Vec3, ivec3, vec3};
-pub use mesh::{Stats, TreeMesh, mesh, mesh_of, stats};
+pub use mesh::{Stats, TreeMesh, mesh, mesh_of, mesh_of_texels, mesh_texels, stats};
 pub use params::{
     Envelope, Footprint, Habit, Palette, Preset, Rgb, TreeParams, VegetationKind, birch, bush,
     dead_tree, mushroom_tree, oak, pine, sapling, shrub, spruce, tall_grass, willow,

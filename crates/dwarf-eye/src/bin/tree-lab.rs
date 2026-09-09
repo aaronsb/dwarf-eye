@@ -39,7 +39,7 @@ use shadow::{
     CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
 };
 use dwarf_eye_trees::texture::{self, Texels};
-use dwarf_eye_trees::{Cut, Habit, Kind, Preset, TreeParams, grow, mesh_of, rasterise_cut};
+use dwarf_eye_trees::{Cut, Habit, Kind, Preset, TreeParams, grow, mesh_of_texels, rasterise_cut};
 use dwarf_eye_world::canopy;
 
 /// Tiles between trunks along a row.
@@ -296,10 +296,14 @@ fn handle_input(
     if keys.just_pressed(KeyCode::Minus) && texels.per_tile > 4 {
         texels.per_tile /= 2;
         texels.dirty = true;
+        // The strip is regenerated at the new density; the streamer quads
+        // must be remeshed at it too or their UVs drift off its cells (#25).
+        lab.dirty = true;
     }
     if keys.just_pressed(KeyCode::Equal) && texels.per_tile < 128 {
         texels.per_tile *= 2;
         texels.dirty = true;
+        lab.dirty = true;
     }
     if keys.just_pressed(KeyCode::KeyR) {
         lab.seed = lab.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -350,6 +354,7 @@ fn rebuild(
     mut report: ResMut<Report>,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<Materials>,
+    texels: Res<TexelDensity>,
     existing: Query<Entity, With<Tree>>,
 ) {
     if !lab.dirty {
@@ -386,7 +391,7 @@ fn rebuild(
             (Kind::Leaf, materials.leaves[&preset].clone()),
             (Kind::Streamer, materials.streamers.clone()),
         ] {
-            let built = mesh_of(&voxels, Some(kind));
+            let built = mesh_of_texels(&voxels, Some(kind), texels.per_tile);
             if built.indices.is_empty() {
                 continue;
             }

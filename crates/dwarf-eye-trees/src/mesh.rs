@@ -8,6 +8,11 @@ use crate::raster::{Kind, VoxelTree};
 use crate::rng::hash_unit;
 use crate::texture::{DEFAULT_TEXELS, STREAMER_CELLS, STREAMER_TIP, streamer_uv};
 
+// `mesh`/`mesh_of` keep their old two- and one-argument shapes for the callers
+// that predate texel-density plumbing (`dwarf-eye-world::canopy`, the crate's
+// own `build`); `mesh_of_texels` is where the live density actually lands, and
+// they are thin wrappers over it at `DEFAULT_TEXELS`.
+
 #[derive(Clone, Debug, Default)]
 pub struct TreeMesh {
     pub positions: Vec<[f32; 3]>,
@@ -57,19 +62,35 @@ pub fn stats(tree: &VoxelTree) -> Stats {
     }
 }
 
-/// Mesh everything, bark and leaves in one buffer.
+/// Mesh everything, bark and leaves in one buffer, at [`DEFAULT_TEXELS`].
 pub fn mesh(tree: &VoxelTree) -> TreeMesh {
     mesh_of(tree, None)
 }
 
-/// Mesh one kind, or all of it when `only` is `None`.
+/// Mesh one kind, or all of it when `only` is `None`, at [`DEFAULT_TEXELS`].
 ///
 /// Positions are in tiles, with the trunk's base at the origin.
 pub fn mesh_of(tree: &VoxelTree, only: Option<Kind>) -> TreeMesh {
+    mesh_of_texels(tree, only, DEFAULT_TEXELS)
+}
+
+/// Mesh everything at a caller-chosen texel density. See [`mesh_of_texels`].
+pub fn mesh_texels(tree: &VoxelTree, texels: u32) -> TreeMesh {
+    mesh_of_texels(tree, None, texels)
+}
+
+/// Mesh one kind, or all of it when `only` is `None`, addressing streamer
+/// quads against a [`crate::texture::streamer_strip`] generated at `texels`.
+/// The strip is regenerated whenever `DWARF_EYE_TEXELS` changes, so a caller
+/// that does the same must mesh at the same density or the strand segments
+/// drift off their cells (issue #25).
+///
+/// Positions are in tiles, with the trunk's base at the origin.
+pub fn mesh_of_texels(tree: &VoxelTree, only: Option<Kind>, texels: u32) -> TreeMesh {
     let mut out = TreeMesh::default();
     if only.is_none_or(|k| k == Kind::Streamer) {
         for strand in &tree.streamers {
-            emit_streamer(&mut out, strand, tree.voxels_per_tile);
+            emit_streamer(&mut out, strand, tree.voxels_per_tile, texels);
         }
     }
     if only == Some(Kind::Streamer) {
@@ -174,7 +195,7 @@ pub fn mesh_of(tree: &VoxelTree, only: Option<Kind>) -> TreeMesh {
 /// above so the strand can bend, all in one seeded vertical plane. The material
 /// draws them double sided, so a strand reads from any angle for two triangles
 /// a segment.
-fn emit_streamer(out: &mut TreeMesh, strand: &Streamer, voxels_per_tile: u32) {
+fn emit_streamer(out: &mut TreeMesh, strand: &Streamer, voxels_per_tile: u32, texels: u32) {
     let step = 1.0 / voxels_per_tile.max(1) as f32;
     let count = (strand.length / step).round().max(1.0) as u32;
     // Across the strand, in its plane; the normal is the other way.
@@ -198,7 +219,7 @@ fn emit_streamer(out: &mut TreeMesh, strand: &Streamer, voxels_per_tile: u32) {
         } else {
             (hash_unit(n as i32, 1, 0, strand.seed) * (STREAMER_CELLS - 1) as f32) as u32
         };
-        let [[u0, v0], [u1, v1]] = streamer_uv(cell, DEFAULT_TEXELS);
+        let [[u0, v0], [u1, v1]] = streamer_uv(cell, texels);
         let edge = |p: [f32; 3], side: f32| {
             [p[0] + across[0] * half * side, p[1], p[2] + across[2] * half * side]
         };
@@ -277,4 +298,57 @@ fn emit(
     let order: [u32; 6] =
         if sign > 0 { [0, 1, 2, 0, 2, 3] } else { [0, 2, 1, 0, 3, 2] };
     out.indices.extend(order.iter().map(|o| start + o));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::vec3;
+
+    fn one_strand_tree() -> VoxelTree {
+        let strand = Streamer {
+            anchor: vec3(0.0, 1.0, 0.0),
+            yaw: 0.3,
+            length: 0.6,
+            drift: 0.1,
+            color: Rgb(200, 200, 200),
+            seed: 7,
+        };
+        VoxelTree { voxels: Default::default(), streamers: vec![strand], voxels_per_tile: 4 }
+    }
+
+    /// A strand segment's UV must land inside the [`streamer_uv`] cell the
+    /// strip was actually generated at, at any texel density: issue #25 was
+    /// `emit_streamer` addressing a strip baked at the live density with UVs
+    /// computed at the hardcoded `DEFAULT_TEXELS`.
+    #[test]
+    fn streamer_uvs_track_the_live_texel_density() {
+        for texels in [16u32, 64] {
+            let tree = one_strand_tree();
+            let built = mesh_of_texels(&tree, Some(Kind::Streamer), texels);
+            assert!(!built.uvs.is_empty(), "no streamer quads at {texels} texels");
+
+            for [u, _v] in &built.uvs {
+                assert!((0.0..=1.0).contains(u), "u {u} out of range at {texels} texels");
+                // A valid UV must land inside exactly one of the strip's own
+                // cells, not in the seam a mismatched density would put it in.
+                let inside = (0..STREAMER_CELLS).any(|cell| {
+                    let [[u0, _], [u1, _]] = streamer_uv(cell, texels);
+                    *u >= u0 - 1e-4 && *u <= u1 + 1e-4
+                });
+                assert!(inside, "u {u} lands outside every strip cell at {texels} texels");
+            }
+        }
+    }
+
+    /// Meshing at the crate default must still match the old two-argument
+    /// entry points, so callers that have not been threaded onto a live
+    /// density (`dwarf-eye-world::canopy`) see no change in behaviour.
+    #[test]
+    fn mesh_of_matches_mesh_of_texels_at_the_default() {
+        let tree = one_strand_tree();
+        let a = mesh_of(&tree, Some(Kind::Streamer));
+        let b = mesh_of_texels(&tree, Some(Kind::Streamer), DEFAULT_TEXELS);
+        assert_eq!(a.uvs, b.uvs);
+    }
 }

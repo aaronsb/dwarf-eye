@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 bevy = "0.19.1"
 dfhack-remote = { path = "../dfhack-remote" }
+dwarf-eye-art = { path = "../dwarf-eye-art" }
 dwarf-eye-world = { path = "../dwarf-eye-world" }
 dwarf-eye-trees = { path = "../dwarf-eye-trees" }
 
