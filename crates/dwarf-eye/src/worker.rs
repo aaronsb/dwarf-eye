@@ -5,13 +5,13 @@
 //! and it is cheaper to mesh next to the data than to ship the data across.
 
 use crate::clouds::Weather;
+use crate::polls;
 use crate::walk::Pilot;
 use anyhow::Result;
 use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::canopy::{BANDS, CanopyMeshes, Forest};
-use dwarf_eye_world::clock;
-use dwarf_eye_world::weather::{self, Precip};
+use dwarf_eye_world::weather::Precip;
 use dwarf_eye_world::{BLOCK, BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, OnceLock};
@@ -28,12 +28,8 @@ pub enum Command {
     Fetch { center: (i32, i32, i32), opts: MeshOptions, force: bool },
     /// Remesh what is already loaded, without going back to DFHack.
     Remesh { opts: MeshOptions },
-    /// Read the game's calendar.
-    Clock,
     /// Run a DFHack console command, for driving the world while testing.
     Run { command: String, args: Vec<String> },
-    /// Read the world's cloud cover.
-    Weather,
     Shutdown,
 }
 
@@ -106,14 +102,20 @@ pub struct Bridge {
 impl Bridge {
     /// Spawns the worker thread and returns the channel pair to talk to it.
     pub fn spawn() -> Self {
+        // Every startup timestamp is measured from here.
+        polls::started();
         let (tx, command_rx) = channel();
         let (event_tx, rx) = channel();
         let origin: Arc<OnceLock<(i32, i32, i32)>> = Arc::default();
         let theirs = Arc::clone(&origin);
+        // The clock and the sky ride their own connection, so neither waits on
+        // a pass; the worker only tells it whether there is a roof overhead.
+        let sky = polls::sky_open();
+        polls::spawn(event_tx.clone(), Arc::clone(&sky));
         thread::Builder::new()
             .name("dfhack".into())
             .spawn(move || {
-                if let Err(err) = run(command_rx, &event_tx, &theirs) {
+                if let Err(err) = run(command_rx, &event_tx, &theirs, &sky) {
                     let _ = event_tx.send(Event::Failed(format!("{err:#}")));
                 }
             })
@@ -126,8 +128,9 @@ fn run(
     commands: Receiver<Command>,
     events: &Sender<Event>,
     origin: &OnceLock<(i32, i32, i32)>,
+    sky: &polls::SkyOpen,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
+    let started = polls::started();
     let mut df = Session::connect_local()?;
     // Walk mode places its own position reads against this.
     let _ = origin.set(df.origin());
@@ -219,9 +222,6 @@ fn run(
     let mut first_pass = true;
 
     let mut horizon_sent = false;
-    // Where the camera last asked for map, which is where the weather poll looks
-    // up for a roof.
-    let mut last_center: Option<(i32, i32, i32)> = None;
     loop {
         let command = match commands.try_recv() {
             Ok(c) => c,
@@ -244,76 +244,7 @@ fn run(
                     Err(e) => events.send(Event::Status(format!("`{command}` failed: {e}")))?,
                 }
             }
-            Command::Weather => {
-                // The protocol carries five cloud bits and nothing else, so the
-                // precipitation grid, the stratus countdown and the moon come
-                // back through Lua the way the clock does.
-                let probed = df.client.run_command("lua", &[weather::PROBE]).is_ok();
-                let reading = probed
-                    .then(|| weather::parse(&df.client.last_notices.concat()))
-                    .flatten();
-                match reading {
-                    Some(r) => {
-                        let outdoors = last_center.is_none_or(|c| open_sky(&df.world, c));
-                        bevy::log::info!(
-                            "weather: {}{}",
-                            r.describe(),
-                            if outdoors { "" } else { ", under a ceiling" }
-                        );
-                        events.send(Event::Weather(WeatherReport {
-                            sky: Weather {
-                                cumulus: r.cumulus_cover(),
-                                stratus: r.stratus_cover(),
-                                cirrus: r.cirrus_cover(),
-                                fog: r.fog_cover(),
-                                countdown: r.stratus_countdown(),
-                            },
-                            precip: r.at_character(),
-                            intensity: r.intensity(),
-                            snow: r.snow_cover(),
-                            moon: r.moon(),
-                            outdoors,
-                        }))?;
-                    }
-                    // No script interpreter, or no world data: the world map
-                    // still carries the cloud kinds.
-                    None => {
-                        if let Ok(map) =
-                            df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP)
-                        {
-                            events.send(Event::Weather(WeatherReport {
-                                sky: read_weather(&map),
-                                ..Default::default()
-                            }))?;
-                        }
-                    }
-                }
-            }
-            Command::Clock => {
-                // Adventure mode abandons cur_year_tick, so read every clock
-                // global and let the reading pick the one its mode keeps.
-                let probed = df.client.run_command("lua", &[clock::PROBE]).is_ok();
-                let reading = probed
-                    .then(|| clock::parse(&df.client.last_notices.concat()))
-                    .flatten();
-                match reading {
-                    Some(r) => events.send(Event::Clock { year: r.year, tick: r.year_tick() })?,
-                    // The Lua path needs a script interpreter; the map center
-                    // is always there.
-                    None => {
-                        if let Ok(map) =
-                            df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP_CENTER)
-                        {
-                            events.send(Event::Clock {
-                                year: map.cur_year(),
-                                tick: map.cur_year_tick(),
-                            })?;
-                        }
-                    }
-                }
-            }
             Command::Fetch { center, opts, force } => {
-                last_center = Some(center);
                 let pass_started = std::time::Instant::now();
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
@@ -327,6 +258,9 @@ fn run(
                         Default::default()
                     }
                 };
+                // The voxels that answer this live here, and the weather poll,
+                // on its own connection, only reads the answer.
+                sky.store(open_sky(&df.world, center), std::sync::atomic::Ordering::Relaxed);
                 if first_pass {
                     first_pass = false;
                     bevy::log::info!(
@@ -369,67 +303,6 @@ fn open_sky(world: &dwarf_eye_world::World, center: (i32, i32, i32)) -> bool {
     let (x, y, z) = center;
     !(1..=CEILING_SEARCH)
         .any(|up| world.voxel(x, y, z + up).is_some_and(|v| !v.solid.is_empty()))
-}
-
-/// Reads cloud cover over the embark out of the world map.
-///
-/// DF reports a cloud kind per world tile on four-step scales, so each becomes a
-/// coverage fraction. The neighbourhood is averaged because a single world tile
-/// flips between states more abruptly than a sky should.
-fn read_weather(map: &rfr::WorldMap) -> Weather {
-    use dfhack_remote::rfr::{CumulusType, FogType, StratusType};
-
-    let width = map.world_width.max(1);
-    let height = map.world_height.max(1);
-    let (cx, cy) = (map.map_x(), map.map_y());
-
-    let mut totals = [0.0f32; 4];
-    let mut samples = 0.0f32;
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            let (x, y) = (cx + dx, cy + dy);
-            if x < 0 || y < 0 || x >= width || y >= height {
-                continue;
-            }
-            let Some(cloud) = map.clouds.get((y * width + x) as usize) else { continue };
-            // The same scales `weather::Reading` puts the Lua kinds on, so the
-            // two paths draw the same sky.
-            use weather::{CIRRUS_COVER, CUMULUS_COVER, FOG_COVER, STRATUS_COVER};
-            totals[0] += match cloud.cumulus() {
-                CumulusType::CumulusNone => CUMULUS_COVER[0],
-                CumulusType::CumulusMedium => CUMULUS_COVER[1],
-                CumulusType::CumulusMulti => CUMULUS_COVER[2],
-                CumulusType::CumulusNimbus => CUMULUS_COVER[3],
-            };
-            totals[1] += match cloud.stratus() {
-                StratusType::StratusNone => STRATUS_COVER[0],
-                StratusType::StratusAlto => STRATUS_COVER[1],
-                StratusType::StratusProper => STRATUS_COVER[2],
-                StratusType::StratusNimbus => STRATUS_COVER[3],
-            };
-            totals[2] += if cloud.cirrus() { CIRRUS_COVER } else { 0.0 };
-            totals[3] += match cloud.fog() {
-                FogType::FogNone => FOG_COVER[0],
-                FogType::FogMist => FOG_COVER[1],
-                FogType::FogNormal => FOG_COVER[2],
-                // DFHack's proto spells this one `F0G_THICK`, with a zero.
-                FogType::F0gThick => FOG_COVER[3],
-            };
-            samples += 1.0;
-        }
-    }
-
-    if samples == 0.0 {
-        return Weather::default();
-    }
-    Weather {
-        cumulus: totals[0] / samples,
-        stratus: totals[1] / samples,
-        cirrus: totals[2] / samples,
-        fog: totals[3] / samples,
-        // The plugin drops the countdown bits; only the Lua probe has them.
-        countdown: 0.0,
-    }
 }
 
 /// Meshes every loaded chunk and ships the results in batches.
