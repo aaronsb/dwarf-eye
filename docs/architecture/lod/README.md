@@ -74,8 +74,8 @@ crossfade is that edge widened to the distance the dither needs
 | Band | Voxels per tile | Ends at | Crossfade | Carries | Meshes per chunk | Material |
 |---|---|---|---|---|---|---|
 | near | 4 (`tree.rs:DETAIL`) | N, 73 tiles | 63..83 | trees, plants, tufts, strands | up to 4 | bark, broadleaf and needle cutouts, leaflet strip |
-| close | 3 (`canopy.rs:CLOSE_DETAIL`) | 4N/3, 145 tiles | 128..165 | trees and strands | up to 4 | the same four |
-| mid | 2 (`canopy.rs:MID_DETAIL`) | 2N, 217 tiles | 181..261 | trees and strands | up to 4 | the same four |
+| close | 3 (`canopy.rs:CLOSE_DETAIL`) | 4N/3, 97 tiles | 85..110 | trees and strands | up to 4 | the same four |
+| mid | 2 (`canopy.rs:MID_DETAIL`) | 2N, 145 tiles | 121..174 | trees and strands | up to 4 | the same four |
 | far | 1 (`canopy.rs:FAR_DETAIL`) | far plane | — | trees only | 1 | one opaque leaf material, bark included |
 
 The steps are 4, 3, 2, 1 rather than 4, 2, 1: no hand-off doubles the voxel, and
@@ -146,7 +146,7 @@ it, in blocks.
 Every later hand-off is the same rule on that band's own leaf voxel, which is
 `DETAIL / detail` times as wide and so stays at the threshold that many times further
 out (`canopy.rs:Band::edge`): the close band reaches 4N/3, the mid band's
-half-tile voxel 2N, 217 tiles at 720, and the far band runs from there to the
+half-tile voxel 2N, 145 tiles at 720, and the far band runs from there to the
 camera's far plane.
 
 The bands are a list, not a pair, and the list is the factory's:
