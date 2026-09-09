@@ -39,7 +39,18 @@ function needs. Agents given a task receive the same rule and the page path.
 - The game clock belongs to the player. For lighting checks use a viewer-side
   override where one exists; if the clock must move, restore it right after.
 - The chunk cache under `~/.cache/dwarf-eye/` is shared with the user's
-  instance. Bump a format version instead of deleting files.
+  instance. Bump a format version instead of deleting files. A private copy for
+  a verification run copies only the world directory
+  (`~/.cache/dwarf-eye/<world>-<save>/`), never the cache root: agent build
+  dirs live there too (`target-<agent>`, removed when the agent finishes) and
+  a full copy filled /tmp once.
+- Every viewer launch is a forced pass on the player's game and a share of
+  their GPU: state a launch budget in each brief, quit each instance the moment
+  its shot lands, and never `pkill`.
+- Remove an agent's worktree only after its final report; a follow-up message
+  resumes the agent inside it. Agents edit only paths under their worktree.
+- `cargo fmt --check` fails repo-wide (no rustfmt.toml; house style is not
+  rustfmt's). Match surrounding style; do not reformat files.
 
 ## Testing and validation
 
