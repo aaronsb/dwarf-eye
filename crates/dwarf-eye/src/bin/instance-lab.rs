@@ -64,7 +64,10 @@ fn env<T: std::str::FromStr>(key: &str) -> Option<T> {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window { title: "instance-lab".into(), ..default() }),
+            primary_window: Some(Window {
+                title: "instance-lab".into(),
+                ..default()
+            }),
             ..default()
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
@@ -84,7 +87,9 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut instanced: ResMut<Instanced>,
 ) {
-    commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::earth(256, 256))));
+    commands.spawn(Atmosphere::earth(
+        mediums.add(ScatteringMedium::earth(256, 256)),
+    ));
 
     let (x, y, z, yaw, pitch) = env::<String>("INSTANCE_LAB_CAM")
         .and_then(|s| {
@@ -94,9 +99,15 @@ fn setup(
         .unwrap_or((0.0, 3.0, 300.0, 0.0, -2.0));
     commands.spawn((
         Camera3d::default(),
-        Projection::Perspective(PerspectiveProjection { far: 40000.0, ..default() }),
+        Projection::Perspective(PerspectiveProjection {
+            far: 40000.0,
+            ..default()
+        }),
         Transform::from_xyz(x, y, z),
-        AtmosphereSettings { rendering_method: AtmosphereMode::Raymarched, ..default() },
+        AtmosphereSettings {
+            rendering_method: AtmosphereMode::Raymarched,
+            ..default()
+        },
         AtmosphereEnvironmentMapLight::default(),
         Exposure::SUNLIGHT,
         // The same prepass and occlusion culling the viewer's camera carries,
@@ -105,11 +116,19 @@ fn setup(
         OcclusionCulling,
         // `camera::fly` rewrites the rotation from these every frame, so the
         // aim has to live here rather than on the transform.
-        FlyCamera { yaw: yaw.to_radians(), pitch: pitch.to_radians(), ..default() },
+        FlyCamera {
+            yaw: yaw.to_radians(),
+            pitch: pitch.to_radians(),
+            ..default()
+        },
     ));
 
     commands.spawn((
-        DirectionalLight { illuminance: lux::FULL_DAYLIGHT, shadow_maps_enabled: true, ..default() },
+        DirectionalLight {
+            illuminance: lux::FULL_DAYLIGHT,
+            shadow_maps_enabled: true,
+            ..default()
+        },
         SunDisk::EARTH,
         Transform::from_xyz(60.0, 100.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
@@ -131,7 +150,10 @@ fn setup(
     // viewer's own; the cloud shadow and the block mask are the blanks a scene
     // with no weather and no fine map would carry.
     let texels = tree_texture::DEFAULT_TEXELS;
-    let leaf = images.add(tiled(tree_texture::leaf_cutout(false, 0.34, texels).rgba, texels));
+    let leaf = images.add(tiled(
+        tree_texture::leaf_cutout(false, 0.34, texels).rgba,
+        texels,
+    ));
     let cloud = images.add(single(255));
     let mask = images.add(single(0));
 
@@ -149,8 +171,16 @@ fn setup(
 
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: FontSize::Px(14.0), ..default() },
-        Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
+        TextFont {
+            font_size: FontSize::Px(14.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(10),
+            left: px(12),
+            ..default()
+        },
         Hud,
     ));
 }
@@ -223,7 +253,9 @@ fn hud(
     camera: Query<&Transform, With<FlyCamera>>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
-    let (Ok(mut text), Ok(transform)) = (hud.single_mut(), camera.single()) else { return };
+    let (Ok(mut text), Ok(transform)) = (hud.single_mut(), camera.single()) else {
+        return;
+    };
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())
@@ -246,7 +278,11 @@ fn hud(
 /// of: an unbound texture drops its binding from the pipeline layout entirely.
 fn single(value: u8) -> Image {
     let mut image = Image::new(
-        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         vec![value, value, value, 255],
         TextureFormat::Rgba8Unorm,
@@ -259,7 +295,11 @@ fn single(value: u8) -> Image {
 /// The leaf cutout, wrapped and mipped the way the far band wears it.
 fn tiled(rgba: Vec<u8>, texels: u32) -> Image {
     let mut image = Image::new(
-        Extent3d { width: texels, height: texels, depth_or_array_layers: 1 },
+        Extent3d {
+            width: texels,
+            height: texels,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         rgba,
         TextureFormat::Rgba8UnormSrgb,

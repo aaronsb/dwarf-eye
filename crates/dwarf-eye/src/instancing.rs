@@ -41,17 +41,16 @@ use bevy::render::render_phase::{
     RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewBinnedRenderPhases,
 };
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
-    uniform_buffer_sized,
+    sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, uniform_buffer_sized,
 };
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntries, BindGroupLayoutEntries, BindingResource, Buffer,
-    BufferDescriptor, BufferInitDescriptor, BufferUsages, CachedComputePipelineId,
-    CachedRenderPipelineId, ComputePassDescriptor, ComputePipelineDescriptor, IndexFormat,
-    BindGroupLayoutDescriptor, MultisampleState, PipelineCache, RenderPipelineDescriptor,
-    SamplerBindingType, ShaderStages, SpecializedMeshPipeline, SpecializedRenderPipeline,
-    SpecializedRenderPipelines, TextureSampleType, VertexAttribute, VertexFormat,
-    VertexStepMode,
+    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+    BindingResource, Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages,
+    CachedComputePipelineId, CachedRenderPipelineId, ComputePassDescriptor,
+    ComputePipelineDescriptor, IndexFormat, MultisampleState, PipelineCache,
+    RenderPipelineDescriptor, SamplerBindingType, ShaderStages, SpecializedMeshPipeline,
+    SpecializedRenderPipeline, SpecializedRenderPipelines, TextureSampleType, VertexAttribute,
+    VertexFormat, VertexStepMode,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue};
 use bevy::render::sync_world::MainEntity;
@@ -84,6 +83,16 @@ const WORKGROUP: u32 = 64;
 
 /// Where the crossfade rule puts a stage that never fades out.
 pub const FAR: f32 = 40000.0;
+
+/// Whether the far band draws through the instanced path.
+///
+/// `DWARF_EYE_INSTANCING=0` falls back to the entity and per-cell-baked path,
+/// which is how the two are measured against each other.
+pub fn enabled() -> bool {
+    std::env::var("DWARF_EYE_INSTANCING")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
 
 // ---------------------------------------------------------------------------
 // What the main world hands over
@@ -435,9 +444,9 @@ struct StoreBuffers {
 
 #[derive(Clone, Copy)]
 struct DrawSpan {
-    index_count: u32,
-    first_index: u32,
-    base_vertex: i32,
+    /// Whether this batch goes through the shadow cascades. Everything else a
+    /// draw needs — the index count, the first index and the base vertex — is
+    /// already in the indirect arguments the cull fills the instance count into.
     casts: bool,
 }
 
@@ -535,7 +544,11 @@ fn vertex_buffers() -> Vec<VertexBufferLayout> {
     let one = |location: u32, format: VertexFormat| VertexBufferLayout {
         array_stride: format.size(),
         step_mode: VertexStepMode::Vertex,
-        attributes: vec![VertexAttribute { format, offset: 0, shader_location: location }],
+        attributes: vec![VertexAttribute {
+            format,
+            offset: 0,
+            shader_location: location,
+        }],
     };
     vec![
         one(POSITION, VertexFormat::Float32x3),
@@ -602,45 +615,45 @@ impl SpecializedRenderPipeline for InstancePipelines {
 fn instance_layout() -> BindGroupLayoutDescriptor {
     let texture = || texture_2d(TextureSampleType::Float { filterable: true });
     let entries = BindGroupLayoutEntries::with_indices(
-            ShaderStages::VERTEX_FRAGMENT,
+        ShaderStages::VERTEX_FRAGMENT,
+        (
+            (0, storage_buffer_read_only_sized(false, None)),
+            (1, storage_buffer_read_only_sized(false, None)),
             (
-                (0, storage_buffer_read_only_sized(false, None)),
-                (1, storage_buffer_read_only_sized(false, None)),
-                (
-                    2,
-                    uniform_buffer_sized(
-                        true,
-                        NonZeroU64::new(std::mem::size_of::<GpuBatch>() as u64),
-                    ),
+                2,
+                uniform_buffer_sized(
+                    true,
+                    NonZeroU64::new(std::mem::size_of::<GpuBatch>() as u64),
                 ),
-                (3, uniform_buffer_sized(false, None)),
-                (4, uniform_buffer_sized(false, None)),
-                (5, texture().visibility(ShaderStages::FRAGMENT)),
-                (
-                    6,
-                    sampler(SamplerBindingType::Filtering).visibility(ShaderStages::FRAGMENT),
-                ),
-                (7, texture().visibility(ShaderStages::FRAGMENT)),
-                (
-                    8,
-                    sampler(SamplerBindingType::Filtering).visibility(ShaderStages::FRAGMENT),
-                ),
-                (9, texture().visibility(ShaderStages::FRAGMENT)),
             ),
+            (3, uniform_buffer_sized(false, None)),
+            (4, uniform_buffer_sized(false, None)),
+            (5, texture().visibility(ShaderStages::FRAGMENT)),
+            (
+                6,
+                sampler(SamplerBindingType::Filtering).visibility(ShaderStages::FRAGMENT),
+            ),
+            (7, texture().visibility(ShaderStages::FRAGMENT)),
+            (
+                8,
+                sampler(SamplerBindingType::Filtering).visibility(ShaderStages::FRAGMENT),
+            ),
+            (9, texture().visibility(ShaderStages::FRAGMENT)),
+        ),
     );
     BindGroupLayoutDescriptor::new("instanced crowns", &entries)
 }
 
 fn cull_layout() -> BindGroupLayoutDescriptor {
     let entries = BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (0, storage_buffer_read_only_sized(false, None)),
-                (1, storage_buffer_sized(false, None)),
-                (2, storage_buffer_read_only_sized(false, None)),
-                (3, uniform_buffer_sized(false, None)),
-                (4, storage_buffer_sized(false, None)),
-            ),
+        ShaderStages::COMPUTE,
+        (
+            (0, storage_buffer_read_only_sized(false, None)),
+            (1, storage_buffer_sized(false, None)),
+            (2, storage_buffer_read_only_sized(false, None)),
+            (3, uniform_buffer_sized(false, None)),
+            (4, storage_buffer_sized(false, None)),
+        ),
     );
     BindGroupLayoutDescriptor::new("instance cull", &entries)
 }
@@ -713,7 +726,9 @@ fn prepare_store(
     if staged.fresh {
         rebuild(&mut store, &staged, &device);
     }
-    let Some(buffers) = store.buffers.as_ref() else { return };
+    let Some(buffers) = store.buffers.as_ref() else {
+        return;
+    };
     queue.write_buffer(&buffers.scene, 0, bytemuck::bytes_of(&staged.scene));
 }
 
@@ -739,9 +754,19 @@ fn rebuild(store: &mut Store, staged: &Staged, device: &RenderDevice) {
         indices.extend_from_slice(&batch.indices);
 
         let first = instances.len() as u32;
-        instances.extend(batch.instances.iter().map(|i| GpuInstance::of(i, index as u32)));
+        instances.extend(
+            batch
+                .instances
+                .iter()
+                .map(|i| GpuInstance::of(i, index as u32)),
+        );
         let count = batch.instances.len() as u32;
-        spans.push(GpuSpan { first, count, visible_at: first, _pad: 0 });
+        spans.push(GpuSpan {
+            first,
+            count,
+            visible_at: first,
+            _pad: 0,
+        });
 
         let record = GpuBatch {
             first,
@@ -756,15 +781,16 @@ fn rebuild(store: &mut Store, staged: &Staged, device: &RenderDevice) {
         padded[..std::mem::size_of::<GpuBatch>()].copy_from_slice(bytemuck::bytes_of(&record));
         batches.extend_from_slice(&padded);
 
-        draws.push(DrawSpan {
-            index_count: batch.indices.len() as u32,
-            first_index,
-            base_vertex,
-            casts: batch.casts,
-        });
+        draws.push(DrawSpan { casts: batch.casts });
         // index_count, instance_count, first_index, base_vertex, first_instance.
         // The instance count is what the cull fills in.
-        for word in [batch.indices.len() as u32, 0, first_index, base_vertex as u32, 0] {
+        for word in [
+            batch.indices.len() as u32,
+            0,
+            first_index,
+            base_vertex as u32,
+            0,
+        ] {
             args.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -831,8 +857,11 @@ fn prepare_view_pipelines(
     views: Query<(Entity, &ExtractedView, Option<&LightEntity>)>,
 ) {
     for (entity, view, light) in views.iter() {
-        let mut set =
-            ViewInstancePipelines { main: None, prepass: None, shadow: None };
+        let mut set = ViewInstancePipelines {
+            main: None,
+            prepass: None,
+            shadow: None,
+        };
         if light.is_some() {
             // A cascade draws depth only, into a single-sampled shadow map.
             set.shadow = Some(pipelines.specialize(
@@ -847,16 +876,17 @@ fn prepare_view_pipelines(
             set.main = Some(pipelines.specialize(
                 &pipeline_cache,
                 &instance_pipelines,
-                InstanceKey { pass: Pass::Main, mesh_key: with_topology(*key) },
+                InstanceKey {
+                    pass: Pass::Main,
+                    mesh_key: with_topology(*key),
+                },
             ));
             set.prepass = Some(pipelines.specialize(
                 &pipeline_cache,
                 &instance_pipelines,
                 InstanceKey {
                     pass: Pass::Depth,
-                    mesh_key: with_topology(MeshPipelineKey::from_msaa_samples(
-                        key.msaa_samples(),
-                    )),
+                    mesh_key: with_topology(MeshPipelineKey::from_msaa_samples(key.msaa_samples())),
                 },
             ));
         }
@@ -879,7 +909,9 @@ fn prepare_view_instances(
 ) {
     let draw_layout = pipeline_cache.get_bind_group_layout(&pipelines.layout);
     let cull_layout = pipeline_cache.get_bind_group_layout(&pipelines.cull_layout);
-    let Some(buffers) = store.buffers.as_ref() else { return };
+    let Some(buffers) = store.buffers.as_ref() else {
+        return;
+    };
     let (Some(leaf), Some(cloud), Some(mask)) = (
         staged.leaf.as_ref().and_then(|h| images.get(h)),
         staged.cloud.as_ref().and_then(|h| images.get(h)),
@@ -889,12 +921,15 @@ fn prepare_view_instances(
     };
 
     for (entity, view) in views.iter() {
-        let held = view_store.0.entry(view.retained_view_entity).or_insert_with(|| ViewBuffers {
-            generation: u64::MAX,
-            args: empty_buffer(&device),
-            visible: empty_buffer(&device),
-            params: empty_buffer(&device),
-        });
+        let held = view_store
+            .0
+            .entry(view.retained_view_entity)
+            .or_insert_with(|| ViewBuffers {
+                generation: u64::MAX,
+                args: empty_buffer(&device),
+                visible: empty_buffer(&device),
+                params: empty_buffer(&device),
+            });
         if held.generation != store.generation {
             held.args = device.create_buffer(&BufferDescriptor {
                 label: Some("crown draw args"),
@@ -920,7 +955,11 @@ fn prepare_view_instances(
         // The instance counts start at zero every frame; the cull's atomic adds
         // are what fill them in.
         queue.write_buffer(&held.args, 0, &store.args_template);
-        queue.write_buffer(&held.params, 0, bytemuck::bytes_of(&view_params(view, &store)));
+        queue.write_buffer(
+            &held.params,
+            0,
+            bytemuck::bytes_of(&view_params(view, &store)),
+        );
 
         let draw = device.create_bind_group(
             "crown draw",
@@ -958,7 +997,10 @@ fn prepare_view_instances(
         );
 
         commands.entity(entity).insert((
-            ViewInstances { args: held.args.clone(), draw },
+            ViewInstances {
+                args: held.args.clone(),
+                draw,
+            },
             ViewCull {
                 bind_group: cull,
                 workgroups: store.instances.div_ceil(WORKGROUP).max(1),
@@ -1006,10 +1048,15 @@ fn cull(
     views: Query<&ViewCull>,
     mut ctx: RenderContext,
 ) {
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.cull) else { return };
+    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.cull) else {
+        return;
+    };
     let mut pass = ctx
         .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor { label: Some("instance cull"), ..default() });
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("instance cull"),
+            ..default()
+        });
     pass.set_pipeline(pipeline);
     for view in views.iter() {
         pass.set_bind_group(0, &view.bind_group, &[]);
@@ -1164,7 +1211,9 @@ impl Plugin for InstancingPlugin {
             .init_resource::<InstanceCounts>()
             .add_systems(Update, count_instances);
 
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
         render_app
             .init_resource::<Store>()
             .init_resource::<Staged>()
@@ -1179,7 +1228,9 @@ impl Plugin for InstancingPlugin {
                     // phase items are queued, and the buffers only before the
                     // passes run: Bevy's own order is Queue, QueueMeshes,
                     // PhaseSort, Prepare, PrepareBindGroups, Render.
-                    (prepare_store, prepare_view_pipelines).chain().in_set(RenderSystems::Queue),
+                    (prepare_store, prepare_view_pipelines)
+                        .chain()
+                        .in_set(RenderSystems::Queue),
                     queue_instances.in_set(RenderSystems::QueueMeshes),
                     prepare_view_instances.in_set(RenderSystems::PrepareBindGroups),
                 ),
@@ -1203,13 +1254,19 @@ fn count_instances(
     mut counts: ResMut<InstanceCounts>,
     camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
 ) {
-    let Ok((transform, projection)) = camera.single() else { return };
+    let Ok((transform, projection)) = camera.single() else {
+        return;
+    };
     let eye = transform.translation();
     let planes = frustum_planes(projection.get_clip_from_view() * transform.to_matrix().inverse());
     let mut drawn = 0;
     let mut triangles = 0;
     for batch in &instanced.batches {
-        let hits = batch.instances.iter().filter(|i| survives(i, &planes, eye)).count();
+        let hits = batch
+            .instances
+            .iter()
+            .filter(|i| survives(i, &planes, eye))
+            .count();
         drawn += hits;
         triangles += hits * batch.triangles();
     }
@@ -1223,7 +1280,13 @@ mod tests {
     use super::*;
 
     fn at(pos: Vec3, band: [f32; 4], dither: f32) -> Instance {
-        Instance { pos, dither, band, radius: 1.0, ..default() }
+        Instance {
+            pos,
+            dither,
+            band,
+            radius: 1.0,
+            ..default()
+        }
     }
 
     /// A perspective view looking down -Z from the origin, the way Bevy's
@@ -1281,10 +1344,12 @@ mod tests {
         let fade = |at: f32| (at * 0.8, at * 1.25);
         let bands: Vec<[f32; 4]> = (0..=edges.len())
             .map(|stage| {
-                let (in_lo, in_hi) =
-                    if stage == 0 { (0.0, 0.0) } else { fade(edges[stage - 1]) };
-                let (out_lo, out_hi) =
-                    edges.get(stage).map(|&e| fade(e)).unwrap_or((FAR, FAR));
+                let (in_lo, in_hi) = if stage == 0 {
+                    (0.0, 0.0)
+                } else {
+                    fade(edges[stage - 1])
+                };
+                let (out_lo, out_hi) = edges.get(stage).map(|&e| fade(e)).unwrap_or((FAR, FAR));
                 [in_lo, in_hi, out_lo, out_hi]
             })
             .collect();

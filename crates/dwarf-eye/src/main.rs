@@ -20,38 +20,38 @@ mod walk;
 mod worker;
 
 use bevy::asset::RenderAssetUsages;
-use bevy::ecs::system::SystemParam;
-use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::prelude::*;
 use bevy::camera::Exposure;
 use bevy::camera::visibility::VisibilityRange;
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::ecs::system::SystemParam;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::light::NotShadowCaster;
 use bevy::light::{
     Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, atmosphere::ScatteringMedium,
     light_consts::lux,
 };
-use bevy::light::NotShadowCaster;
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
-use camera::FlyCamera;
-use clouds::Weather;
-use shadow::{
-    CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
-};
-use sky::Clock;
-use dwarf_eye_trees as trees;
+use bevy::prelude::*;
 use bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport;
 use bevy::render::occlusion_culling::OcclusionCulling;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::{RenderApp, RenderStartup};
+use camera::FlyCamera;
+use clouds::Weather;
+use dwarf_eye_trees as trees;
 use dwarf_eye_world::canopy::{BANDS, Band, CanopyMeshes, Coat, Surface};
 use dwarf_eye_world::factory::{self, Detail as TreeStage};
 use dwarf_eye_world::horizon::batch;
 use dwarf_eye_world::horizon::scatter::stages as horizon_stages;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
+use shadow::{
+    CloudShadow, ShadowUniform, TerrainMaterial as TerrainMat, canopy_sky, leaf_transmission,
+};
+use sky::Clock;
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
 
@@ -70,17 +70,24 @@ const CEILING_ABOVE_PLAYER: i32 = 16;
 fn forced_weather() -> Option<Weather> {
     let preset = match std::env::var("DWARF_EYE_WEATHER").as_deref() {
         Ok("clear") => Weather::default(),
-        Ok("rain") => {
-            Weather { cumulus: 0.35, stratus: 0.95, cirrus: 0.0, fog: 0.15, countdown: 0.4 }
-        }
-        Ok("snow") => {
-            Weather { cumulus: 0.2, stratus: 0.8, cirrus: 0.0, fog: 0.45, countdown: 0.6 }
-        }
+        Ok("rain") => Weather {
+            cumulus: 0.35,
+            stratus: 0.95,
+            cirrus: 0.0,
+            fog: 0.15,
+            countdown: 0.4,
+        },
+        Ok("snow") => Weather {
+            cumulus: 0.2,
+            stratus: 0.8,
+            cirrus: 0.0,
+            fog: 0.45,
+            countdown: 0.6,
+        },
         _ => return Weather::from_env(),
     };
     Some(preset)
 }
-
 
 /// One line naming the world and the game's date, printed once both are known,
 /// so an unattended shot can be labelled with what it caught.
@@ -90,8 +97,13 @@ fn forced_weather() -> Option<Weather> {
 /// is the right default and no use at all for a screenshot of a hall sixty
 /// tiles away.
 fn aim_offset() -> (f32, f32, f32) {
-    let Ok(spec) = std::env::var("DWARF_EYE_AIM") else { return (0.0, 0.0, 0.0) };
-    let n: Vec<f32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    let Ok(spec) = std::env::var("DWARF_EYE_AIM") else {
+        return (0.0, 0.0, 0.0);
+    };
+    let n: Vec<f32> = spec
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
     match n.as_slice() {
         [x, y, z] => (*x, *y, *z),
         [x, y] => (*x, *y, 0.0),
@@ -156,6 +168,7 @@ fn main() {
                 refresh_mask,
                 update_hud,
                 pulse_magma,
+                sync_instanced_scene,
             ),
         )
         .add_systems(
@@ -175,23 +188,26 @@ fn main() {
 /// the camera asks for: the two-phase pass needs GPU preprocessing with
 /// culling, and Bevy quietly ignores `OcclusionCulling` where that is missing.
 fn report_culling(app: &mut App) {
-    let Some(render) = app.get_sub_app_mut(RenderApp) else { return };
-    render.add_systems(
-        RenderStartup,
-        |support: Res<GpuPreprocessingSupport>| {
-            info!(
-                "GPU preprocessing {}; occlusion culling {}",
-                if support.is_available() { "available" } else { "unavailable" },
-                if !support.is_culling_supported() {
-                    "unsupported on this device"
-                } else if occlusion_culling() {
-                    "on"
-                } else {
-                    "off (DWARF_EYE_OCCLUSION=0)"
-                }
-            );
-        },
-    );
+    let Some(render) = app.get_sub_app_mut(RenderApp) else {
+        return;
+    };
+    render.add_systems(RenderStartup, |support: Res<GpuPreprocessingSupport>| {
+        info!(
+            "GPU preprocessing {}; occlusion culling {}",
+            if support.is_available() {
+                "available"
+            } else {
+                "unavailable"
+            },
+            if !support.is_culling_supported() {
+                "unsupported on this device"
+            } else if occlusion_culling() {
+                "on"
+            } else {
+                "off (DWARF_EYE_OCCLUSION=0)"
+            }
+        );
+    });
 }
 
 #[derive(Resource)]
@@ -208,13 +224,21 @@ impl Default for ViewSettings {
     fn default() -> Self {
         // Adventure mode leaves nearly the whole map undiscovered, so drawing
         // only what the player has seen shows almost nothing. Start revealed.
-        Self { z_ceiling: i32::MAX, show_hidden: true, placed: false, player_z: 0 }
+        Self {
+            z_ceiling: i32::MAX,
+            show_hidden: true,
+            placed: false,
+            player_z: 0,
+        }
     }
 }
 
 impl ViewSettings {
     fn mesh_options(&self) -> MeshOptions {
-        MeshOptions { z_ceiling: self.z_ceiling, show_hidden: self.show_hidden }
+        MeshOptions {
+            z_ceiling: self.z_ceiling,
+            show_hidden: self.show_hidden,
+        }
     }
 }
 
@@ -324,7 +348,10 @@ fn stage_ranges(edges: &[f32]) -> Vec<VisibilityRange> {
 
 /// How many of the finest stages `DWARF_EYE_LOD_SKIP` hides.
 fn lod_skip() -> usize {
-    std::env::var("DWARF_EYE_LOD_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    std::env::var("DWARF_EYE_LOD_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Which band a canopy entity belongs to, by its place in `canopy::BANDS`, so a
@@ -355,6 +382,123 @@ fn staged_range(ranges: &[VisibilityRange], stage: HorizonStage) -> VisibilityRa
     range
 }
 
+/// Keeps the instanced path's surfaces and weather in step with the material
+/// the entity path wears.
+///
+/// One source of truth: `clouds::bake_shadow` and the weather systems write
+/// every terrain material asset, and the far crowns' own copy is one of them,
+/// so reading it back here is how the instanced draw gets the same cloud
+/// shadow, the same wetness and the same block mask without a second set of
+/// knobs to keep aligned.
+fn sync_instanced_scene(
+    far: Res<HorizonCanopyMaterial>,
+    materials: Res<Assets<TerrainMat>>,
+    mut instanced: ResMut<instancing::Instanced>,
+) {
+    let Some(material) = materials.get(&far.grown) else {
+        return;
+    };
+    instanced.scene = material.extension.uniform;
+    instanced.leaf = material.base.base_color_texture.clone();
+    instanced.cloud = Some(material.extension.map.clone());
+    instanced.mask = Some(material.extension.mask.clone());
+}
+
+/// The far band's whole tree chain as instance batches: one entry per species,
+/// growth variant and cut, with a transform per tree.
+///
+/// The band each instance carries is its own stage's `VisibilityRange` written
+/// out as four distances, so the compute cull runs the same hand-off rule Bevy
+/// runs for the window's canopy bands. A tree the camera can never come near
+/// enough to ask a stage for is left out of that stage entirely, exactly as the
+/// entity path leaves it unspawned (`batch::reach`).
+fn instance_batches(
+    crowns: &[batch::CrownBatch],
+    ranges: &[VisibilityRange],
+    blob_from: usize,
+) -> Vec<instancing::Batch> {
+    let stage_of = |stage| {
+        horizon_stages()
+            .iter()
+            .position(|s| s.detail == stage)
+            .unwrap_or(0)
+    };
+    let mut out = Vec::new();
+    for crown in crowns {
+        let at = stage_of(crown.stage);
+        let unit = crown.mesh_height.max(f32::EPSILON);
+        // The mesh's own bounding sphere about a centre on its axis, which is
+        // what the cull's frustum test uses.
+        let top = crown
+            .mesh
+            .positions
+            .iter()
+            .map(|p| p[1])
+            .fold(0.0f32, f32::max);
+        let centre = top * 0.5;
+        let bound = crown
+            .mesh
+            .positions
+            .iter()
+            .map(|p| (p[0] * p[0] + (p[1] - centre) * (p[1] - centre) + p[2] * p[2]).sqrt())
+            .fold(0.5f32, f32::max);
+        let instances: Vec<instancing::Instance> = crown
+            .instances
+            .iter()
+            .filter(|tree| stage_is_reachable(ranges, at, tree.reach))
+            .map(|tree| {
+                let opens = opening_stage(ranges, tree.reach) == at;
+                let range = staged_range(ranges, HorizonStage { stage: at, opens });
+                let scale = tree.height / unit;
+                let pos = Vec3::from(tree.pos);
+                instancing::Instance {
+                    pos,
+                    yaw: tree.yaw,
+                    scale,
+                    radius: bound * scale,
+                    centre_y: centre * scale,
+                    // Hashed from the tree's place, so every stage of one tree
+                    // agrees and exactly one of them draws it.
+                    dither: instancing::dither_of(pos),
+                    band: [
+                        range.start_margin.start,
+                        range.start_margin.end,
+                        range.end_margin.start,
+                        range.end_margin.end,
+                    ],
+                    tint: [1.0; 4],
+                }
+            })
+            .collect();
+        if instances.is_empty() {
+            continue;
+        }
+        out.push(instancing::Batch {
+            positions: crown.mesh.positions.clone(),
+            normals: crown.mesh.normals.clone(),
+            uvs: crown.mesh.uvs.clone(),
+            colors: crown.mesh.colors.clone(),
+            indices: crown.mesh.indices.clone(),
+            instances,
+            // A rasterised cut carries no shading of its own and takes the
+            // canopy's sky term; `crown.rs` bakes a lit top and darker sides
+            // into the crown and box stages' vertex colours, and the sky term
+            // over that would take their sides to nearly black.
+            canopy: if crown.stage.per_tile().is_some() {
+                canopy_sky()
+            } else {
+                0.0
+            },
+            roughness: 0.97,
+            // Everything inside the sun's cascades casts a real shadow; past
+            // them a shadow map has nothing left to resolve a tree with, and
+            // the blob quads take over.
+            casts: at < blob_from,
+        });
+    }
+    out
+}
+
 /// Whether a stage is worth spawning for trees the camera can never come
 /// closer to than `reach` tiles.
 ///
@@ -368,7 +512,9 @@ fn stage_is_reachable(ranges: &[VisibilityRange], stage: usize, reach: f32) -> b
 
 /// The first stage of the chain the camera can ask for at `reach`.
 fn opening_stage(ranges: &[VisibilityRange], reach: f32) -> usize {
-    (0..ranges.len()).find(|&i| stage_is_reachable(ranges, i, reach)).unwrap_or(0)
+    (0..ranges.len())
+        .find(|&i| stage_is_reachable(ranges, i, reach))
+        .unwrap_or(0)
 }
 
 /// How far the sun's shadow cascades reach, mirroring Bevy's own default
@@ -403,7 +549,11 @@ fn horizon_ranges(near: f32) -> Vec<VisibilityRange> {
 /// shadows at all reads as flat.
 fn horizon_blob_from(near: f32) -> usize {
     let edges = horizon_edges(near);
-    edges.iter().position(|&at| at >= SHADOW_DISTANCE).map(|i| i + 1).unwrap_or(edges.len())
+    edges
+        .iter()
+        .position(|&at| at >= SHADOW_DISTANCE)
+        .map(|i| i + 1)
+        .unwrap_or(edges.len())
 }
 
 /// The range a blob shadow carries: one blob a tree, appearing where the first
@@ -473,7 +623,9 @@ fn aim_blob_shadows(
     }
     aim.0 = now;
     for (shadows, mesh) in &blobs {
-        let Some(mut mesh) = meshes.get_mut(&mesh.0) else { continue };
+        let Some(mut mesh) = meshes.get_mut(&mesh.0) else {
+            continue;
+        };
         let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
         else {
@@ -505,7 +657,9 @@ struct HorizonSpawn<'w, 's> {
 }
 
 fn occlusion_culling() -> bool {
-    std::env::var("DWARF_EYE_OCCLUSION").map(|v| v != "0").unwrap_or(true)
+    std::env::var("DWARF_EYE_OCCLUSION")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Everyone on the map, and the two censuses the drawn positions sit between.
@@ -563,7 +717,9 @@ fn draw_units(
     settings: Res<ViewSettings>,
     bridge: NonSend<Bridge>,
 ) {
-    let Some(&origin) = bridge.origin.get() else { return };
+    let Some(&origin) = bridge.origin.get() else {
+        return;
+    };
     if crowd.current.is_empty() && crowd.entities.is_empty() {
         return;
     }
@@ -585,7 +741,10 @@ fn draw_units(
         let was = crowd.previous.get(&unit.id).copied().unwrap_or(unit);
         // A jump of more than a few tiles is a teleport or a re-centring, not
         // a step; easing through it would be a long slide through the ground.
-        let far = (was.at.0 - unit.at.0).abs().max((was.at.1 - unit.at.1).abs()) > 4.0
+        let far = (was.at.0 - unit.at.0)
+            .abs()
+            .max((was.at.1 - unit.at.1).abs())
+            > 4.0
             || (was.at.2 - unit.at.2).abs() > 1.0;
         let at = if far {
             unit.at
@@ -710,7 +869,10 @@ impl Spawned {
     /// What this chunk draws with the camera here: one band, never two.
     fn drawn(&self, eye: Vec3, edges: &[f32]) -> usize {
         let away = self.centre.distance(eye);
-        let stage = edges.iter().position(|&edge| away < edge).unwrap_or(edges.len());
+        let stage = edges
+            .iter()
+            .position(|&edge| away < edge)
+            .unwrap_or(edges.len());
         self.base + self.bands.get(stage).map(|s| s.triangles).unwrap_or(0)
     }
 }
@@ -876,37 +1038,50 @@ fn setup(
 ) {
     // A physically-based atmosphere, so the sky colour follows the sun rather
     // than being painted on.
-    commands.spawn(Atmosphere::earth(mediums.add(ScatteringMedium::earth(256, 256))));
+    commands.spawn(Atmosphere::earth(
+        mediums.add(ScatteringMedium::earth(256, 256)),
+    ));
 
-    let camera = commands.spawn((
-        Camera3d::default(),
-        // Far enough to take in the outer terrain.
-        Projection::Perspective(PerspectiveProjection { far: 40000.0, ..default() }),
-        Transform::from_xyz(0.0, 40.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
-        AtmosphereSettings {
-            // Raymarching integrates the sky directly, which removes the seams
-            // the lookup textures leave and sharpens volumetric shadows.
-            rendering_method: AtmosphereMode::Raymarched,
-            sky_max_samples: 32,
-            ..default()
-        },
-        // RAW_SUNLIGHT is pre-scattering, so the exposure has to be raised to
-        // bring the scene back into range. The clock drives it from here on:
-        // day sits where it always did, night opens five stops.
-        Exposure { ev100: sky::ev100_override().unwrap_or(sky::DAY_EV100) },
-        Tonemapping::AcesFitted,
-        // A dark sky gradient bands badly at 8 bits; dithering breaks up the
-        // steps that otherwise read as seams.
-        DebandDither::Enabled,
-        Bloom::NATURAL,
-        // Sky-driven ambient: the sky lights the scene, which is what makes
-        // dusk read as dusk. Raised above the physical default because there is
-        // no bounce lighting to fill the shadows.
-        AtmosphereEnvironmentMapLight { intensity: 2.6, size: UVec2::splat(1024), ..default() },
-        // The cloud volume reads scene depth to stop its march at terrain.
-        DepthPrepass,
-        FlyCamera::default(),
-    )).id();
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            // Far enough to take in the outer terrain.
+            Projection::Perspective(PerspectiveProjection {
+                far: 40000.0,
+                ..default()
+            }),
+            Transform::from_xyz(0.0, 40.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
+            AtmosphereSettings {
+                // Raymarching integrates the sky directly, which removes the seams
+                // the lookup textures leave and sharpens volumetric shadows.
+                rendering_method: AtmosphereMode::Raymarched,
+                sky_max_samples: 32,
+                ..default()
+            },
+            // RAW_SUNLIGHT is pre-scattering, so the exposure has to be raised to
+            // bring the scene back into range. The clock drives it from here on:
+            // day sits where it always did, night opens five stops.
+            Exposure {
+                ev100: sky::ev100_override().unwrap_or(sky::DAY_EV100),
+            },
+            Tonemapping::AcesFitted,
+            // A dark sky gradient bands badly at 8 bits; dithering breaks up the
+            // steps that otherwise read as seams.
+            DebandDither::Enabled,
+            Bloom::NATURAL,
+            // Sky-driven ambient: the sky lights the scene, which is what makes
+            // dusk read as dusk. Raised above the physical default because there is
+            // no bounce lighting to fill the shadows.
+            AtmosphereEnvironmentMapLight {
+                intensity: 2.6,
+                size: UVec2::splat(1024),
+                ..default()
+            },
+            // The cloud volume reads scene depth to stop its march at terrain.
+            DepthPrepass,
+            FlyCamera::default(),
+        ))
+        .id();
     // Two-phase GPU occlusion culling, which rides on that depth prepass: a
     // forest hides most of itself behind its own front row, and this drops
     // those meshes before their vertices are transformed.
@@ -938,7 +1113,10 @@ fn setup(
             ..default()
         },
         // The moon's disk is the sun's angular size; only its brightness differs.
-        SunDisk { angular_size: SunDisk::EARTH.angular_size, intensity: sky::MOON_DISK_INTENSITY },
+        SunDisk {
+            angular_size: SunDisk::EARTH.angular_size,
+            intensity: sky::MOON_DISK_INTENSITY,
+        },
         Transform::from_xyz(-60.0, 120.0, -40.0).looking_at(Vec3::ZERO, Vec3::Y),
         sky::Moon,
     ));
@@ -1000,7 +1178,9 @@ fn setup(
     let texels = tree_texels();
     // The species' own openness is per tree; these two cutouts are the fallback
     // the whole world shares, one leafy and one needled.
-    let broadleaf = images.add(tree_texture(trees::texture::leaf_cutout(false, 0.34, texels)));
+    let broadleaf = images.add(tree_texture(trees::texture::leaf_cutout(
+        false, 0.34, texels,
+    )));
     let needle = images.add(tree_texture(trees::texture::leaf_cutout(true, 0.5, texels)));
     let strip = images.add(tree_texture(trees::texture::streamer_strip(texels)));
     let bark_texture = images.add(tree_texture(trees::texture::bark(texels)));
@@ -1080,12 +1260,24 @@ fn setup(
         streamers: materials.add(cutout(strip)),
         leaf: materials.add(solid_leaf),
     });
-    commands.insert_resource(BlockMask { image: mask, blocks: Vec::new(), dirty: false });
+    commands.insert_resource(BlockMask {
+        image: mask,
+        blocks: Vec::new(),
+        dirty: false,
+    });
 
     commands.spawn((
         Text::new("connecting to DFHack…"),
-        TextFont { font_size: FontSize::Px(13.0), ..default() },
-        Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
+        TextFont {
+            font_size: FontSize::Px(13.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(10),
+            left: px(12),
+            ..default()
+        },
         // DWARF_EYE_HUD=off leaves the overlay out of the picture, for a shot
         // that is meant to show the world rather than the instrument.
         match std::env::var("DWARF_EYE_HUD").as_deref() {
@@ -1115,6 +1307,7 @@ fn drain_worker(
     mut materials: ResMut<Assets<TerrainMat>>,
     material: Res<TerrainMaterial>,
     mut status: ResMut<Status>,
+    mut instanced: ResMut<instancing::Instanced>,
     mut settings: ResMut<ViewSettings>,
     mut clock: ResMut<Clock>,
     mut sky: WeatherState,
@@ -1128,13 +1321,13 @@ fn drain_worker(
         match event {
             Event::Weather(report) => {
                 *sky.weather = forced_weather().unwrap_or(report.sky);
-                sky.precip.report(report.precip, report.intensity, report.outdoors);
+                sky.precip
+                    .report(report.precip, report.intensity, report.outdoors);
                 sky.cover.target =
                     precipitation::SnowCover::override_from_env().unwrap_or(report.snow);
                 // The region's own rainfall and temperature feed the haze,
                 // unless DWARF_EYE_HAZE pinned them.
-                if let (false, Some((rainfall, temperature))) =
-                    (sky.climate.pinned, report.climate)
+                if let (false, Some((rainfall, temperature))) = (sky.climate.pinned, report.climate)
                 {
                     sky.climate.rainfall = rainfall;
                     sky.climate.temperature = temperature;
@@ -1148,9 +1341,18 @@ fn drain_worker(
             Event::Clock { year, tick } => {
                 // DWARF_EYE_HOUR pins the hour the view is lit at without
                 // moving the game's own clock.
-                *clock = Clock { year, tick, moon: clock.moon }.with_hour_override();
+                *clock = Clock {
+                    year,
+                    tick,
+                    moon: clock.moon,
+                }
+                .with_hour_override();
             }
-            Event::Atlas { width, height, pixels } => {
+            Event::Atlas {
+                width,
+                height,
+                pixels,
+            } => {
                 let handle = images.add(texture::atlas_image(width, height, pixels));
                 if let Some(mut m) = materials.get_mut(&material.0) {
                     m.base.base_color_texture = Some(handle.clone());
@@ -1162,7 +1364,12 @@ fn drain_worker(
                     m.base.base_color_texture = Some(handle);
                 }
             }
-            Event::Connected { world_name, save, center, size } => {
+            Event::Connected {
+                world_name,
+                save,
+                center,
+                size,
+            } => {
                 status.world = format!("{world_name} ({save})");
                 status.detail = format!("map {} x {} x {} tiles", size.0, size.1, size.2);
 
@@ -1221,27 +1428,36 @@ fn drain_worker(
                 ));
                 let blob_from = horizon_blob_from(far.bands.near);
                 let blob_range = horizon_blob_range(far.bands.near);
-                let stage_of =
-                    |stage| horizon_stages().iter().position(|s| s.detail == stage).unwrap_or(0);
+                let stage_of = |stage| {
+                    horizon_stages()
+                        .iter()
+                        .position(|s| s.detail == stage)
+                        .unwrap_or(0)
+                };
                 let mut spawned = 1;
 
-                // The cheap stages come merged: one mesh per cell per stage,
-                // every tree's transform already baked into the vertices, so a
-                // few hundred trees are one entity at the identity transform.
-                // The range measures from the mesh's own bounds, so a cell
-                // hands over at its own distance.
+                // The instanced path: every stage of the chain is one entry per
+                // species, variant and cut, with a transform per tree in a
+                // storage buffer. No entity per tree and no baked copy per tree
+                // either — the cull decides, per view and per frame, which of
+                // them draws (`instancing.rs`).
+                if instancing::enabled() {
+                    instanced.replace(instance_batches(&data.crowns, &ranges, blob_from));
+                }
+
+                // The merged fallback: one mesh per cell per stage with every
+                // tree's transform baked into the vertices. Off by default now
+                // that the instanced path draws the same stages off one mesh;
+                // `DWARF_EYE_HORIZON_MERGE=1` brings it back for comparison.
                 for cell in data.merged {
                     let at = stage_of(cell.stage);
                     if !stage_is_reachable(&ranges, at, cell.reach) {
                         continue;
                     }
-                    let stage =
-                        HorizonStage { stage: at, opens: opening_stage(&ranges, cell.reach) == at };
-                    // A rasterised cut carries no shading of its own and takes
-                    // the canopy's sky term; `crown.rs` bakes a lit top and
-                    // darker sides into the crown and box stages' vertex
-                    // colours, and the sky term over that would take their
-                    // sides to nearly black.
+                    let stage = HorizonStage {
+                        stage: at,
+                        opens: opening_stage(&ranges, cell.reach) == at,
+                    };
                     let coat = if cell.stage.per_tile().is_some() {
                         far.canopy.grown.clone()
                     } else {
@@ -1261,40 +1477,36 @@ fn drain_worker(
                     spawned += 1;
                 }
 
-                // The rasterised cuts are hundreds to thousands of triangles a
-                // tree, too big to copy per tree, so they stay one entity a
-                // tree over a shared mesh — but only for the trees near enough
-                // to the live window that the camera can still ask for that
-                // cut. A rasterised cut carries no shading of its own and takes
-                // the canopy's sky term.
-                for batch in data.crowns {
-                    let at = stage_of(batch.stage);
-                    let unit = batch.mesh_height;
-                    let mesh = meshes.add(to_bevy_mesh(batch.mesh));
-                    for tree in &batch.instances {
-                        if !stage_is_reachable(&ranges, at, tree.reach) {
-                            continue;
+                // The per-tree entities the instanced path replaces. Only
+                // reached with instancing off.
+                if !instancing::enabled() {
+                    for batch in data.crowns {
+                        let at = stage_of(batch.stage);
+                        let unit = batch.mesh_height;
+                        let mesh = meshes.add(to_bevy_mesh(batch.mesh));
+                        for tree in &batch.instances {
+                            if !stage_is_reachable(&ranges, at, tree.reach) {
+                                continue;
+                            }
+                            let stage = HorizonStage {
+                                stage: at,
+                                opens: opening_stage(&ranges, tree.reach) == at,
+                            };
+                            let mut entity = commands.spawn((
+                                Mesh3d(mesh.clone()),
+                                MeshMaterial3d(far.canopy.grown.clone()),
+                                Transform::from_translation(Vec3::from(tree.pos))
+                                    .with_rotation(Quat::from_rotation_y(tree.yaw))
+                                    .with_scale(Vec3::splat(tree.height / unit)),
+                                staged_range(&ranges, stage),
+                                stage,
+                                Horizon,
+                            ));
+                            if at >= blob_from {
+                                entity.insert(NotShadowCaster);
+                            }
+                            spawned += 1;
                         }
-                        let stage =
-                            HorizonStage { stage: at, opens: opening_stage(&ranges, tree.reach) == at };
-                        let mut entity = commands.spawn((
-                            Mesh3d(mesh.clone()),
-                            MeshMaterial3d(far.canopy.grown.clone()),
-                            Transform::from_translation(Vec3::from(tree.pos))
-                                .with_rotation(Quat::from_rotation_y(tree.yaw))
-                                .with_scale(Vec3::splat(tree.height / unit)),
-                            staged_range(&ranges, stage),
-                            stage,
-                            Horizon,
-                        ));
-                        // Everything inside the sun's cascades casts a real
-                        // shadow. Past them a shadow map has nothing left to
-                        // resolve a tree with, so every stage whose near edge
-                        // is at or beyond `SHADOW_DISTANCE` casts a blob.
-                        if at >= blob_from {
-                            entity.insert(NotShadowCaster);
-                        }
-                        spawned += 1;
                     }
                 }
 
@@ -1309,7 +1521,10 @@ fn drain_worker(
                         MeshMaterial3d(far.blob.0.clone()),
                         Transform::IDENTITY,
                         blob_range.clone(),
-                        HorizonStage { stage: blob_from, opens: false },
+                        HorizonStage {
+                            stage: blob_from,
+                            opens: false,
+                        },
                         BlobShadows(cell.shadows),
                         Horizon,
                         NotShadowCaster,
@@ -1435,7 +1650,9 @@ fn upload_chunks(
 
     let ranges = band_ranges(bands.near);
     for key in keys.into_iter().take(UPLOAD_BUDGET) {
-        let Some((mut data, crowns)) = pending.0.remove(&key) else { continue };
+        let Some((mut data, crowns)) = pending.0.remove(&key) else {
+            continue;
+        };
         // Water rides in with the terrain and splits off here: its own entity,
         // its own translucent material.
         let pool = data.take_water();
@@ -1475,25 +1692,40 @@ fn upload_chunks(
         let magma = spawn(melt, magma_material.0.clone(), None);
         let mut spawned_bands = Vec::with_capacity(crowns.len());
         for (stage, crown) in crowns.into_iter().enumerate() {
-            let Some(&band) = BANDS.get(stage) else { continue };
+            let Some(&band) = BANDS.get(stage) else {
+                continue;
+            };
             let triangles = crown.triangle_count();
             let meshes_of = [crown.bark, crown.broadleaf, crown.needle, crown.streamers];
             let mut entities = [None; 4];
-            for (slot, (mesh, material)) in
-                meshes_of.into_iter().zip(canopy_materials.each(band)).enumerate()
+            for (slot, (mesh, material)) in meshes_of
+                .into_iter()
+                .zip(canopy_materials.each(band))
+                .enumerate()
             {
                 entities[slot] = spawn(mesh, material, Some(stage));
             }
-            spawned_bands.push(Stage { entities, triangles });
+            spawned_bands.push(Stage {
+                entities,
+                triangles,
+            });
         }
         let centre = Vec3::new(
             (key.0 * BLOCK + BLOCK / 2) as f32,
             key.2 as f32 * Z_SCALE,
             (key.1 * BLOCK + BLOCK / 2) as f32,
         );
-        entities
-            .0
-            .insert(key, Spawned { terrain, water, magma, bands: spawned_bands, base, centre });
+        entities.0.insert(
+            key,
+            Spawned {
+                terrain,
+                water,
+                magma,
+                bands: spawned_bands,
+                base,
+                centre,
+            },
+        );
     }
     status.triangles = entities.0.values().map(Spawned::held).sum();
 }
@@ -1509,7 +1741,11 @@ fn tree_texels() -> u32 {
 /// 0..1, so these wrap; nearest magnification keeps the cutout's edge hard.
 fn tree_texture(texels: trees::texture::Texels) -> Image {
     let mut image = Image::new(
-        Extent3d { width: texels.width, height: texels.height, depth_or_array_layers: 1 },
+        Extent3d {
+            width: texels.width,
+            height: texels.height,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         texels.rgba,
         TextureFormat::Rgba8UnormSrgb,
@@ -1529,7 +1765,11 @@ fn tree_texture(texels: trees::texture::Texels) -> Image {
 fn empty_mask() -> Image {
     let n = shadow::MASK_BLOCKS;
     Image::new(
-        Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        Extent3d {
+            width: n,
+            height: n,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         vec![0u8; (n * n) as usize],
         TextureFormat::R8Unorm,
@@ -1542,11 +1782,15 @@ fn refresh_mask(mut mask: ResMut<BlockMask>, mut images: ResMut<Assets<Image>>) 
     if !mask.dirty {
         return;
     }
-    let Some(mut image) = images.get_mut(&mask.image) else { return };
+    let Some(mut image) = images.get_mut(&mask.image) else {
+        return;
+    };
     mask.dirty = false;
     let n = shadow::MASK_BLOCKS as i32;
     let half = n / 2;
-    let Some(data) = image.data.as_mut() else { return };
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
     data.fill(0);
     for &(bx, by) in &mask.blocks {
         let (x, y) = (bx + half, by + half);
@@ -1579,8 +1823,13 @@ fn handle_input(
     // Drive the game's own clock and weather, so lighting can be tested without
     // waiting for the world.
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let step = if shift { sky::TICKS_PER_DAY / 4 } else { sky::TICKS_PER_DAY / 24 };
-    let nudge = keys.just_pressed(KeyCode::Period) as i32 - keys.just_pressed(KeyCode::Comma) as i32;
+    let step = if shift {
+        sky::TICKS_PER_DAY / 4
+    } else {
+        sky::TICKS_PER_DAY / 24
+    };
+    let nudge =
+        keys.just_pressed(KeyCode::Period) as i32 - keys.just_pressed(KeyCode::Comma) as i32;
     // With the hour pinned from the environment the clock resource is the
     // viewer's own, so stepping it would drag the game somewhere it never was.
     if nudge != 0 && sky::hour_override().is_none() {
@@ -1625,7 +1874,9 @@ fn handle_input(
     }
 
     if changed {
-        let _ = bridge.tx.send(Command::Remesh { opts: settings.mesh_options() });
+        let _ = bridge.tx.send(Command::Remesh {
+            opts: settings.mesh_options(),
+        });
         **needs_fetch = true;
     }
 }
@@ -1658,7 +1909,9 @@ fn request_blocks(
     }
     *cooldown -= time.delta_secs();
 
-    let Ok((transform, fly)) = camera.single() else { return };
+    let Ok((transform, fly)) = camera.single() else {
+        return;
+    };
 
     // Load around the cut plane, not the camera's altitude: the camera normally
     // floats well above the slice it is looking at.
@@ -1667,8 +1920,16 @@ fn request_blocks(
     } else {
         settings.z_ceiling
     };
-    let center = (transform.translation.x as i32, transform.translation.z as i32, z);
-    let block = (center.0.div_euclid(BLOCK), center.1.div_euclid(BLOCK), center.2);
+    let center = (
+        transform.translation.x as i32,
+        transform.translation.z as i32,
+        z,
+    );
+    let block = (
+        center.0.div_euclid(BLOCK),
+        center.1.div_euclid(BLOCK),
+        center.2,
+    );
 
     // Re-request on entering a new block, and otherwise once a second so the
     // view keeps up with the game world changing underneath it.
@@ -1705,6 +1966,7 @@ fn request_blocks(
 
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
+    counts: Res<instancing::InstanceCounts>,
     clock: Res<Clock>,
     weather: Res<Weather>,
     precip: Res<precipitation::Precipitation>,
@@ -1717,8 +1979,12 @@ fn update_hud(
     camera: Query<(&Transform, &FlyCamera)>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
-    let Ok(mut text) = hud.single_mut() else { return };
-    let Ok((transform, fly)) = camera.single() else { return };
+    let Ok(mut text) = hud.single_mut() else {
+        return;
+    };
+    let Ok((transform, fly)) = camera.single() else {
+        return;
+    };
 
     let ceiling = if settings.z_ceiling == i32::MAX {
         "none".to_string()
@@ -1731,6 +1997,7 @@ fn update_hud(
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          {}\n\
          chunks  {}   triangles {} of {} held   {:.0} fps\n\
+         far band  {} instances   {} drawn   {} culled   {} triangles\n\
          z-ceiling {ceiling}   hidden tiles {}   sky {}   falling {}   light shafts {}   \
          haze: {}\n\
          \n\
@@ -1741,12 +2008,20 @@ fn update_hud(
         status.world,
         status.detail,
         clock.describe(),
-        if clock.is_daylight() { "daylight" } else { "night" },
+        if clock.is_daylight() {
+            "daylight"
+        } else {
+            "night"
+        },
         transform.translation.x,
         transform.translation.z,
         transform.translation.y / Z_SCALE,
         fly.speed,
-        if walk.active { walk.line.as_str() } else { "fly     tab to walk with the character" },
+        if walk.active {
+            walk.line.as_str()
+        } else {
+            "fly     tab to walk with the character"
+        },
         entities.0.len(),
         drawn_triangles(&entities, bands.near, transform.translation),
         status.triangles,
@@ -1754,7 +2029,15 @@ fn update_hud(
             .get(&FrameTimeDiagnosticsPlugin::FPS)
             .and_then(|d| d.smoothed())
             .unwrap_or(0.0),
-        if settings.show_hidden { "shown" } else { "hidden" },
+        counts.instances,
+        counts.drawn,
+        counts.culled(),
+        counts.triangles,
+        if settings.show_hidden {
+            "shown"
+        } else {
+            "hidden"
+        },
         weather.describe(),
         precip.describe(),
         if rays.enabled { "on" } else { "off" },
@@ -1776,10 +2059,16 @@ mod tests {
         let edges = band_edges(near());
         assert_eq!(edges.len(), BANDS.len() - 1, "one hand-off per gap");
         for (fade, at) in band_fades(&edges).iter().zip(&edges) {
-            assert!(fade.start < *at && fade.end > *at, "{fade:?} does not straddle {at}");
+            assert!(
+                fade.start < *at && fade.end > *at,
+                "{fade:?} does not straddle {at}"
+            );
             // The dither is screen-space, so it only reads as a fade if the
             // camera spends real distance inside it.
-            assert!((fade.end - fade.start) / at > 0.2, "{fade:?} is barely wider than {at}");
+            assert!(
+                (fade.end - fade.start) / at > 0.2,
+                "{fade:?} is barely wider than {at}"
+            );
         }
     }
 
@@ -1788,7 +2077,10 @@ mod tests {
         // Bevy wants a range's start margin over before its end margin begins,
         // and a band caught fading in and out at once would flicker.
         let fades = band_fades(&band_edges(near()));
-        assert!(fades.windows(2).all(|w| w[0].end < w[1].start), "{fades:?} run into each other");
+        assert!(
+            fades.windows(2).all(|w| w[0].end < w[1].start),
+            "{fades:?} run into each other"
+        );
         for range in band_ranges(near()) {
             assert!(
                 range.start_margin.end <= range.end_margin.start,
@@ -1803,7 +2095,11 @@ mod tests {
     fn the_ranges_run_nearest_first_and_meet_at_the_hand_offs() {
         let ranges = band_ranges(near());
         assert_eq!(ranges.len(), BANDS.len(), "one range per band");
-        assert_eq!(ranges[0].start_margin, 0.0..0.0, "the near band starts at the camera");
+        assert_eq!(
+            ranges[0].start_margin,
+            0.0..0.0,
+            "the near band starts at the camera"
+        );
         for pair in ranges.windows(2) {
             assert_eq!(
                 pair[0].end_margin, pair[1].start_margin,
@@ -1829,8 +2125,16 @@ mod tests {
         let n = near();
         let window = band_edges(n);
         let horizon = horizon_edges(n);
-        assert_eq!(&horizon[..window.len()], &window[..], "the two chains disagree");
-        assert_eq!(horizon.len(), horizon_stages().len() - 1, "one hand-off per gap");
+        assert_eq!(
+            &horizon[..window.len()],
+            &window[..],
+            "the two chains disagree"
+        );
+        assert_eq!(
+            horizon.len(),
+            horizon_stages().len() - 1,
+            "one hand-off per gap"
+        );
     }
 
     /// Coarsening outward: every hand-off is further out than the one before,
@@ -1839,7 +2143,10 @@ mod tests {
     fn the_chain_coarsens_outward() {
         let n = near();
         for edges in [band_edges(n), horizon_edges(n)] {
-            assert!(edges.windows(2).all(|w| w[0] < w[1]), "{edges:?} is not monotone");
+            assert!(
+                edges.windows(2).all(|w| w[0] < w[1]),
+                "{edges:?} is not monotone"
+            );
         }
     }
 
@@ -1850,10 +2157,19 @@ mod tests {
         let n = near();
         let at = horizon_blob_from(n);
         let edges = horizon_edges(n);
-        assert!(at > 0 && at <= edges.len(), "blob stage {at} is off the chain");
-        assert!(edges[at - 1] >= SHADOW_DISTANCE, "the blob starts inside the cascades");
+        assert!(
+            at > 0 && at <= edges.len(),
+            "blob stage {at} is off the chain"
+        );
+        assert!(
+            edges[at - 1] >= SHADOW_DISTANCE,
+            "the blob starts inside the cascades"
+        );
         if at > 1 {
-            assert!(edges[at - 2] < SHADOW_DISTANCE, "a casting stage was given a blob");
+            assert!(
+                edges[at - 2] < SHADOW_DISTANCE,
+                "a casting stage was given a blob"
+            );
         }
         let range = horizon_blob_range(n);
         assert_eq!(range.start_margin, horizon_ranges(n)[at].start_margin);
@@ -1877,7 +2193,10 @@ mod tests {
         // A tree past the finest cut's own fade loses it, and the next stage
         // opens the chain.
         let past = ranges[0].end_margin.end + 1.0;
-        assert!(!stage_is_reachable(&ranges, 0, past), "the finest cut survived {past}");
+        assert!(
+            !stage_is_reachable(&ranges, 0, past),
+            "the finest cut survived {past}"
+        );
         assert!(stage_is_reachable(&ranges, 1, past));
         assert_eq!(opening_stage(&ranges, past), 1);
 
@@ -1890,11 +2209,23 @@ mod tests {
 
         // A stage that opens the chain starts at the camera; one that does not
         // keeps its predecessor's hand-off.
-        let opening = HorizonStage { stage: last, opens: true };
+        let opening = HorizonStage {
+            stage: last,
+            opens: true,
+        };
         assert_eq!(staged_range(&ranges, opening).start_margin, 0.0..0.0);
-        let following = HorizonStage { stage: last, opens: false };
-        assert_eq!(staged_range(&ranges, following).start_margin, ranges[last].start_margin);
-        assert_eq!(staged_range(&ranges, following).end_margin, ranges[last].end_margin);
+        let following = HorizonStage {
+            stage: last,
+            opens: false,
+        };
+        assert_eq!(
+            staged_range(&ranges, following).start_margin,
+            ranges[last].start_margin
+        );
+        assert_eq!(
+            staged_range(&ranges, following).end_margin,
+            ranges[last].end_margin
+        );
     }
 
     /// What the far band costs in entities: one per merged cell per reachable
