@@ -287,6 +287,17 @@ fn damp(rgb: [f32; 3], keep: f32) -> [f32; 3] {
     ]
 }
 
+/// The bottom sliver of a wall's side strip, `height` of a z-level tall.
+///
+/// A side strip runs one cell of texture per z-level, `v0` at the top of the
+/// box and `v1` at its foot. A floor slab sits at the bottom of its own level,
+/// so it takes the last sliver of that run: the course of masonry the wall
+/// below it would have shown had it carried on, at the wall's own texel
+/// density rather than a whole sheet squeezed into a thin band.
+fn strip_foot(side: Rect, height: f32) -> Rect {
+    Rect { v0: side.v1 - (side.v1 - side.v0) * (height / Z_SCALE).clamp(0.0, 1.0), ..side }
+}
+
 /// A deterministic per-tile brightness wobble, so a hillside of one material
 /// does not read as a single painted plane.
 fn jitter(x: i32, y: i32, z: i32) -> f32 {
@@ -523,7 +534,30 @@ pub fn build_chunk_budgeted(
                         mesh.stamp(&model.mesh, [fx, fy, fz], tint);
                         if lib.mode(voxel.tile_id) == Some(RenderMode::FlatTile) {
                             let rims = rim_faces();
-                            mesh.cuboid([fx, fy, fz], [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0], color, Faces { top: true, ..rims });
+                            let (lo, hi) =
+                                ([fx, fy, fz], [fx + 1.0, fy + FLOOR_HEIGHT, fz + 1.0]);
+                            match lib.floor_rim(voxel.tile_id) {
+                                // A built floor is the lid of a built wall, so
+                                // where its slab faces a drop it shows the same
+                                // masonry rather than a blank skirt. The model
+                                // already drew the lid and the underside is
+                                // never seen, so only the four sides are cut,
+                                // and both rects are the strip's foot.
+                                Some((side, _)) => {
+                                    let foot = strip_foot(side, FLOOR_HEIGHT);
+                                    mesh.textured_cuboid(
+                                        lo,
+                                        hi,
+                                        [tint[0], tint[1], tint[2], 1.0],
+                                        Faces { top: true, ..rims },
+                                        foot,
+                                        foot,
+                                    )
+                                }
+                                None => {
+                                    mesh.cuboid(lo, hi, color, Faces { top: true, ..rims })
+                                }
+                            }
                             tally(&mesh, before, &mut budget.floors);
                         } else {
                             tally(&mesh, before, &mut budget.models);

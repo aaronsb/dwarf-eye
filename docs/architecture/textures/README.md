@@ -56,6 +56,18 @@ every run).
   nine slices of one interlocking 3x3 edge pattern and only the centre `_5` is
   fully opaque, so `library.rs:ground_alias` asks for the centre everywhere and
   maps DFHack's four floor variants onto `_5`, `_5B`, `_5C`, `_5D`.
+- A built floor has no ground family at all. DFHack calls it `ConstructedFloor`,
+  with four `ShoddyConstructedFloor` cuts and sixteen `ConstructedFloorTrack`
+  variants beside it, and the raws name nothing of the sort, so
+  `library.rs:construction_floor` sends every one of them to
+  `floor_stone_blocks.png` — one atlas cell, shared, because the block sheet has
+  no directional cuts — and `mesh.rs:strip_foot` skirts the slab with the foot of
+  the constructed wall's own side strip ([walls.md](walls.md)). Nothing says what
+  the thing was built from: the block, log, bar or boulder lives in the block's
+  `construction_items` list, and a voxel carries a material index without the
+  type that separates a plank from a slab, so a wooden roof comes out as blocks
+  in wood colour. `WOOD_FLOOR`, `METAL_FLOOR` and the three `GLASS_*_FLOOR`
+  sheets wait for the day a voxel carries the type as well.
 - A sprite below `library.rs:PATTERN_SATURATION` 0.22 is a pattern to tint with
   the tile's material colour; above it, the sprite carries its own colour
   (`dwarf-eye-art:Sprite::saturation`).

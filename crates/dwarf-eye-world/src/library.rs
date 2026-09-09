@@ -7,7 +7,9 @@ use crate::model::{Caps, RenderMode, build_flat_tile, build_model};
 use crate::ramp;
 use crate::wall;
 use anyhow::Result;
-use dfhack_remote::rfr::{PlantRawList, TiletypeList, TiletypeMaterial, TiletypeShape};
+use dfhack_remote::rfr::{
+    PlantRawList, TiletypeList, TiletypeMaterial, TiletypeShape, TiletypeSpecial,
+};
 use dwarf_eye_art::atlas::{Atlas, Rect};
 use dwarf_eye_art::{Art, Sprite, find_install, raws};
 use std::collections::{HashMap, HashSet};
@@ -214,6 +216,32 @@ fn ground_alias(family: &str) -> Vec<String> {
     vec![family.to_string()]
 }
 
+/// Which of DF's floor sheets a built floor draws from, or `None` for ground
+/// the numbered families already name.
+///
+/// A construction's tiletype says only that somebody built it: `ConstructedFloor`,
+/// the four `ShoddyConstructedFloor` cuts and the sixteen `ConstructedFloorTrack`
+/// variants all report material `Construction` and nothing about the item they
+/// were raised from. That item lives in the block's `construction_items` list,
+/// and a voxel carries a material *index* without the material *type* that
+/// separates a plank from a slab, so nothing here can tell a wooden roof from a
+/// stone one. Every built floor therefore wears the block sheet and takes its
+/// material's colour, the bargain a constructed wall already makes with
+/// `ROCK_BLOCKS_WALL` ([walls.md]). DF ships `WOOD_FLOOR`, `METAL_FLOOR` and the
+/// three `GLASS_*_FLOOR` sheets against the day a voxel carries the type too.
+///
+/// The rim of the slab is the wall sheet's own side strip, so a roof's edge is
+/// the masonry it sits on rather than a white skirt.
+///
+/// [walls.md]: ../../../docs/architecture/textures/walls.md
+fn construction_floor(material: TiletypeMaterial, shape: TiletypeShape) -> Option<&'static str> {
+    matches!(
+        (material, shape),
+        (TiletypeMaterial::Construction, TiletypeShape::Floor)
+    )
+    .then_some("FLOOR_STONE_BLOCK")
+}
+
 /// A stable atlas key for one packed sprite.
 fn atlas_key(family: &str, dirs: u8, plant_id: &str) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -273,6 +301,8 @@ pub struct TileLibrary {
     /// Wall family -> the strip its four sides share, and whether the sheet is
     /// a pattern the material colours.
     wall_side: HashMap<&'static str, (Rect, bool)>,
+    /// Built floor -> the wall family whose side strip skirts its slab.
+    floor_rim: HashMap<i32, &'static str>,
     /// DF's ramp sprites, by full sprite name.
     ramp_uv: HashMap<String, (Rect, bool)>,
     /// Ramp geometry, by tiletype and the eight-neighbour wall mask.
@@ -296,6 +326,7 @@ impl TileLibrary {
         let mut tiles = HashMap::new();
         let mut built = HashSet::new();
         let mut walls = HashMap::new();
+        let mut floor_rim = HashMap::new();
         for t in &tiletypes.tiletype_list {
             let name = t.name();
             let entity = factory::Tile {
@@ -327,11 +358,19 @@ impl TileLibrary {
             } else {
                 alias(&raws::family_from_tiletype(name)).to_string()
             };
-            let candidates = if mode == RenderMode::FlatTile {
-                ground_alias(&family)
-            } else {
-                Vec::new()
+            // A built floor's own family names nothing on any sheet — there is
+            // no `CONSTRUCTED_FLOOR` — so it goes straight to the block sheet.
+            let built_floor = construction_floor(t.material(), t.shape());
+            let candidates = match (mode, built_floor) {
+                (RenderMode::FlatTile, Some(sheet)) => vec![sheet.to_string()],
+                (RenderMode::FlatTile, None) => ground_alias(&family),
+                _ => Vec::new(),
             };
+            if built_floor.is_some() {
+                if let Some(rim) = wall::family_for(t.material(), TiletypeSpecial::Normal, name) {
+                    floor_rim.insert(t.id, rim);
+                }
+            }
             // Billboards need ground under them; ramps need it on their slope.
             let beneath = matches!(mode, RenderMode::Billboard | RenderMode::Ramp)
                 .then(|| ground_under(t.material()));
@@ -344,7 +383,14 @@ impl TileLibrary {
                     ramp: (mode == RenderMode::Ramp)
                         .then(|| ramp::family_for(t.material()))
                         .flatten(),
-                    dirs: raws::direction_mask(t.direction()),
+                    // The block sheet has no directional cuts, so the sixteen
+                    // track floors would otherwise pack one sprite sixteen
+                    // times under sixteen atlas keys.
+                    dirs: if built_floor.is_some() {
+                        0
+                    } else {
+                        raws::direction_mask(t.direction())
+                    },
                     links: crate::skeleton::links_from_direction(t.direction()),
                     mode,
                     generic,
@@ -389,6 +435,7 @@ impl TileLibrary {
             walls,
             wall_top: HashMap::new(),
             wall_side: HashMap::new(),
+            floor_rim,
             ramp_uv: HashMap::new(),
             ramp_model: HashMap::new(),
             built,
@@ -667,6 +714,16 @@ impl TileLibrary {
         let (side, tint) = *self.wall_side.get(family)?;
         let top = *self.wall_top.get(&(family, wall::variant(mask)))?;
         Some(WallSkin { top, side, tint })
+    }
+
+    /// Where a built floor's rim samples the atlas, and whether that sheet is a
+    /// pattern the material colours.
+    ///
+    /// A roof is the lid of the wall under it, so its edge takes the wall
+    /// sheet's own side strip rather than a blank slab side.
+    pub fn floor_rim(&self, tile: i32) -> Option<(Rect, bool)> {
+        let family = *self.floor_rim.get(&tile)?;
+        self.wall_side.get(family).copied()
     }
 
     /// How many atlas cells the wall sheets took.
@@ -948,5 +1005,65 @@ impl TileLibrary {
 
     pub fn mode(&self, tile: i32) -> Option<RenderMode> {
         self.tiles.get(&tile).map(|t| t.mode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_built_floor_takes_dfs_block_sheet() {
+        use TiletypeMaterial as M;
+        use TiletypeShape as S;
+        let f = construction_floor;
+        // ConstructedFloor, the four Shoddy cuts and the sixteen track floors
+        // are one tiletype class as far as the sheets are concerned.
+        assert_eq!(f(M::Construction, S::Floor), Some("FLOOR_STONE_BLOCK"));
+        // Everything else a construction can be is somebody else's: a wall and
+        // a fortification wear the wall sheet, a ramp and a stair have their
+        // own geometry.
+        assert_eq!(f(M::Construction, S::Wall), None);
+        assert_eq!(f(M::Construction, S::Fortification), None);
+        assert_eq!(f(M::Construction, S::Ramp), None);
+        assert_eq!(f(M::Construction, S::StairUpdown), None);
+        // Natural ground keeps the numbered families it already resolves to.
+        assert_eq!(f(M::Stone, S::Floor), None);
+        assert_eq!(f(M::Soil, S::Floor), None);
+        assert_eq!(f(M::GrassLight, S::Floor), None);
+        assert_eq!(f(M::FrozenLiquid, S::Floor), None);
+    }
+
+    #[test]
+    fn a_built_floors_rim_is_the_masonry_of_a_built_wall() {
+        let wall = wall::family_for(TiletypeMaterial::Construction, TiletypeSpecial::Normal, "");
+        assert_eq!(wall, Some("ROCK_BLOCKS_WALL"));
+        // The rim is looked up through `wall_side`, so the wall sheet has to be
+        // one `pack_walls` fills: it is, because the tiletype list always holds
+        // constructed walls whether or not the map does.
+        assert!(construction_floor(TiletypeMaterial::Construction, TiletypeShape::Floor).is_some());
+    }
+
+    #[test]
+    fn the_floor_sheets_survive_the_raws_parser() {
+        // `parse_part` eats a trailing direction group, so a sheet whose name
+        // ends in N, S, W or E letters would be indexed under a shorter family
+        // than it was asked for.
+        for name in ["FLOOR_STONE_BLOCK", "WOOD_FLOOR", "METAL_FLOOR", "GLASS_GREEN_FLOOR"] {
+            let key = raws::parse_part(name);
+            assert_eq!(key.family, name);
+            assert_eq!(key.dirs, 0);
+        }
+    }
+
+    #[test]
+    fn a_built_floor_does_not_go_through_the_ground_families() {
+        // DFHack's names give families no sheet answers to, which is what left
+        // a roof blank. The construction path has to come first.
+        for name in ["ConstructedFloor", "ShoddyConstructedFloor1", "ConstructedFloorTrackNSEW"] {
+            let family = alias(&raws::family_from_tiletype(name)).to_string();
+            assert_eq!(ground_alias(&family), vec![family.clone()]);
+            assert!(family.starts_with("CONSTRUCTED") || family.starts_with("SHODDY"));
+        }
     }
 }
