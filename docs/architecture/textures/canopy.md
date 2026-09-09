@@ -55,11 +55,9 @@ the far band wears no cutout.
   tree lab threads its own `TexelDensity` resource through, so `-`/`=` and
   `DWARF_EYE_TEXELS` now rebuild streamers at the strip's own density (issue
   #25; a shot at 16 texels/tile shows the leaflets landing on their cells
-  rather than sampling a neighbour's). `dwarf-eye-world::canopy`'s own calls to
-  `mesh_of` are unchanged and still default to `DEFAULT_TEXELS`, so the live
-  viewer still misaligns streamer UVs whenever `DWARF_EYE_TEXELS` is set to
-  anything but 32 — threading the density from `main.rs:tree_texels` into
-  `canopy.rs`'s meshing is the remaining half of #25.
+  rather than sampling a neighbour's). The viewer meshes strands through
+  `texture::live_texels()`, the one reader of `DWARF_EYE_TEXELS`, so the strip
+  image and its UVs cannot disagree.
 - Tree surfaces carry no mipmaps and minify nearest, so they alias at distance
   where the ground atlas does not.
 - Leaf tones come from the species' own twig sprite, darkest first

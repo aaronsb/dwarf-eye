@@ -410,7 +410,8 @@ fn voxelise(
 
 /// The tree's weeping strands, meshed once and moved into render space.
 fn strands(grown: &trees::VoxelTree, at: [f32; 3]) -> TreeMesh {
-    let mut mesh = trees::mesh_of(grown, Some(Kind::Streamer));
+    let mut mesh =
+        trees::mesh_of_texels(grown, Some(Kind::Streamer), trees::texture::live_texels());
     for p in &mut mesh.positions {
         p[0] += at[0];
         p[1] = p[1] * Z_SCALE + at[1];

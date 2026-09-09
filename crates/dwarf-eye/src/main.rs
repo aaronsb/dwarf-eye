@@ -1345,11 +1345,7 @@ fn upload_chunks(
 /// a tile and the ground is drawn at that density, so trees match it by
 /// default; `DWARF_EYE_TEXELS` overrides.
 fn tree_texels() -> u32 {
-    std::env::var("DWARF_EYE_TEXELS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(trees::texture::DEFAULT_TEXELS)
-        .clamp(4, 128)
+    trees::texture::live_texels()
 }
 
 /// Wraps a generated surface. Canopy UVs are world-space and run well past

@@ -131,6 +131,17 @@ pub fn bark(texels: u32) -> Texels {
 /// world tile.
 pub const DEFAULT_TEXELS: u32 = 32;
 
+/// Texels per tile the viewer runs at: `DWARF_EYE_TEXELS`, else the default,
+/// clamped to 4..128. One reader for the meshers and the texture generators,
+/// so strip UVs and strip images always agree.
+pub fn live_texels() -> u32 {
+    std::env::var("DWARF_EYE_TEXELS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TEXELS)
+        .clamp(4, 128)
+}
+
 /// How many cells [`streamer_strip`] holds: three leaflet variants and a tip.
 pub const STREAMER_CELLS: u32 = 4;
 
