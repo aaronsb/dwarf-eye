@@ -59,8 +59,9 @@ classify_building(type) -> Class   // Building(type), from DF's own building_typ
 classify_unit() -> Class           // Unit
 classify_items(count) -> Class     // ItemPile once enough of them share a tile
 extent(Tile) -> Extent             // Tile or Tree: how much room DF gives it
+footing(Tile, Class) -> Footing    // Ground, Slope, Cliff, Tile: what it does to the ground surface
 resolve(Class, Style) -> Treatment // Sprite, Grown(...), Billboard, Massing(height), Capsule
-plan(Tile, Near) -> Plan           // the pair, decided once per tiletype
+plan(Tile, Near) -> Plan           // the three, decided once per tiletype
 seed(x, y, z, species) -> u64      // absolute tile and species, nothing else
 ```
 
@@ -118,6 +119,13 @@ mesher asking per tile pays one hash lookup.
 skipped by the sprite path, and a one-tile plant keeps the ground slab the
 billboard used to stand on. `Style::current` reads `DWARF_EYE_PLANTS=billboard`
 once, which puts standing plants back on crossed sprites for comparison.
+
+`Plan::footing` is the same decision for the ground: `Ground` and `Slope` are
+the natural surface the heightfield draws as one sheet, `Cliff` is where that
+sheet stops and holds its height, and `Tile` keeps the geometry the sprite
+library gives it ([../pipeline/meshing.md](../pipeline/meshing.md)). Whether a
+particular cliff has a ramp against it is the mesher's neighbourhood question,
+not the factory's, which is why the answer can be cached per tiletype.
 
 Sprite geometry is unchanged underneath: `library.rs:mode_for` still maps a
 `TiletypeShape` to one of five `RenderMode` values for everything the factory

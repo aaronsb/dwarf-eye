@@ -9,8 +9,9 @@ details planned (issue #9).
 ## What it does
 
 Draws three tiers of ground: full voxel detail where DF has tiles, nothing yet
-in between, and, out to the horizon, a terraced heightfield from the region and
-world maps carrying forests, rivers and sites. Crowns have four bands of their
+in between, and, out to the horizon, a heightfield from the region and world
+maps carrying forests, rivers and sites. Both the fine and the coarse tier
+follow `DWARF_EYE_GROUND`: smooth by default, terraced under `stepped`. Crowns have four bands of their
 own, because the canopy is where the triangles are: about five thousand a chunk,
 nearly all of them alpha-masked leaf voxels.
 
@@ -229,5 +230,5 @@ tiles beyond `world.map.block_index`
 ## Related issues
 
 #10 (mid detail), #9 (the seam skirt where the terraces meet the world grid),
-#6 (a smoothed fine tier would turn the terracing off and keep the boundary
-snap), #31 (the far band, landed).
+#6 (closed, the smoothed fine tier that turned the terracing off and kept the
+boundary snap), #31 (the far band, landed).

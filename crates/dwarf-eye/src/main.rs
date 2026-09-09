@@ -105,6 +105,9 @@ fn log_scene(clock: Res<Clock>, status: Res<Status>, mut said: Local<bool>) {
 }
 
 fn main() {
+    // `DWARF_EYE_GROUND=stepped` puts the terraces back, for a before-and-after
+    // at one framing (`heightfield.rs:Ground`).
+    println!("ground: {}", dwarf_eye_world::Ground::current().name());
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {

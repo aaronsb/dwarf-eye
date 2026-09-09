@@ -1,6 +1,7 @@
 # Meshing
 
 Status: landed (`crates/dwarf-eye-world/src/mesh.rs`,
+`crates/dwarf-eye-world/src/heightfield.rs`,
 `crates/dwarf-eye-world/src/water.rs`, `crates/dwarf-eye-world/src/canopy.rs`,
 `crates/dwarf-eye/src/main.rs`).
 
@@ -34,13 +35,72 @@ is pulled toward its own brightness (`mesh.rs:damp`), and a per-tile hash gives
 a brightness wobble so a hillside of one material is not a painted plane
 (`mesh.rs:jitter`).
 
+## The ground heightfield
+
+`heightfield.rs` draws natural ground as one smoothed sheet instead of a slab
+per tile. `mesh.rs:build_chunk_in` builds a `Surface` per chunk, the tile loop
+skips every tile that surface covers, and `Surface::emit` draws them all
+afterwards.
+
+Heights live on tile **corners**. A corner is the mean of what the four tiles
+touching it ask for, so both chunks either side of a border compute a shared
+corner from the same four tiles and the sheet has no seam — the trick
+`water.rs` already uses. What a tile asks for:
+
+| Tile | Asks for |
+|---|---|
+| natural floor, and the tile a shrub or a boulder stands in | its own slab top, `z + FLOOR_HEIGHT` |
+| natural ramp | `ramp::slopes` at each corner: the field `ramp.rs` cut its wedge from |
+| natural wall with natural ground on top | that ground's height, which is what a slope's high edge climbs to |
+| natural wall with nothing on top | nothing, and it **pins** the corners it touches |
+| constructed floor, stair, building, tree, anything worked | nothing, and it pins |
+
+The classification is the factory's (`factory.rs:footing`, cached in
+`Plan::footing`): `Ground`, `Slope`, `Cliff`, `Tile`. `heightfield.rs:probe`
+reads it straight off the palette, so walk mode can ask without a sprite
+library.
+
+Smoothing is `SWEEPS` 2 Jacobi sweeps, each pulling a corner `RELAX` 0.5 of the
+way toward the mean of its four cardinal neighbours. Pinned corners never move,
+so a cliff edge, a road and a workshop floor keep the height the game gave them
+and the sheet meets them flush. Two sweeps reach two rings, so a chunk is built
+over its own tiles plus a `BORDER` of two and every corner it keeps is the
+corner its neighbour computes — same inputs, same stencil, same answer, no
+crack. A wider border would be needed for a third sweep.
+
+Each covered tile becomes one two-triangle patch, folded along whichever
+diagonal the surface is flatter across, with per-corner normals from central
+differences and the tile's own ground sprite projected straight down onto it.
+The sprite comes back off the cached model (`heightfield.rs:ground_uv`), so the
+sheet wears exactly what the flat slab wore. Colour stays per tile, jitter and
+all, so the ground still reads as ground rather than a painted plane. The rim
+shows on the same rule the slab used: only where the tile beside it is open and
+nothing solid stands under it.
+
+`DWARF_EYE_GROUND=stepped` puts the terraces back
+(`heightfield.rs:Ground::current`, printed at startup). Every heightfield path
+hangs off one `covered` flag that is false whenever no surface was built, so
+stepped mode is the pass as it stood.
+
+### Grounding
+
+The heightfield publishes `h`, and everything standing on the ground drops to
+it. `heightfield.rs:grounded` is the whole rule: an entity stood on the tile's
+own slab before and may sink to meet the sheet, never rise off it.
+
+- one tile — a plant, a boulder — takes `h` at the tile's centre
+  (`canopy.rs:sow`);
+- a footprint — a building massing, an item pile — puts its lid on `h` at the
+  centre and stretches its bottom down to the tile's lowest corner, which is
+  the skirt (`mesh.rs:build_furnishings`).
+
 ## Geometry per tile
 
 | `Solid` | Geometry |
 |---|---|
 | `Cube`, `Fortification` | full cuboid, faces culled by `occluded`; a wall samples the atlas, the neighbour variant on its lid and a derived face on its sides (`MeshData::textured_cuboid`), anything else keeps its vertex colour |
-| `Floor` | slab `FLOOR_HEIGHT` 0.12 thick, rim faces only at a drop |
-| `Ramp` | wedge from the ramp sheet, or a half-height block with no sprite |
+| `Floor` | a patch of the ground sheet where natural; otherwise a slab `FLOOR_HEIGHT` 0.12 thick, rim faces only at a drop |
+| `Ramp` | a patch of the ground sheet where natural; a constructed one keeps the wedge from the ramp sheet, or a half-height block with no sprite |
 | `Stair` | two stacked boxes |
 | `Foliage` | inset box, 0.85 tall |
 | magma | box whose height is the fill level over 7, opaque material |
@@ -66,7 +126,10 @@ a brightness wobble so a hillside of one material is not a painted plane
 - Magma still draws as an opaque box with vertex alpha the material ignores.
   Greedy-merging terrain cubes is the rest of issue #16; the merge already
   exists for crowns in `canopy.rs:emit` and in `dwarf-eye-trees::mesh`.
-- Natural ground is stepped terraces, not a heightfield. Issue #6.
+- Natural ground is one smoothed sheet; the tile loop draws no top face and no
+  side face for a tile the sheet covers, and the sheet draws its own rim.
+  Constructed floors, buildings, stairs, water and anything a plant or a tree
+  grows out of keep their tile geometry.
 
 ## Water
 
@@ -93,6 +156,6 @@ with depth, so a shore is nearly clear and open water is not.
 
 ## Related issues
 
-#5 (registry lookups in place of the scattered checks), #6 (smoothed
-heightfield), #16 (magma transparency and greedy meshing), #10 (mid LOD),
-#29 (closed, this water), #13 (closed, textured walls).
+#5 (registry lookups in place of the scattered checks), #16 (magma
+transparency and greedy meshing), #10 (mid LOD), #6 (closed, this
+heightfield), #29 (closed, this water), #13 (closed, textured walls).

@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         total.ground_under += budget.ground_under;
         total.cubes += budget.cubes;
         total.floors += budget.floors;
+        total.surface += budget.surface;
         total.foliage += budget.foliage;
         total.liquids += budget.liquids;
         total.other += budget.other;
@@ -41,7 +42,7 @@ fn main() -> Result<()> {
         }
         chunks += 1;
     }
-    let sum = canopy.triangles + total.models + total.ramps + total.ground_under + total.cubes + total.floors + total.foliage + total.liquids + total.other;
+    let sum = canopy.triangles + total.models + total.ramps + total.ground_under + total.cubes + total.floors + total.surface + total.foliage + total.liquids + total.other;
     println!("{chunks} chunks, {sum} triangles");
     for (name, n) in [
         ("trees", canopy.triangles),
@@ -50,6 +51,7 @@ fn main() -> Result<()> {
         ("ground under billboards", total.ground_under),
         ("cubes (walls, soil, trunks without sprites)", total.cubes),
         ("floors", total.floors),
+        ("smoothed ground sheet", total.surface),
         ("foliage blocks", total.foliage),
         ("liquids", total.liquids),
         ("other", total.other),

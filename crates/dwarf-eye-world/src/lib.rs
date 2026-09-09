@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod clock;
 pub mod factory;
+pub mod heightfield;
 pub mod canopy;
 pub mod horizon;
 pub mod library;
@@ -18,6 +19,7 @@ pub mod weather;
 pub mod skeleton;
 pub mod world;
 
+pub use heightfield::{Ground, Surface};
 pub use mesh::{MeshData, MeshOptions, build_chunk};
 pub use palette::{Palette, Rgb, Solid};
 pub use session::Session;

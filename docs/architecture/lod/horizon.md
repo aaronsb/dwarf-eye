@@ -150,9 +150,24 @@ of different pitch disagree and the strata the fine map shows where its edge
 falls on a slope. Elsewhere risers hang `RISER_SKIRT` 2.0 below the cell they
 drop to.
 
-Only the quantisation is a mode switch: were the fine tier ever smoothed
-(issue #6), the boundary snap to fine column heights is unchanged and the
-terracing is what would be swapped out.
+The quantisation is a mode switch, and issue #6 threw it. Under
+`DWARF_EYE_GROUND=smooth` — the default now that the fine tier is a smoothed
+heightfield ([../pipeline/meshing.md](../pipeline/meshing.md)) — an unstitched
+cell is a quad over four **corner** heights taken from the un-quantised
+relieved survey (`terrace.rs:corner_top`, the mean of the four cell centres
+meeting at that corner) rather than a flat slab at a whole level. Two cells of
+one pitch average the same four centres, so they share the corner and the band
+is one sheet with no risers in it.
+
+The boundary snap is unchanged: a cell that touches the fine map is still the
+triangle fan of `stitch.rs`, its body still at `stitched_level`, its fine-side
+vertices still on the fine tiles' own levels. What changes around it is the
+skirting. A smooth cell hangs one only where it cannot share a corner — a
+change of pitch, a stitched neighbour, the fine rim, the world grid — and a
+stitched cell hangs one along its whole outline rather than only the stretches
+the fine map set, because in smooth mode its non-fine sides face a sheet at a
+height it does not hold. `DWARF_EYE_GROUND=stepped` puts both tiers back to
+terraces together.
 
 ## Forests
 
@@ -385,6 +400,6 @@ not exist.
 ## Related issues
 
 #31 (this band), #9 (the seam skirt past the region details), #10 (mid detail
-under the same mask), #6 (a smoothed fine tier would turn the quantisation off
-and keep the boundary snap), #12 (elevation offset and other protocol
-semantics).
+under the same mask), #6 (closed, the smoothed fine tier that turned the
+quantisation off and kept the boundary snap), #12 (elevation offset and other
+protocol semantics).
