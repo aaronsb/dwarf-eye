@@ -46,6 +46,21 @@ use super::scatter::{CrownInstance, Stage};
 /// every window move, a hundred times the geometry it holds now.
 pub const MERGE_MAX_TRIANGLES: usize = 64;
 
+/// Whether a build bakes the cheap stages into one mesh a cell at all.
+///
+/// Baking was the answer while a tree was an entity: twenty thousand entities
+/// cost more than the copies did. The instanced path
+/// (`dwarf-eye/src/instancing.rs`) draws every stage off one shared mesh with a
+/// transform per tree, so there is nothing left for baking to save and a good
+/// deal of held geometry to give back — [`assemble`] then leaves every stage
+/// instanced. `DWARF_EYE_HORIZON_MERGE=1` puts the baking back, which is how
+/// the two are compared.
+pub fn merging() -> bool {
+    std::env::var("DWARF_EYE_HORIZON_MERGE")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
 /// How many region tiles across one merged cell is, per stage.
 ///
 /// A cell hands over as a whole, at its own centre's distance (Bevy's
@@ -161,7 +176,11 @@ pub fn bake(src: &MeshData, instance: &CrownInstance, mesh_height: f32, out: &mu
     let turn = |v: [f32; 3]| [cos * v[0] + sin * v[2], v[1], -sin * v[0] + cos * v[2]];
     out.positions.extend(src.positions.iter().map(|p| {
         let t = turn([p[0] * scale, p[1] * scale, p[2] * scale]);
-        [t[0] + instance.pos[0], t[1] + instance.pos[1], t[2] + instance.pos[2]]
+        [
+            t[0] + instance.pos[0],
+            t[1] + instance.pos[1],
+            t[2] + instance.pos[2],
+        ]
     }));
     out.normals.extend(src.normals.iter().map(|n| turn(*n)));
     out.colors.extend_from_slice(&src.colors);
@@ -212,7 +231,11 @@ pub fn blob_corners(blob: &Blob, aim: [f32; 3]) -> [[f32; 3]; 4] {
 pub fn blob_mesh(shadows: &[Blob], aim: [f32; 3]) -> MeshData {
     let mut mesh = MeshData::default();
     for blob in shadows {
-        mesh.push_quad(blob_corners(blob, aim), [0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+        mesh.push_quad(
+            blob_corners(blob, aim),
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        );
     }
     mesh
 }
@@ -246,12 +269,21 @@ pub struct Batched {
 pub fn assemble(
     instances: &[(Preset, CrownInstance)],
     stages: &[Stage],
+    merge: bool,
     mut mesh_for: impl FnMut(Preset, Stage, u32) -> MeshData,
 ) -> Batched {
     // Only the rasterised cuts vary by growth variant; the crown and the box
     // have one mesh a species.
     fn key_of(preset: Preset, stage: Stage, instance: &CrownInstance) -> (Preset, Stage, u32) {
-        (preset, stage, if stage.per_tile().is_some() { instance.variant } else { 0 })
+        (
+            preset,
+            stage,
+            if stage.per_tile().is_some() {
+                instance.variant
+            } else {
+                0
+            },
+        )
     }
 
     // One canonical mesh per species, stage and variant, built once here and
@@ -277,7 +309,7 @@ pub fn assemble(
                 .map(|(_, (m, _))| m.triangle_count())
                 .max()
                 .unwrap_or(0);
-            (stage, worst <= MERGE_MAX_TRIANGLES)
+            (stage, merge && worst <= MERGE_MAX_TRIANGLES)
         })
         .collect();
 
@@ -291,14 +323,19 @@ pub fn assemble(
             let (mesh, height) = &canonical[&key];
             if merges[&stage] {
                 let span = cell_span(stage);
-                let cell = (instance.tile.0.div_euclid(span), instance.tile.1.div_euclid(span));
-                let slot = merged.entry((stage, cell.0, cell.1)).or_insert_with(|| Merged {
-                    stage,
-                    cell,
-                    reach: f32::MAX,
-                    trees: 0,
-                    mesh: MeshData::default(),
-                });
+                let cell = (
+                    instance.tile.0.div_euclid(span),
+                    instance.tile.1.div_euclid(span),
+                );
+                let slot = merged
+                    .entry((stage, cell.0, cell.1))
+                    .or_insert_with(|| Merged {
+                        stage,
+                        cell,
+                        reach: f32::MAX,
+                        trees: 0,
+                        mesh: MeshData::default(),
+                    });
                 slot.reach = slot.reach.min(instance.reach);
                 slot.trees += 1;
                 bake(mesh, &instance, *height, &mut slot.mesh);
@@ -326,13 +363,21 @@ pub fn assemble(
             .map(|p| p[0].abs().max(p[2].abs()))
             .fold(0.5f32, f32::max)
             * (instance.height / unit);
-        let cell =
-            (instance.tile.0.div_euclid(BLOB_CELL), instance.tile.1.div_euclid(BLOB_CELL));
-        let slot = blobs
-            .entry(cell)
-            .or_insert_with(|| Blobs { cell, reach: f32::MAX, shadows: Vec::new() });
+        let cell = (
+            instance.tile.0.div_euclid(BLOB_CELL),
+            instance.tile.1.div_euclid(BLOB_CELL),
+        );
+        let slot = blobs.entry(cell).or_insert_with(|| Blobs {
+            cell,
+            reach: f32::MAX,
+            shadows: Vec::new(),
+        });
         slot.reach = slot.reach.min(instance.reach);
-        slot.shadows.push(Blob { pos: instance.pos, radius, height: instance.height });
+        slot.shadows.push(Blob {
+            pos: instance.pos,
+            radius,
+            height: instance.height,
+        });
     }
 
     let mut out = Batched {
@@ -342,7 +387,8 @@ pub fn assemble(
     };
     // A stable order, so a rebuild spawns the same things in the same order.
     out.merged.sort_by_key(|m| (m.stage, m.cell));
-    out.crowns.sort_by_key(|b| (b.preset.name(), b.stage, b.variant));
+    out.crowns
+        .sort_by_key(|b| (b.preset.name(), b.stage, b.variant));
     out.blobs.sort_by_key(|b| b.cell);
     out
 }
@@ -364,7 +410,11 @@ fn copy(mesh: &MeshData) -> MeshData {
 /// How tall a stage's mesh stands, so an instance can be scaled to the height
 /// the scatter gave it whichever stage is drawing.
 pub fn mesh_height(mesh: &MeshData) -> f32 {
-    mesh.positions.iter().map(|p| p[1]).fold(0.0f32, f32::max).max(0.5)
+    mesh.positions
+        .iter()
+        .map(|p| p[1])
+        .fold(0.0f32, f32::max)
+        .max(0.5)
 }
 
 #[cfg(test)]
@@ -375,7 +425,12 @@ mod tests {
         let mut mesh = MeshData::default();
         // A one-tile box standing on zero, two tiles tall.
         mesh.push_quad(
-            [[-0.5, 0.0, -0.5], [-0.5, 2.0, -0.5], [0.5, 2.0, -0.5], [0.5, 0.0, -0.5]],
+            [
+                [-0.5, 0.0, -0.5],
+                [-0.5, 2.0, -0.5],
+                [0.5, 2.0, -0.5],
+                [0.5, 0.0, -0.5],
+            ],
             [0.0, 0.0, -1.0],
             [1.0, 1.0, 1.0, 1.0],
         );
@@ -407,7 +462,11 @@ mod tests {
         assert_eq!(out.triangle_count(), src.triangle_count() * 2);
         assert_eq!(out.indices.len(), src.indices.len() * 2);
         // The second copy's indices point at its own vertices.
-        assert!(out.indices[src.indices.len()..].iter().all(|&i| i as usize >= src.positions.len()));
+        assert!(
+            out.indices[src.indices.len()..]
+                .iter()
+                .all(|&i| i as usize >= src.positions.len())
+        );
 
         // A tree at twice the mesh's height doubles it and stands it on its
         // own spot.
@@ -416,7 +475,10 @@ mod tests {
         assert!((foot[1] - 0.0).abs() < 1e-4, "{foot:?}");
         assert!((foot[2] - (20.0 - 1.0)).abs() < 1e-4, "{foot:?}");
         let top = out.positions[1];
-        assert!((top[1] - 4.0).abs() < 1e-4, "a 4-tile tree off a 2-tile mesh: {top:?}");
+        assert!(
+            (top[1] - 4.0).abs() < 1e-4,
+            "a 4-tile tree off a 2-tile mesh: {top:?}"
+        );
 
         // A quarter turn takes the mesh's -z face to -x, about the tree's own
         // position.
@@ -431,7 +493,12 @@ mod tests {
     fn baking_turns_the_normals() {
         let src = unit_mesh();
         let mut out = MeshData::default();
-        bake(&src, &tree(0.0, 0.0, std::f32::consts::FRAC_PI_2, 6.0), 2.0, &mut out);
+        bake(
+            &src,
+            &tree(0.0, 0.0, std::f32::consts::FRAC_PI_2, 6.0),
+            2.0,
+            &mut out,
+        );
         let n = out.normals[0];
         assert!((n[0] - (-1.0)).abs() < 1e-4, "{n:?}");
         assert!(n[1].abs() < 1e-4 && n[2].abs() < 1e-4, "{n:?}");
@@ -443,7 +510,11 @@ mod tests {
     fn reach_is_the_gap_to_the_live_window() {
         let live = (0, 0, 144, 144);
         assert_eq!(reach((0, 0), (0, 0), live), 0.0, "a tile inside the window");
-        assert_eq!(reach((3, 0), (0, 0), live), 0.0, "a tile touching the window");
+        assert_eq!(
+            reach((3, 0), (0, 0), live),
+            0.0,
+            "a tile touching the window"
+        );
         // The fourth region tile out starts at 192, so its near edge is 48
         // tiles clear of the window's east side.
         assert!((reach((4, 0), (0, 0), live) - 48.0).abs() < 1e-4);
@@ -456,7 +527,11 @@ mod tests {
     /// away from the sun as it sets, never past the cap.
     #[test]
     fn a_blob_stretches_along_the_sun() {
-        let blob = Blob { pos: [0.0, 0.0, 0.0], radius: 1.0, height: 8.0 };
+        let blob = Blob {
+            pos: [0.0, 0.0, 0.0],
+            radius: 1.0,
+            height: 8.0,
+        };
         let overhead = blob_corners(&blob, [0.0, -1.0, 0.0]);
         let span = |c: [[f32; 3]; 4], axis: usize| {
             let lo = c.iter().map(|p| p[axis]).fold(f32::MAX, f32::min);
@@ -465,19 +540,28 @@ mod tests {
         };
         assert!((span(overhead, 0) - 2.0).abs() < 1e-4);
         assert!((span(overhead, 2) - 2.0).abs() < 1e-4);
-        assert!((overhead[0][1] - BLOB_LIFT).abs() < 1e-4, "the blob lies above the ground");
+        assert!(
+            (overhead[0][1] - BLOB_LIFT).abs() < 1e-4,
+            "the blob lies above the ground"
+        );
 
         // A low sun to the west throws the shadow east and stretches it.
         let low = [1.0f32, -0.25, 0.0];
         let cast = blob_corners(&blob, low);
         assert!(span(cast, 0) > 2.0, "{cast:?}");
-        assert!((span(cast, 2) - 2.0).abs() < 1e-3, "the width across the sun is unchanged");
+        assert!(
+            (span(cast, 2) - 2.0).abs() < 1e-3,
+            "the width across the sun is unchanged"
+        );
         let centre: f32 = cast.iter().map(|p| p[0]).sum::<f32>() / 4.0;
         assert!(centre > 0.0, "the shadow fell toward the sun: {centre}");
 
         // And never past the cap, however low the sun gets.
         let grazing = blob_corners(&blob, [1.0, -0.001, 0.0]);
-        assert!(span(grazing, 0) <= 2.0 * BLOB_MAX_STRETCH + 2.0 + 1e-3, "{grazing:?}");
+        assert!(
+            span(grazing, 0) <= 2.0 * BLOB_MAX_STRETCH + 2.0 + 1e-3,
+            "{grazing:?}"
+        );
     }
 
     /// Re-aiming rewrites the same positions the mesh would have been built
@@ -485,8 +569,16 @@ mod tests {
     #[test]
     fn re_aiming_matches_a_rebuild() {
         let shadows = vec![
-            Blob { pos: [3.0, 1.0, 4.0], radius: 1.5, height: 9.0 },
-            Blob { pos: [-8.0, 2.0, 1.0], radius: 0.8, height: 5.0 },
+            Blob {
+                pos: [3.0, 1.0, 4.0],
+                radius: 1.5,
+                height: 9.0,
+            },
+            Blob {
+                pos: [-8.0, 2.0, 1.0],
+                radius: 0.8,
+                height: 5.0,
+            },
         ];
         let dawn = [0.9f32, -0.3, 0.2];
         let noon = [0.05f32, -0.99, 0.0];

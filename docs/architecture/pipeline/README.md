@@ -41,6 +41,10 @@ delays the clock. Splitting them is issue #4.
 | [cache.md](cache.md) | the on-disk chunk store and the column floors |
 | [meshing.md](meshing.md) | chunks to triangles, and what rides which material |
 
+The far band's trees leave this pipeline before the ECS does: they are a
+storage buffer and a compute pass rather than entities and meshes
+([../lod/instancing.md](../lod/instancing.md)).
+
 ## Invariants
 
 - The worker thread owns the `World`. Face culling reads neighbouring chunks,

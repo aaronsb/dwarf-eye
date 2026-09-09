@@ -46,8 +46,8 @@ use batch::{Batched, Blobs, CrownBatch, Merged};
 use field::{Cell, Field};
 use fine::FineSurface;
 use scatter::{Clearing, CrownInstance, Patch, Stage, stages};
-use skin::Skins;
 use shade::{WATER, jitter, to_linear, top_color};
+use skin::Skins;
 use terrace::{FAR, Terrain, smooth_height};
 
 /// Tiles per region tile, and region tiles per world tile.
@@ -105,8 +105,12 @@ impl Horizon {
     /// instances. The two agree with what the stage cost before it was merged,
     /// which is what makes this line comparable across the change.
     pub fn stage_triangles(&self, stage: Stage) -> usize {
-        let baked: usize =
-            self.merged.iter().filter(|m| m.stage == stage).map(|m| m.mesh.triangle_count()).sum();
+        let baked: usize = self
+            .merged
+            .iter()
+            .filter(|m| m.stage == stage)
+            .map(|m| m.mesh.triangle_count())
+            .sum();
         let instanced: usize = self
             .crowns
             .iter()
@@ -168,7 +172,12 @@ impl Window {
 fn live_window(info: &MapInfo, origin: (i32, i32, i32)) -> (i32, i32, i32, i32) {
     let x0 = info.block_pos_x() * REGION_TILE - origin.0;
     let y0 = info.block_pos_y() * REGION_TILE - origin.1;
-    (x0, y0, x0 + info.block_size_x() * crate::world::BLOCK, y0 + info.block_size_y() * crate::world::BLOCK)
+    (
+        x0,
+        y0,
+        x0 + info.block_size_x() * crate::world::BLOCK,
+        y0 + info.block_size_y() * crate::world::BLOCK,
+    )
 }
 
 fn overlaps(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
@@ -196,7 +205,10 @@ fn region_cell(palette: &Palette, tile: &RegionTile) -> Cell {
         rainfall: tile.rainfall() as f32,
         drainage: tile.drainage() as f32,
         snow: tile.snow() as f32,
-        ground: tile.surface_material.as_ref().and_then(|p| palette.material_color(p)),
+        ground: tile
+            .surface_material
+            .as_ref()
+            .and_then(|p| palette.material_color(p)),
         detail: true,
     }
 }
@@ -221,7 +233,9 @@ pub fn build(
     for map in &regions.region_maps {
         let (wx, wy) = (map.map_x(), map.map_y());
         for (i, tile) in map.tiles.iter().enumerate() {
-            let Some((lx, ly)) = region_index(i as i32, transpose) else { continue };
+            let Some((lx, ly)) = region_index(i as i32, transpose) else {
+                continue;
+            };
             field.insert(
                 wx * REGIONS_PER_WORLD + lx,
                 wy * REGIONS_PER_WORLD + ly,
@@ -242,7 +256,11 @@ pub fn build(
         let elevation = *world_map.elevation.get(i)? as f32;
         Some(Cell {
             elevation,
-            water: world_map.water_elevation.get(i).map(|w| *w as f32).unwrap_or(elevation),
+            water: world_map
+                .water_elevation
+                .get(i)
+                .map(|w| *w as f32)
+                .unwrap_or(elevation),
             vegetation: world_map.vegetation.get(i).copied().unwrap_or(0) as f32,
             rainfall: world_map.rainfall.get(i).copied().unwrap_or(0) as f32,
             drainage: world_map.drainage.get(i).copied().unwrap_or(0) as f32,
@@ -275,7 +293,9 @@ pub fn build(
                 ((x0, y0 + 1), (1.0 - tx) * ty),
                 ((x0 + 1, y0 + 1), tx * ty),
             ] {
-                let Some(c) = sample_world(cx, cy) else { continue };
+                let Some(c) = sample_world(cx, cy) else {
+                    continue;
+                };
                 acc.elevation += c.elevation * w;
                 acc.water += c.water * w;
                 acc.vegetation += c.vegetation * w;
@@ -319,7 +339,9 @@ pub fn build(
     for map in &regions.region_maps {
         let (wx, wy) = (map.map_x(), map.map_y());
         for (i, tile) in map.tiles.iter().enumerate() {
-            let Some((lx, ly)) = region_index(i as i32, transpose) else { continue };
+            let Some((lx, ly)) = region_index(i as i32, transpose) else {
+                continue;
+            };
             let (rx, ry) = (wx * REGIONS_PER_WORLD + lx, wy * REGIONS_PER_WORLD + ly);
             let (ox, oz) = (rx * REGION_TILE - origin.0, ry * REGION_TILE - origin.1);
             let covered = fine.covers(ox + REGION_TILE / 2, oz + REGION_TILE / 2);
@@ -328,7 +350,9 @@ pub fn build(
                 features::emit_river(&mut mesh, &window, rx, ry, river);
             }
             let stone = features::stone_color(
-                tile.stone_materials.first().and_then(|p| palette.material_color(p)),
+                tile.stone_materials
+                    .first()
+                    .and_then(|p| palette.material_color(p)),
             );
             for building in &tile.buildings {
                 let footprint = features::building_bounds(&window, rx, ry, building);
@@ -348,7 +372,11 @@ pub fn build(
 
             mixes.insert(
                 (rx, ry),
-                (species_mix(palette, tile), tile.vegetation(), tile.elevation() as f32),
+                (
+                    species_mix(palette, tile),
+                    tile.vegetation(),
+                    tile.elevation() as f32,
+                ),
             );
         }
     }
@@ -358,7 +386,9 @@ pub fn build(
     for (&(rx, ry), (presets, vegetation, elevation)) in &mixes {
         let mut neighbours: Vec<Preset> = Vec::new();
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let Some((mix, _, _)) = mixes.get(&(rx + dx, ry + dy)) else { continue };
+            let Some((mix, _, _)) = mixes.get(&(rx + dx, ry + dy)) else {
+                continue;
+            };
             for preset in mix {
                 if !presets.contains(preset) && !neighbours.contains(preset) {
                     neighbours.push(*preset);
@@ -384,8 +414,11 @@ pub fn build(
 
     emit_world_grid(&mut mesh, &window, world_map, bias, &fine);
     let trees = crowns.len();
-    let Batched { merged, crowns, blobs } =
-        batch::assemble(&crowns, &stage_details(), crown_mesh);
+    let Batched {
+        merged,
+        crowns,
+        blobs,
+    } = batch::assemble(&crowns, &stage_details(), batch::merging(), crown_mesh);
     Horizon {
         mesh,
         merged,
@@ -426,13 +459,17 @@ fn world_bias(field: &Field, regions: &RegionMaps, world_map: &WorldMap) -> f32 
         if wx < 0 || wy < 0 || wx >= world_map.world_width || wy >= world_map.world_height {
             continue;
         }
-        let Some(&elevation) = world_map.elevation.get((wy * world_map.world_width + wx) as usize) else {
+        let Some(&elevation) = world_map
+            .elevation
+            .get((wy * world_map.world_width + wx) as usize)
+        else {
             continue;
         };
         let (mut sum, mut count) = (0.0, 0);
         for ly in 0..REGIONS_PER_WORLD {
             for lx in 0..REGIONS_PER_WORLD {
-                if let Some(c) = field.get(wx * REGIONS_PER_WORLD + lx, wy * REGIONS_PER_WORLD + ly) {
+                if let Some(c) = field.get(wx * REGIONS_PER_WORLD + lx, wy * REGIONS_PER_WORLD + ly)
+                {
                     sum += c.elevation;
                     count += 1;
                 }
@@ -450,17 +487,29 @@ fn world_bias(field: &Field, regions: &RegionMaps, world_map: &WorldMap) -> f32 
 /// range a z-level is under a pixel. It runs a world tile under the terraced
 /// bands and sits lower there, so the join is a step hidden beneath the finer
 /// surface rather than a crack.
-fn emit_world_grid(mesh: &mut MeshData, window: &Window, world_map: &WorldMap, bias: f32, fine: &FineSurface) {
+fn emit_world_grid(
+    mesh: &mut MeshData,
+    window: &Window,
+    world_map: &WorldMap,
+    bias: f32,
+    fine: &FineSurface,
+) {
     let spacing = REGION_TILE * REGIONS_PER_WORLD;
     let mut samples: HashMap<(i32, i32), (f32, [f32; 4], bool)> = HashMap::new();
     for wy in 0..world_map.world_height {
         for wx in 0..world_map.world_width {
             let i = (wy * world_map.world_width + wx) as usize;
-            let Some(&elevation) = world_map.elevation.get(i) else { continue };
+            let Some(&elevation) = world_map.elevation.get(i) else {
+                continue;
+            };
             let elevation = elevation as f32;
             let cell = Cell {
                 elevation: elevation - bias,
-                water: world_map.water_elevation.get(i).map(|w| *w as f32 - bias).unwrap_or(elevation - bias),
+                water: world_map
+                    .water_elevation
+                    .get(i)
+                    .map(|w| *w as f32 - bias)
+                    .unwrap_or(elevation - bias),
                 vegetation: world_map.vegetation.get(i).copied().unwrap_or(0) as f32,
                 rainfall: world_map.rainfall.get(i).copied().unwrap_or(0) as f32,
                 drainage: world_map.drainage.get(i).copied().unwrap_or(0) as f32,
@@ -468,13 +517,23 @@ fn emit_world_grid(mesh: &mut MeshData, window: &Window, world_map: &WorldMap, b
                 ground: None,
                 detail: false,
             };
-            let (px, pz) = (wx * spacing - window.origin.0 + spacing / 2, wy * spacing - window.origin.1 + spacing / 2);
-            let r = (px - window.centre.0).abs().max((pz - window.centre.1).abs());
+            let (px, pz) = (
+                wx * spacing - window.origin.0 + spacing / 2,
+                wy * spacing - window.origin.1 + spacing / 2,
+            );
+            let r = (px - window.centre.0)
+                .abs()
+                .max((pz - window.centre.1).abs());
             let under = r < FAR + spacing;
             let color = if cell.underwater() {
                 WATER
             } else {
-                jitter(top_color(&cell, 1.0), px + window.origin.0, pz + window.origin.1, 0.05)
+                jitter(
+                    top_color(&cell, 1.0),
+                    px + window.origin.0,
+                    pz + window.origin.1,
+                    0.05,
+                )
             };
             samples.insert(
                 (wx, wy),
@@ -511,14 +570,19 @@ fn emit_world_grid(mesh: &mut MeshData, window: &Window, world_map: &WorldMap, b
     for key in &keys {
         let (x, z) = *key;
         let corners = [(x, z), (x + 1, z), (x, z + 1), (x + 1, z + 1)];
-        let Some(indices) = corners.iter().map(|c| index_of.get(c).copied()).collect::<Option<Vec<u32>>>()
+        let Some(indices) = corners
+            .iter()
+            .map(|c| index_of.get(c).copied())
+            .collect::<Option<Vec<u32>>>()
         else {
             continue;
         };
         if corners.iter().all(|c| samples[c].2) {
             continue;
         }
-        mesh.indices.extend_from_slice(&[indices[0], indices[2], indices[1], indices[1], indices[2], indices[3]]);
+        mesh.indices.extend_from_slice(&[
+            indices[0], indices[2], indices[1], indices[1], indices[2], indices[3],
+        ]);
     }
 }
 
@@ -582,7 +646,13 @@ mod tests {
     }
 
     fn window() -> Window {
-        Window { x0: 0, y0: 0, origin: (0, 0, 100), centre: (72, 72), live: (0, 0, 144, 144) }
+        Window {
+            x0: 0,
+            y0: 0,
+            origin: (0, 0, 100),
+            centre: (72, 72),
+            live: (0, 0, 144, 144),
+        }
     }
 
     /// Quantising must not move the ground more than half a level, plus the
@@ -603,14 +673,22 @@ mod tests {
         };
         for tz in (-600..600).step_by(37) {
             for tx in (-600..600).step_by(41) {
-                let Some(level) = terrain.level_at(tx, tz) else { continue };
+                let Some(level) = terrain.level_at(tx, tz) else {
+                    continue;
+                };
                 let pitch = terrain.pitch_at(tx, tz).unwrap();
                 let smooth = field
-                    .relieved(cell_centre(tx, pitch) + window.origin.0, cell_centre(tz, pitch) + window.origin.1)
+                    .relieved(
+                        cell_centre(tx, pitch) + window.origin.0,
+                        cell_centre(tz, pitch) + window.origin.1,
+                    )
                     .surface()
                     - window.origin.2 as f32;
                 let step = (terrain.slab_top(level) - smooth).abs();
-                assert!(step <= 0.5 + crate::mesh::FLOOR_HEIGHT + 1e-4, "at ({tx}, {tz}): moved {step}");
+                assert!(
+                    step <= 0.5 + crate::mesh::FLOOR_HEIGHT + 1e-4,
+                    "at ({tx}, {tz}): moved {step}"
+                );
             }
         }
     }
@@ -697,7 +775,12 @@ mod tests {
         let fine = FineSurface::default();
         let sparse = placed(40, &fine);
         let dense = placed(90, &fine);
-        assert!(sparse.len() < dense.len(), "{} vs {}", sparse.len(), dense.len());
+        assert!(
+            sparse.len() < dense.len(),
+            "{} vs {}",
+            sparse.len(),
+            dense.len()
+        );
         for (i, tree) in sparse.iter().enumerate() {
             assert_eq!(tree.1, dense[i].1, "instance {i} moved");
             assert_eq!(tree.0, dense[i].0, "instance {i} changed species");
@@ -710,17 +793,24 @@ mod tests {
     fn a_treeless_window_edge_leaves_the_first_ring_bare() {
         // Region tile (5, -3) starts at tile (240, -144). Fine ground right
         // beside it, with no trees on it.
-        let columns: Vec<((i32, i32), i32)> =
-            (-12..12).flat_map(|by| (11..16).map(move |bx| ((bx, by), 40))).collect();
+        let columns: Vec<((i32, i32), i32)> = (-12..12)
+            .flat_map(|by| (11..16).map(move |bx| ((bx, by), 40)))
+            .collect();
         let bare: Vec<((i32, i32), f32)> = columns.iter().map(|(k, _)| (*k, 0.0)).collect();
         let fine = FineSurface::from_columns(&columns).with_canopy(&bare);
         assert!(!placed(90, &FineSurface::default()).is_empty());
-        assert!(placed(90, &fine).is_empty(), "trees grew beside a bare window");
+        assert!(
+            placed(90, &fine).is_empty(),
+            "trees grew beside a bare window"
+        );
 
         // The same window with a forest on it fills the ring again.
         let dense: Vec<((i32, i32), f32)> = columns.iter().map(|(k, _)| (*k, 0.9)).collect();
         let wooded = FineSurface::from_columns(&columns).with_canopy(&dense);
-        assert!(!placed(90, &wooded).is_empty(), "a wooded window edge grew nothing");
+        assert!(
+            !placed(90, &wooded).is_empty(),
+            "a wooded window edge grew nothing"
+        );
     }
 
     /// Crowns give way to the fine map exactly where the block mask does.
@@ -733,18 +823,31 @@ mod tests {
             .collect();
         let masked = placed(90, &FineSurface::from_columns(&columns));
         assert!(!clear.is_empty());
-        assert!(masked.is_empty(), "{} crowns stood on fine ground", masked.len());
+        assert!(
+            masked.is_empty(),
+            "{} crowns stood on fine ground",
+            masked.len()
+        );
     }
 
     #[test]
     fn every_preset_and_stage_meshes() {
-        for preset in [Preset::Oak, Preset::Birch, Preset::Pine, Preset::Willow, Preset::MushroomTree] {
+        for preset in [
+            Preset::Oak,
+            Preset::Birch,
+            Preset::Pine,
+            Preset::Willow,
+            Preset::MushroomTree,
+        ] {
             for stage in stages() {
                 let stage = stage.detail;
                 let mesh = crown_mesh(preset, stage, 1);
                 assert!(!mesh.indices.is_empty(), "{preset:?} {stage:?}");
                 assert_eq!(mesh.uvs.len(), mesh.positions.len());
-                assert!(batch::mesh_height(&mesh) > 1.0, "{preset:?} {stage:?} is flat");
+                assert!(
+                    batch::mesh_height(&mesh) > 1.0,
+                    "{preset:?} {stage:?} is flat"
+                );
             }
         }
     }
@@ -756,12 +859,20 @@ mod tests {
     fn every_tree_carries_every_stage() {
         let trees = placed(90, &FineSurface::default());
         assert!(!trees.is_empty());
-        let out = batch::assemble(&trees, &stage_details(), crown_mesh);
+        let out = batch::assemble(&trees, &stage_details(), true, crown_mesh);
         for stage in stage_details() {
-            let baked: usize =
-                out.merged.iter().filter(|m| m.stage == stage).map(|m| m.trees).sum();
-            let instanced: usize =
-                out.crowns.iter().filter(|b| b.stage == stage).map(|b| b.instances.len()).sum();
+            let baked: usize = out
+                .merged
+                .iter()
+                .filter(|m| m.stage == stage)
+                .map(|m| m.trees)
+                .sum();
+            let instanced: usize = out
+                .crowns
+                .iter()
+                .filter(|b| b.stage == stage)
+                .map(|b| b.instances.len())
+                .sum();
             assert_eq!(baked + instanced, trees.len(), "{stage:?} is missing trees");
             assert!(baked == 0 || instanced == 0, "{stage:?} is drawn two ways");
         }
@@ -771,9 +882,16 @@ mod tests {
         assert!(out.merged.iter().any(|m| m.stage == Stage::Box));
         assert!(out.crowns.iter().all(|b| b.stage.per_tile().is_some()));
         // Only the rasterised stages split by growth variant.
-        assert!(out.crowns.iter().all(|b| b.stage.per_tile().is_some() || b.variant == 0));
+        assert!(
+            out.crowns
+                .iter()
+                .all(|b| b.stage.per_tile().is_some() || b.variant == 0)
+        );
         // One blob a tree, however many stages stand over it.
-        assert_eq!(out.blobs.iter().map(|b| b.shadows.len()).sum::<usize>(), trees.len());
+        assert_eq!(
+            out.blobs.iter().map(|b| b.shadows.len()).sum::<usize>(),
+            trees.len()
+        );
     }
 
     /// Merging is a copy, not a rebuild: a cell's mesh holds exactly one copy
@@ -782,7 +900,7 @@ mod tests {
     #[test]
     fn merging_preserves_the_geometry_it_bakes() {
         let trees = placed(90, &FineSurface::default());
-        let out = batch::assemble(&trees, &stage_details(), crown_mesh);
+        let out = batch::assemble(&trees, &stage_details(), true, crown_mesh);
         for stage in [Stage::Crown, Stage::Box] {
             // What the same trees would have cost one entity at a time.
             let mut wanted = 0;
@@ -795,7 +913,10 @@ mod tests {
                 .filter(|m| m.stage == stage)
                 .map(|m| m.mesh.positions.len())
                 .sum();
-            assert_eq!(got, wanted, "{stage:?} lost or gained vertices in the merge");
+            assert_eq!(
+                got, wanted,
+                "{stage:?} lost or gained vertices in the merge"
+            );
         }
     }
 
@@ -811,17 +932,20 @@ mod tests {
         ]
         .into_iter()
         .map(|(pos, height, yaw)| {
-            (Preset::Oak, CrownInstance {
-                pos,
-                height,
-                yaw,
-                variant: 0,
-                tile: (0, 0),
-                reach: 500.0,
-            })
+            (
+                Preset::Oak,
+                CrownInstance {
+                    pos,
+                    height,
+                    yaw,
+                    variant: 0,
+                    tile: (0, 0),
+                    reach: 500.0,
+                },
+            )
         })
         .collect();
-        let out = batch::assemble(&placed, &[Stage::Box], crown_mesh);
+        let out = batch::assemble(&placed, &[Stage::Box], true, crown_mesh);
         assert_eq!(out.merged.len(), 1, "one tile, one cell");
         let cell = &out.merged[0];
         assert_eq!(cell.trees, 3);
@@ -845,7 +969,10 @@ mod tests {
                     -sin * x + cos * z + tree.pos[2],
                 ];
                 for k in 0..3 {
-                    assert!((got[k] - expect[k]).abs() < 1e-3, "tree {i}: {got:?} not {expect:?}");
+                    assert!(
+                        (got[k] - expect[k]).abs() < 1e-3,
+                        "tree {i}: {got:?} not {expect:?}"
+                    );
                 }
             }
             // And each stands at its own height off its own ground.
@@ -863,13 +990,21 @@ mod tests {
     #[test]
     fn a_tree_is_the_same_height_at_every_stage() {
         let trees = placed(90, &FineSurface::default());
-        let out = batch::assemble(&trees, &stage_details(), crown_mesh);
+        let out = batch::assemble(&trees, &stage_details(), true, crown_mesh);
         for batch in &out.crowns {
             let unit = batch::mesh_height(&crown_mesh(batch.preset, batch.stage, batch.variant));
-            assert!((unit - batch.mesh_height).abs() < 1e-3, "{:?} mesh height", batch.stage);
+            assert!(
+                (unit - batch.mesh_height).abs() < 1e-3,
+                "{:?} mesh height",
+                batch.stage
+            );
             for instance in &batch.instances {
                 let drawn = instance.height / batch.mesh_height * batch.mesh_height;
-                assert!((drawn - instance.height).abs() < 1e-3, "{:?} scaled wrong", batch.stage);
+                assert!(
+                    (drawn - instance.height).abs() < 1e-3,
+                    "{:?} scaled wrong",
+                    batch.stage
+                );
             }
         }
     }
@@ -883,7 +1018,12 @@ mod tests {
         assert!(!trees.is_empty());
         for (_, tree) in &trees {
             let wanted = batch::reach(tree.tile, (0, 0), (0, 0, 144, 144));
-            assert!((tree.reach - wanted).abs() < 1e-3, "{:?} reach {}", tree.tile, tree.reach);
+            assert!(
+                (tree.reach - wanted).abs() < 1e-3,
+                "{:?} reach {}",
+                tree.tile,
+                tree.reach
+            );
             assert!(tree.reach > 0.0, "a tree grew inside the live window");
         }
     }

@@ -252,6 +252,18 @@ cuts, which is [the batching below](#the-batching):
 | crown | `dwarf_eye_trees::crown`, a trunk under one to three boxes | `max(8 N, 150)` | 583 | a cell | a blob |
 | box | `dwarf_eye_trees::crown_box`, 12 triangles | the far plane | — | a cell | a blob |
 
+Every one of those rows is now **one instance in a storage buffer**, whatever
+the "drawn by" column says: `main.rs:instance_batches` hands the whole chain to
+`instancing.rs`, a compute pass culls it per view and each (mesh, stage) group
+is one indirect draw ([instancing.md](instancing.md), issue #34). The stage a
+tree draws at is still that tree's own distance to the eye, and the hand-off is
+still `main.rs:band_fades`'s margins — only now the dither is per tree rather
+than per pixel, so exactly one stage draws each tree and no stage pays a
+`VISIBILITY_RANGE_DITHER` discard. `DWARF_EYE_INSTANCING=0` puts the entity path
+back and `DWARF_EYE_HORIZON_MERGE=1` the baking with it, which is how the two
+are measured: at the same framings, 4424 entities at 64 fps at eye level and 83
+from the air become 680 entities at 75 and 120.
+
 `N` is the canopy's own near band (`canopy::near_band`, 73 tiles at the default threshold into a
 720-tall window), so a longer lens or a taller window pushes the whole chain
 out. The first four edges are the window's, to the bit

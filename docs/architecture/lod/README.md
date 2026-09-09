@@ -5,7 +5,9 @@ canopy bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); the
 far band from region data landed (`crates/dwarf-eye-world/src/horizon/`, issue
 #31); the bands and the far band's instances now come off one chain in the
 factory (`factory.rs:Chain`, [../factory/README.md](../factory/README.md), issue
-#5); mid terrain heightfield planned (issue #10); seam skirt past the region
+#5); the far band's trees draw through true GPU instancing
+(`crates/dwarf-eye/src/instancing.rs`, issue #34); mid terrain heightfield
+planned (issue #10); seam skirt past the region
 details planned (issue #9).
 
 ## What it does
@@ -203,6 +205,7 @@ tiles beyond `world.map.block_index`
 
 | Page | |
 |---|---|
+| [instancing.md](instancing.md) | true GPU instancing: one storage buffer of trees, a compute cull per view, indirect draws through the main pass, the prepass and the cascades |
 | [horizon.md](horizon.md) | the terraced far band: region and world maps, the ground sprites it wears, the window's own tree chain drawn as instances, rivers, sites, the block mask and the stitched seam |
 
 ## Invariants and gotchas
