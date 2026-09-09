@@ -158,7 +158,7 @@ impl Chunk {
 }
 
 /// A bounding box of blocks in x/y and z-levels in z, matching `BlockRequest`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockBounds {
     pub min_x: i32,
     pub max_x: i32,

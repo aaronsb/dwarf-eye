@@ -1473,12 +1473,23 @@ fn handle_input(
     }
 }
 
+/// A travel vector held fixed by the environment: `DWARF_EYE_TRAVEL=east,south`
+/// as two numbers, say `1,0`. It is how the preload order is checked without
+/// walking anybody: the fetch centre stays where it is and only the order the
+/// blocks are asked for, meshed and kept in changes.
+fn pinned_travel() -> Option<Vec2> {
+    let spec = std::env::var("DWARF_EYE_TRAVEL").ok()?;
+    let (east, south) = spec.split_once(',')?;
+    let v = Vec2::new(east.trim().parse().ok()?, south.trim().parse().ok()?);
+    (v != Vec2::ZERO).then(|| v.normalize())
+}
+
 /// Asks for map around the camera whenever it moves into a new block.
 fn request_blocks(
     time: Res<Time>,
     bridge: NonSend<Bridge>,
     settings: Res<ViewSettings>,
-    camera: Query<&Transform, With<FlyCamera>>,
+    camera: Query<(&Transform, &FlyCamera)>,
     walk: Res<walk::WalkMode>,
     mut last: Local<Option<(i32, i32, i32)>>,
     mut cooldown: Local<f32>,
@@ -1490,7 +1501,7 @@ fn request_blocks(
     }
     *cooldown -= time.delta_secs();
 
-    let Ok(transform) = camera.single() else { return };
+    let Ok((transform, fly)) = camera.single() else { return };
 
     // Load around the cut plane, not the camera's altitude: the camera normally
     // floats well above the slice it is looking at.
@@ -1519,10 +1530,19 @@ fn request_blocks(
     // to stream in at the character's pace rather than the flier's.
     *cooldown = if walk.active { 0.3 } else { 1.0 };
 
+    // Which way the view is going, on the ground plan. The character's own run
+    // of tile crossings comes first — it is the world the game is streaming —
+    // and the flier's eased keys stand in when nobody is walking.
+    let heading = pinned_travel()
+        .or_else(|| walk.travel())
+        .or_else(|| if walk.active { None } else { fly.travelling() })
+        .map(|v| (v.x, v.y));
+
     let _ = bridge.tx.send(Command::Fetch {
         center,
         opts: settings.mesh_options(),
         force,
+        heading,
     });
 }
 

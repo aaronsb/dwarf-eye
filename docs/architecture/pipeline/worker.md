@@ -20,13 +20,14 @@ sequenceDiagram
   participant R as Bevy
   participant W as worker thread
   participant D as DFHack
-  R->>W: Fetch { center, opts, force }
+  R->>W: Fetch { center, opts, force, heading }
   W->>D: GetMapInfo, GetViewInfo
-  W->>D: GetBlockList x slabs of 500
+  W->>D: GetBlockList, the newly covered strip, forced
+  W->>D: GetBlockList x slabs of 500, ahead band, sides, behind
   D-->>W: changed blocks only, unless forced
   W->>W: absorb, read_floors, persist
   W->>W: retain_within, retire_near
-  W->>W: build_chunk + Forest::build_chunk
+  W->>W: build_chunk + Forest::build_chunk, leading edge first
   W-->>R: Coverage, Chunks (batches of 48)
   W->>D: GetRegionMapsNew, GetWorldMap (first pass, or window moved)
   W-->>R: Horizon
@@ -35,11 +36,21 @@ sequenceDiagram
 Commands are `Fetch`, `Remesh`, `Run` and `Shutdown`. The clock and the sky
 used to be two more and are now `polls.rs`, a light connection of their own.
 `worker.rs:collect` is the pass: refresh the window, read the view centre, tell
-the session where the character is (`Session::watch_from`), fetch
-`COLLECT_ABOVE` 200 levels up and `COLLECT_BELOW` 32 levels down, retire chunks
-outside `RETAIN_RADIUS` 40 blocks horizontally, remesh what arrived and its six
+the session where the character is and which way they are going
+(`Session::watch_from`, `Session::travel_toward`), fetch `COLLECT_ABOVE` 200
+levels up and `COLLECT_BELOW` 32 levels down, retire chunks outside
+`RETAIN_RADIUS` 40 blocks horizontally, remesh what arrived and its six
 neighbours (`worker.rs:remesh_touched`), and rebuild the horizon when the window
 has moved.
+
+`Fetch` carries a travel vector and everything ordered by it is
+[../preload/README.md](../preload/README.md): the strip the window has just
+uncovered goes first and forced (`worker.rs:newly_covered`), then the window in
+three bands — ahead, the sides, behind (`session.rs:travel_bands`) — and the
+chunks are meshed leading edge first (`worker.rs:leading_first`). The retention
+box is pushed along the heading so what falls out of it is what is behind
+(`worker.rs:retention_box`). Each pass says the order it chose in one log line,
+repeated only when the heading or the shift changes it.
 
 `main.rs:request_blocks` drives it: on entering a new block, otherwise every
 second flying and every 0.3 s walking. The first request forces.
@@ -82,6 +93,6 @@ centre between threads for no gain, so it stays.
 
 ## Related issues
 
-#4 (landed for the clock and the weather; the view centre stays in the pass), #21 (slab and
-remesh order on the travel vector), #23 (re-probe under column floors), #17
-(closed, restored-cache meshing cost).
+#4 (landed for the clock and the weather; the view centre stays in the pass),
+#21 (landed, slab and remesh order on the travel vector), #23 (re-probe under
+column floors), #17 (closed, restored-cache meshing cost).

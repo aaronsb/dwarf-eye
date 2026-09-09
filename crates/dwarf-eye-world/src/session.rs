@@ -59,6 +59,13 @@ pub struct Pass {
     /// The window moved while the pass was in flight, so it neither trusted its
     /// own frame nor dropped anything.
     pub window_moved: bool,
+    /// Blocks asked for in the forced strip the window had just uncovered, and
+    /// how many boxes that strip took.
+    pub leading: i32,
+    pub leading_boxes: usize,
+    /// How many bands the travel heading cut the window into: one when nothing
+    /// is travelling, otherwise ahead, the sides, and behind.
+    pub bands: usize,
 }
 
 /// Which levels of a column a descent asks about.
@@ -273,6 +280,46 @@ fn unanswered(
     out
 }
 
+/// A box cut into the bands a travelling character wants in order: the blocks
+/// ahead of them, the strip they stand in, then the blocks behind. `here` is
+/// their block column in the same coordinates as the box.
+///
+/// A request is a box, so the cut is a single plane across the axis the heading
+/// mostly runs on. A diagonal therefore puts one flanking quarter in with the
+/// blocks ahead, which is the price of not turning one request into four; what
+/// matters is that the land the character is walking into is asked for first.
+/// Nothing here widens the box: every band is a slice of it.
+fn travel_bands(
+    local: &BlockBounds,
+    here: (i32, i32),
+    heading: Option<(f32, f32)>,
+) -> Vec<BlockBounds> {
+    let Some((hx, hy)) = heading else { return vec![*local] };
+    let across_x = hx.abs() >= hy.abs();
+    let (lo, hi, at, forward) = if across_x {
+        (local.min_x, local.max_x, here.0, hx >= 0.0)
+    } else {
+        (local.min_y, local.max_y, here.1, hy >= 0.0)
+    };
+    let at = at.clamp(lo, hi - 1);
+    let spans = if forward {
+        [(at + 1, hi), (at, at + 1), (lo, at)]
+    } else {
+        [(lo, at), (at, at + 1), (at + 1, hi)]
+    };
+    spans
+        .into_iter()
+        .filter(|(a, b)| a < b)
+        .map(|(a, b)| {
+            if across_x {
+                BlockBounds { min_x: a, max_x: b, ..*local }
+            } else {
+                BlockBounds { min_y: a, max_y: b, ..*local }
+            }
+        })
+        .collect()
+}
+
 /// Where a reply's own local coordinates sit, in render blocks and levels.
 ///
 /// Every `BlockList` carries the window's position at the moment the server
@@ -315,6 +362,10 @@ pub struct Session {
     /// Where the character is, in render tiles and level, so a column they
     /// descend into is probed afresh.
     viewer: (i32, i32, i32),
+    /// Which way they are travelling on the ground plan, as a unit vector east
+    /// and south, or `None` when nothing is travelling. It orders the slabs; it
+    /// never changes which blocks a pass asks about.
+    heading: Option<(f32, f32)>,
     /// When the ground under the floors was last asked about.
     probed: Instant,
     /// What the last pass cost.
@@ -347,6 +398,7 @@ impl Session {
             cache,
             floors: Floors::new(floors),
             viewer: (0, 0, 0),
+            heading: None,
             // The first probe comes a period in, so the first pass — which is
             // forced, and asks for everything the floors allow — is untouched.
             probed: Instant::now(),
@@ -358,6 +410,13 @@ impl Session {
     /// a column they have gone down into is asked about again.
     pub fn watch_from(&mut self, at: (i32, i32, i32)) {
         self.viewer = at;
+    }
+
+    /// Tells the session which way the character is travelling, as a unit
+    /// vector east and south on the ground plan, so the slabs ahead of them are
+    /// asked for first. `None` puts the window back in one piece.
+    pub fn travel_toward(&mut self, heading: Option<(f32, f32)>) {
+        self.heading = heading;
     }
 
     /// How many columns have a known floor.
@@ -503,6 +562,21 @@ impl Session {
         }
     }
 
+    /// A render-space box clipped to the window, in the window's own block
+    /// coordinates. `None` when none of it is inside.
+    fn localize(&self, bounds: BlockBounds, shift: (i32, i32, i32)) -> Option<BlockBounds> {
+        let local = BlockBounds {
+            min_x: (bounds.min_x - shift.0).max(0),
+            max_x: (bounds.max_x - shift.0).min(self.map_info.block_size_x()),
+            min_y: (bounds.min_y - shift.1).max(0),
+            max_y: (bounds.max_y - shift.1).min(self.map_info.block_size_y()),
+            min_z: (bounds.min_z - shift.2).max(0),
+            max_z: (bounds.max_z - shift.2).min(self.map_info.block_size_z()),
+        };
+        (local.min_x < local.max_x && local.min_y < local.max_y && local.min_z < local.max_z)
+            .then_some(local)
+    }
+
     /// Fetches the blocks of `bounds` (render-space blocks and levels) that
     /// fall inside the window, and folds them into the world. Returns the keys
     /// of the chunks that arrived.
@@ -523,20 +597,27 @@ impl Session {
     /// A column comes back when the character goes down into it, when the block
     /// that proved its floor is revealed, when the periodic probe finds ground
     /// under the floor, or when a neighbour does and this column is next to it.
+    ///
+    /// `leading` is the part of the box the last pass did not cover, in render
+    /// blocks: the strip a window shift or a change of depth has just uncovered.
+    /// It is asked for first and forced, because an unforced request would weigh
+    /// it against a hash from land that is no longer there.
     pub fn fetch(&mut self, bounds: BlockBounds, force: bool) -> Result<Vec<(i32, i32, i32)>> {
+        self.fetch_leading(bounds, force, &[])
+    }
+
+    /// [`Session::fetch`] with a leading strip in front of it.
+    pub fn fetch_leading(
+        &mut self,
+        bounds: BlockBounds,
+        force: bool,
+        leading: &[BlockBounds],
+    ) -> Result<Vec<(i32, i32, i32)>> {
         let (sx, sy, sz) = self.shift();
         let shift_blocks = (sx.div_euclid(BLOCK), sy.div_euclid(BLOCK), sz);
-        let local = BlockBounds {
-            min_x: (bounds.min_x - shift_blocks.0).max(0),
-            max_x: (bounds.max_x - shift_blocks.0).min(self.map_info.block_size_x()),
-            min_y: (bounds.min_y - shift_blocks.1).max(0),
-            max_y: (bounds.max_y - shift_blocks.1).min(self.map_info.block_size_y()),
-            min_z: (bounds.min_z - shift_blocks.2).max(0),
-            max_z: (bounds.max_z - shift_blocks.2).min(self.map_info.block_size_z()),
-        };
-        if local.min_x >= local.max_x || local.min_y >= local.max_y || local.min_z >= local.max_z {
+        let Some(local) = self.localize(bounds, shift_blocks) else {
             return Ok(Vec::new());
-        }
+        };
         // A column the character has walked down into is one whose floor was
         // only ever the limit of what they had seen from above.
         //
@@ -552,27 +633,61 @@ impl Session {
         self.floors.forget_under(here);
         let kept = self.floors.len();
 
-        let surface = self.descend(&local, shift_blocks, force, Phase::Surface)?;
         let mut pass = Pass {
-            asked: surface.asked,
             whole_box: (local.max_x - local.min_x)
                 * (local.max_y - local.min_y)
                 * (local.max_z - local.min_z),
-            arrived: 0,
             floors: kept,
             ..Default::default()
         };
-        let mut arrived = surface.arrived;
-        let mut news = surface.news;
+        let mut arrived = Vec::new();
+        let mut news = Vec::new();
+        let mut asked_keys = Vec::new();
+        let mut moved = false;
+
+        // The strip first, forced, in the order the caller put it in — the
+        // leading edge before the trailing one.
+        for &strip in leading {
+            let Some(strip) = self.localize(strip, shift_blocks) else { continue };
+            let out = self.descend(&strip, shift_blocks, true, Phase::Surface)?;
+            pass.asked += out.asked;
+            pass.leading += out.asked;
+            pass.leading_boxes += 1;
+            moved |= out.moved;
+            asked_keys.extend(out.asked_keys);
+            arrived.extend(out.arrived);
+            news.extend(out.news);
+        }
+
+        // Then the window itself, cut into the bands the heading orders: the
+        // blocks ahead of the character, the strip they stand in, then the ones
+        // behind. Each band is a slice of the same box, so nothing is asked for
+        // that the one descent would not have asked for.
+        let local_here = (
+            self.viewer.0.div_euclid(BLOCK) - shift_blocks.0,
+            self.viewer.1.div_euclid(BLOCK) - shift_blocks.1,
+        );
+        let bands = travel_bands(&local, local_here, self.heading);
+        pass.bands = bands.len();
+        for band in &bands {
+            let out = self.descend(band, shift_blocks, force, Phase::Surface)?;
+            pass.asked += out.asked;
+            moved |= out.moved;
+            asked_keys.extend(out.asked_keys);
+            arrived.extend(out.arrived);
+            news.extend(out.news);
+        }
 
         // While the live window covers a block, the game is the authority on
         // it. A forced request is the whole truth about the box it asked for,
         // so a chunk still standing where nothing came back is land the game
         // has moved on from: a felled tree, a block that is now air, or a chunk
-        // written 48 tiles off by a pass that spanned a re-centring.
-        pass.window_moved = surface.moved;
-        if force && !surface.moved {
-            for key in unanswered(&surface.asked_keys, &arrived) {
+        // written 48 tiles off by a pass that spanned a re-centring. Only a
+        // forced descent fills `asked_keys`, so an unforced sweep with a forced
+        // strip in front of it drops only inside that strip.
+        pass.window_moved = moved;
+        if !moved {
+            for key in unanswered(&asked_keys, &arrived) {
                 if self.world.remove(key) {
                     pass.stale.push(key);
                 }
@@ -610,6 +725,10 @@ impl Session {
             }
         }
 
+        // The bands sweep over the leading strip as well, so a block can arrive
+        // twice in one pass. Meshing it twice is only waste.
+        arrived.sort_unstable();
+        arrived.dedup();
         pass.arrived = arrived.len();
         pass.reopened =
             news.iter().filter(|s| s.opened).map(|s| (s.column, s.z)).collect();
@@ -1054,6 +1173,82 @@ mod tests {
         // on, which is three blocks.
         list.map_x = Some(2);
         assert_eq!(reply_frame(&list, origin, 3), Some((3, 0, 3)));
+    }
+
+    /// A synthetic window: nine block columns square, eight levels deep.
+    fn window() -> BlockBounds {
+        BlockBounds { min_x: 0, max_x: 9, min_y: 0, max_y: 9, min_z: 100, max_z: 108 }
+    }
+
+    /// The x or y span of a band, on whichever axis the cut was made.
+    fn spans(bands: &[BlockBounds], across_x: bool) -> Vec<(i32, i32)> {
+        bands
+            .iter()
+            .map(|b| if across_x { (b.min_x, b.max_x) } else { (b.min_y, b.max_y) })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_travelling_leaves_the_window_in_one_piece() {
+        assert_eq!(travel_bands(&window(), (4, 4), None), vec![window()]);
+    }
+
+    #[test]
+    fn the_blocks_ahead_are_asked_for_before_the_sides_and_the_sides_before_behind() {
+        let bands = travel_bands(&window(), (4, 4), Some((1.0, 0.0)));
+        assert_eq!(spans(&bands, true), vec![(5, 9), (4, 5), (0, 4)]);
+        // Walking west is the same cut read the other way round.
+        let back = travel_bands(&window(), (4, 4), Some((-1.0, 0.0)));
+        assert_eq!(spans(&back, true), vec![(0, 4), (4, 5), (5, 9)]);
+        // North is negative y, so the blocks ahead are the low ones.
+        let north = travel_bands(&window(), (4, 4), Some((0.0, -1.0)));
+        assert_eq!(spans(&north, false), vec![(0, 4), (4, 5), (5, 9)]);
+        for band in &bands {
+            assert_eq!((band.min_y, band.max_y, band.min_z, band.max_z), (0, 9, 100, 108));
+        }
+    }
+
+    #[test]
+    fn a_diagonal_run_is_cut_across_the_axis_it_mostly_runs_on() {
+        // South-east, leaning east: the cut is on x.
+        let bands = travel_bands(&window(), (4, 4), Some((0.8, 0.6)));
+        assert_eq!(spans(&bands, true), vec![(5, 9), (4, 5), (0, 4)]);
+        // South-east, leaning south: the same run, cut on y.
+        let bands = travel_bands(&window(), (4, 4), Some((0.6, 0.8)));
+        assert_eq!(spans(&bands, false), vec![(5, 9), (4, 5), (0, 4)]);
+    }
+
+    #[test]
+    fn the_bands_cover_the_window_exactly_once_and_never_widen_it() {
+        let box_ = window();
+        for heading in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (0.7, -0.7)] {
+            for here in [(4, 4), (0, 0), (8, 8), (-3, 12)] {
+                let bands = travel_bands(&box_, here, Some(heading));
+                let mut seen = Vec::new();
+                for band in &bands {
+                    assert!(
+                        band.min_x >= box_.min_x
+                            && band.max_x <= box_.max_x
+                            && band.min_y >= box_.min_y
+                            && band.max_y <= box_.max_y
+                            && band.min_z == box_.min_z
+                            && band.max_z == box_.max_z,
+                        "a band reached outside the window: {band:?}"
+                    );
+                    for bx in band.min_x..band.max_x {
+                        for by in band.min_y..band.max_y {
+                            seen.push((bx, by));
+                        }
+                    }
+                }
+                let whole = (box_.max_x - box_.min_x) * (box_.max_y - box_.min_y);
+                seen.sort_unstable();
+                let asked = seen.len();
+                seen.dedup();
+                assert_eq!(seen.len(), asked, "a column was asked about twice: {heading:?}");
+                assert_eq!(asked as i32, whole, "the bands lost a column: {heading:?} at {here:?}");
+            }
+        }
     }
 
     #[test]
