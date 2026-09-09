@@ -14,6 +14,7 @@ pub mod session;
 pub mod tree;
 pub mod wall;
 pub mod water;
+pub mod weather;
 pub mod skeleton;
 pub mod world;
 

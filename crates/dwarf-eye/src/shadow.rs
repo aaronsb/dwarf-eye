@@ -65,6 +65,14 @@ pub struct ShadowUniform {
     /// and with no shaded side. Foliage scales that fill down and weights it
     /// toward the sky, so the sun is what decides which side of a tree is lit.
     pub canopy: f32,
+    /// How far rain darkens the albedo, 0..1. Wet ground is darker ground.
+    pub wet: f32,
+    /// How far rain drops the roughness, 0..1: the sheen that reads as wet.
+    pub polish: f32,
+    /// Snow lying on upward faces, 0..1, from DF's own snowfall at the embark's
+    /// world tile. The coarse horizon shades its own, so its materials leave
+    /// this at zero.
+    pub snow: f32,
 }
 
 /// Bindings start at 100; the base `StandardMaterial` owns everything below.

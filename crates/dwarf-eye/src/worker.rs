@@ -11,6 +11,7 @@ use dfhack_remote::{methods, rfr};
 use dwarf_eye_world::library::TileLibrary;
 use dwarf_eye_world::canopy::{BANDS, CanopyMeshes, Forest};
 use dwarf_eye_world::clock;
+use dwarf_eye_world::weather::{self, Precip};
 use dwarf_eye_world::{BLOCK, BlockBounds, MeshData, MeshOptions, Session, build_chunk};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, OnceLock};
@@ -36,9 +37,41 @@ pub enum Command {
     Shutdown,
 }
 
+/// Everything one weather poll learned.
+///
+/// The Lua probe fills all of it; the world-map fallback fills the sky and
+/// leaves the rest at its default, which is a dry, snowless, moonless report the
+/// viewer's own derivations stand in for.
+pub struct WeatherReport {
+    pub sky: Weather,
+    /// What is falling where the character stands.
+    pub precip: Precip,
+    /// The fraction of the 5x5 grid that is wet.
+    pub intensity: f32,
+    /// Snow lying on the ground, 0..1.
+    pub snow: f32,
+    /// DF's own moon phase, where the probe could read it.
+    pub moon: Option<f32>,
+    /// False when the loaded map has something solid over the camera.
+    pub outdoors: bool,
+}
+
+impl Default for WeatherReport {
+    fn default() -> Self {
+        Self {
+            sky: Weather::default(),
+            precip: Precip::None,
+            intensity: 0.0,
+            snow: 0.0,
+            moon: None,
+            outdoors: true,
+        }
+    }
+}
+
 pub enum Event {
-    /// Cloud cover over the embark.
-    Weather(Weather),
+    /// Cloud cover over the embark, and what is falling out of it.
+    Weather(WeatherReport),
     /// Dwarf Fortress's calendar, polled while the world runs.
     Clock { year: i32, tick: i32 },
     /// The packed ground texture, sent once before any geometry.
@@ -183,6 +216,9 @@ fn run(
     let mut first_pass = true;
 
     let mut horizon_sent = false;
+    // Where the camera last asked for map, which is where the weather poll looks
+    // up for a roof.
+    let mut last_center: Option<(i32, i32, i32)> = None;
     loop {
         let command = match commands.try_recv() {
             Ok(c) => c,
@@ -206,8 +242,48 @@ fn run(
                 }
             }
             Command::Weather => {
-                if let Ok(map) = df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP) {
-                    events.send(Event::Weather(read_weather(&map)))?;
+                // The protocol carries five cloud bits and nothing else, so the
+                // precipitation grid, the stratus countdown and the moon come
+                // back through Lua the way the clock does.
+                let probed = df.client.run_command("lua", &[weather::PROBE]).is_ok();
+                let reading = probed
+                    .then(|| weather::parse(&df.client.last_notices.concat()))
+                    .flatten();
+                match reading {
+                    Some(r) => {
+                        let outdoors = last_center.is_none_or(|c| open_sky(&df.world, c));
+                        bevy::log::info!(
+                            "weather: {}{}",
+                            r.describe(),
+                            if outdoors { "" } else { ", under a ceiling" }
+                        );
+                        events.send(Event::Weather(WeatherReport {
+                            sky: Weather {
+                                cumulus: r.cumulus_cover(),
+                                stratus: r.stratus_cover(),
+                                cirrus: r.cirrus_cover(),
+                                fog: r.fog_cover(),
+                                countdown: r.stratus_countdown(),
+                            },
+                            precip: r.at_character(),
+                            intensity: r.intensity(),
+                            snow: r.snow_cover(),
+                            moon: r.moon(),
+                            outdoors,
+                        }))?;
+                    }
+                    // No script interpreter, or no world data: the world map
+                    // still carries the cloud kinds.
+                    None => {
+                        if let Ok(map) =
+                            df.client.call_empty::<rfr::WorldMap>(methods::GET_WORLD_MAP)
+                        {
+                            events.send(Event::Weather(WeatherReport {
+                                sky: read_weather(&map),
+                                ..Default::default()
+                            }))?;
+                        }
+                    }
                 }
             }
             Command::Clock => {
@@ -234,6 +310,7 @@ fn run(
                 }
             }
             Command::Fetch { center, opts, force } => {
+                last_center = Some(center);
                 let pass_started = std::time::Instant::now();
                 // Travel mode and loading screens leave no map behind, and
                 // DFHack answers with a link failure. Wait it out.
@@ -277,6 +354,20 @@ fn run(
     }
 }
 
+/// How far up the column above the camera is searched for a roof.
+const CEILING_SEARCH: i32 = 24;
+
+/// Whether the sky is open over a tile, so precipitation can reach it.
+///
+/// The loaded map is already here, so this is a lookup rather than a request. A
+/// column that has not been fetched reads as open: rain outside is the commoner
+/// mistake, and it corrects itself the moment the blocks land.
+fn open_sky(world: &dwarf_eye_world::World, center: (i32, i32, i32)) -> bool {
+    let (x, y, z) = center;
+    !(1..=CEILING_SEARCH)
+        .any(|up| world.voxel(x, y, z + up).is_some_and(|v| !v.solid.is_empty()))
+}
+
 /// Reads cloud cover over the embark out of the world map.
 ///
 /// DF reports a cloud kind per world tile on four-step scales, so each becomes a
@@ -298,25 +389,28 @@ fn read_weather(map: &rfr::WorldMap) -> Weather {
                 continue;
             }
             let Some(cloud) = map.clouds.get((y * width + x) as usize) else { continue };
+            // The same scales `weather::Reading` puts the Lua kinds on, so the
+            // two paths draw the same sky.
+            use weather::{CIRRUS_COVER, CUMULUS_COVER, FOG_COVER, STRATUS_COVER};
             totals[0] += match cloud.cumulus() {
-                CumulusType::CumulusNone => 0.0,
-                CumulusType::CumulusMedium => 0.35,
-                CumulusType::CumulusMulti => 0.62,
-                CumulusType::CumulusNimbus => 0.88,
+                CumulusType::CumulusNone => CUMULUS_COVER[0],
+                CumulusType::CumulusMedium => CUMULUS_COVER[1],
+                CumulusType::CumulusMulti => CUMULUS_COVER[2],
+                CumulusType::CumulusNimbus => CUMULUS_COVER[3],
             };
             totals[1] += match cloud.stratus() {
-                StratusType::StratusNone => 0.0,
-                StratusType::StratusAlto => 0.40,
-                StratusType::StratusProper => 0.75,
-                StratusType::StratusNimbus => 0.95,
+                StratusType::StratusNone => STRATUS_COVER[0],
+                StratusType::StratusAlto => STRATUS_COVER[1],
+                StratusType::StratusProper => STRATUS_COVER[2],
+                StratusType::StratusNimbus => STRATUS_COVER[3],
             };
-            totals[2] += if cloud.cirrus() { 0.5 } else { 0.0 };
+            totals[2] += if cloud.cirrus() { CIRRUS_COVER } else { 0.0 };
             totals[3] += match cloud.fog() {
-                FogType::FogNone => 0.0,
-                FogType::FogMist => 0.25,
-                FogType::FogNormal => 0.55,
+                FogType::FogNone => FOG_COVER[0],
+                FogType::FogMist => FOG_COVER[1],
+                FogType::FogNormal => FOG_COVER[2],
                 // DFHack's proto spells this one `F0G_THICK`, with a zero.
-                FogType::F0gThick => 0.85,
+                FogType::F0gThick => FOG_COVER[3],
             };
             samples += 1.0;
         }
@@ -330,6 +424,8 @@ fn read_weather(map: &rfr::WorldMap) -> Weather {
         stratus: totals[1] / samples,
         cirrus: totals[2] / samples,
         fog: totals[3] / samples,
+        // The plugin drops the countdown bits; only the Lua probe has them.
+        countdown: 0.0,
     }
 }
 

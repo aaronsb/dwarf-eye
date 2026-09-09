@@ -32,6 +32,11 @@ struct CloudShadow {
     mask_origin: vec2<f32>,
     // How much of the sky's indirect light foliage keeps, 0 on the ground.
     canopy: f32,
+    // How far rain darkens the albedo, and how far it drops the roughness.
+    wet: f32,
+    polish: f32,
+    // Snow lying on upward faces, 0..1.
+    snow: f32,
 }
 
 // Bevy substitutes the material group index; it is 3 in this version, and
@@ -112,6 +117,11 @@ fn horizon_leaf(tile: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
     return textureSampleGrad(base_color_texture, base_color_sampler, tile, ddx, ddy);
 }
 
+// Lying snow, in the same linear space the base colour is in. Short of white,
+// because a fully white ground blows out under the sun and takes the bloom with
+// it; `horizon::shade` shades the coarse band toward the same grey.
+const SNOW: vec3<f32> = vec3<f32>(0.84, 0.87, 0.93);
+
 // Fraction of sunlight reaching a point on the ground.
 fn transmittance(world: vec3<f32>) -> f32 {
     if cloud.enabled < 0.5 || cloud.sun.y <= 0.02 {
@@ -164,6 +174,29 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #endif
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);
+
+    // Weather on the surface. Both terms ride the face's own normal: rain wets
+    // everything but pools on what looks up, and snow only lies on what looks up
+    // at all — the ground and the top of a crown, never the side of a wall.
+    let up = clamp(in.world_normal.y, 0.0, 1.0);
+    if cloud.wet > 0.0 {
+        pbr_input.material.base_color = vec4(
+            pbr_input.material.base_color.rgb * (1.0 - cloud.wet * mix(0.45, 1.0, up)),
+            pbr_input.material.base_color.a,
+        );
+        // A wet surface is a smoother one, which is the whole of why it shines.
+        pbr_input.material.perceptual_roughness =
+            max(0.08, pbr_input.material.perceptual_roughness * (1.0 - cloud.polish * up));
+    }
+    if cloud.snow > 0.0 {
+        let lying = cloud.snow * smoothstep(0.35, 0.85, up);
+        pbr_input.material.base_color = vec4(
+            mix(pbr_input.material.base_color.rgb, SNOW, lying),
+            pbr_input.material.base_color.a,
+        );
+        pbr_input.material.perceptual_roughness =
+            mix(pbr_input.material.perceptual_roughness, 0.86, lying);
+    }
 
     // Occlusion only touches the indirect terms, so this dims the sky's fill
     // on a crown without touching the sun: the shaded side of a tree goes dark

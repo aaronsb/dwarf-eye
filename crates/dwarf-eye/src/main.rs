@@ -8,6 +8,7 @@ mod capture;
 mod clouds;
 mod god_rays;
 mod noise;
+mod precipitation;
 mod shadow;
 mod sky;
 mod stars;
@@ -64,12 +65,17 @@ const CEILING_ABOVE_PLAYER: i32 = 16;
 fn forced_weather() -> Option<Weather> {
     let preset = match std::env::var("DWARF_EYE_WEATHER").as_deref() {
         Ok("clear") => Weather::default(),
-        Ok("rain") => Weather { cumulus: 0.35, stratus: 0.95, cirrus: 0.0, fog: 0.15 },
-        Ok("snow") => Weather { cumulus: 0.2, stratus: 0.8, cirrus: 0.0, fog: 0.45 },
+        Ok("rain") => {
+            Weather { cumulus: 0.35, stratus: 0.95, cirrus: 0.0, fog: 0.15, countdown: 0.4 }
+        }
+        Ok("snow") => {
+            Weather { cumulus: 0.2, stratus: 0.8, cirrus: 0.0, fog: 0.45, countdown: 0.6 }
+        }
         _ => return Weather::from_env(),
     };
     Some(preset)
 }
+
 
 /// One line naming the world and the game's date, printed once both are known,
 /// so an unattended shot can be labelled with what it caught.
@@ -95,6 +101,7 @@ fn main() {
         .add_plugins(clouds::CloudPlugin)
         .add_plugins(god_rays::GodRaysPlugin)
         .add_plugins(capture::CapturePlugin)
+        .add_plugins(precipitation::PrecipitationPlugin)
         .insert_resource(ClearColor(Color::srgb(0.42, 0.58, 0.78)))
         .init_resource::<ViewSettings>()
         .init_resource::<Bands>()
@@ -809,6 +816,15 @@ fn setup(
     ));
 }
 
+/// The three resources one weather reading lands in, gathered so the drain
+/// system stays inside Bevy's limit on system parameters.
+#[derive(SystemParam)]
+struct WeatherState<'w> {
+    weather: ResMut<'w, Weather>,
+    precip: ResMut<'w, precipitation::Precipitation>,
+    cover: ResMut<'w, precipitation::SnowCover>,
+}
+
 /// Pulls everything the worker has produced since the last frame.
 fn drain_worker(
     mut commands: Commands,
@@ -820,7 +836,7 @@ fn drain_worker(
     mut status: ResMut<Status>,
     mut settings: ResMut<ViewSettings>,
     mut clock: ResMut<Clock>,
-    mut weather: ResMut<Weather>,
+    mut sky: WeatherState,
     mut ground: ResMut<clouds::GroundLevel>,
     mut camera: Query<(&mut Transform, &mut FlyCamera)>,
     far: HorizonSpawn,
@@ -829,13 +845,21 @@ fn drain_worker(
 ) {
     for event in bridge.rx.try_iter() {
         match event {
-            Event::Weather(reported) => {
-                *weather = forced_weather().unwrap_or(reported);
+            Event::Weather(report) => {
+                *sky.weather = forced_weather().unwrap_or(report.sky);
+                sky.precip.report(report.precip, report.intensity, report.outdoors);
+                sky.cover.target =
+                    precipitation::SnowCover::override_from_env().unwrap_or(report.snow);
+                // DF's own moon, which the protocol never sends. Absent, the
+                // clock's 28-day derivation stays in charge.
+                if report.moon.is_some() {
+                    clock.moon = report.moon;
+                }
             }
             Event::Clock { year, tick } => {
                 // DWARF_EYE_HOUR pins the hour the view is lit at without
                 // moving the game's own clock.
-                *clock = Clock { year, tick }.with_hour_override();
+                *clock = Clock { year, tick, moon: clock.moon }.with_hour_override();
             }
             Event::Atlas { width, height, pixels } => {
                 let handle = images.add(texture::atlas_image(width, height, pixels));
@@ -1346,6 +1370,7 @@ fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     clock: Res<Clock>,
     weather: Res<Weather>,
+    precip: Res<precipitation::Precipitation>,
     status: Res<Status>,
     settings: Res<ViewSettings>,
     entities: Res<ChunkEntities>,
@@ -1369,7 +1394,7 @@ fn update_hud(
          camera  tile ({:.0}, {:.0}, {:.0})   speed {:.0}\n\
          {}\n\
          chunks  {}   triangles {} of {} held   {:.0} fps\n\
-         z-ceiling {ceiling}   hidden tiles {}   sky {}   light shafts {}\n\
+         z-ceiling {ceiling}   hidden tiles {}   sky {}   falling {}   light shafts {}\n\
          \n\
          WASD move   QE up/down   shift boost   right-drag look   wheel speed\n\
          tab  fly / walk sync (walk: WASD steps the character, QE on stairs)\n\
@@ -1393,6 +1418,7 @@ fn update_hud(
             .unwrap_or(0.0),
         if settings.show_hidden { "shown" } else { "hidden" },
         weather.describe(),
+        precip.describe(),
         if rays.enabled { "on" } else { "off" },
     );
 }

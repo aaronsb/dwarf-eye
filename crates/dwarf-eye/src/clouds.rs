@@ -68,6 +68,10 @@ pub struct Weather {
     pub cirrus: f32,
     /// Sits on the ground rather than above it.
     pub fog: f32,
+    /// DF's four-bit stratus countdown as a fraction, 0..1. The plugin drops it;
+    /// the Lua probe reads it. It drives the sheet's own transitions, so the
+    /// haze follows it rather than stepping when the kind changes.
+    pub countdown: f32,
 }
 
 impl Weather {

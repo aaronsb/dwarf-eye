@@ -21,6 +21,15 @@ which carries `cur_year` and `cur_year_tick` (`worker.rs:run`, `Command::Clock`)
 `day_of_year`, `tick_of_day`, `day_fraction`, `month`, `day_of_month`,
 `describe`.
 
+The moon is the one part that is no longer derived. `Clock::moon` carries DF's
+own `world_data.moon_phase`, read by the weather probe
+(`weather.rs:PROBE`, see [weather.md](weather.md)) and set on the `Weather`
+event rather than the `Clock` one, because that is the poll that reads it.
+`Clock::moon_phase` returns it when it is there and falls back to the calendar's
+28-day month otherwise. The two agree to within a day: 15 Granite of year 100
+read `moon_phase` 15, a phase of 0.536 against the derived 0.514, both a full
+moon.
+
 | Constant | |
 |---|---|
 | `TICKS_PER_DAY` | 1200 |
@@ -48,6 +57,9 @@ which carries `cur_year` and `cur_year_tick` (`worker.rs:run`, `Command::Clock`)
   (`main.rs:handle_input`); put it back after a lighting check.
 - The clock poll shares the worker thread with map fetches, so a heavy pass
   leaves the sun at the wrong hour until it clears. Issue #4.
+- The moon arrives on the twelve-second weather poll, not the half-second clock
+  poll, so the first few seconds of a session run on the derived phase.
+- `moon_angle` is read and carried but unused; its units are unverified.
 
 ## Claims to verify
 
@@ -59,4 +71,5 @@ the same numbers.
 ## Related issues
 
 #19 (closed), #4 (poll off the critical path), #14 (a viewer-side hour override
-so the player's clock need not move).
+so the player's clock need not move), #32 (the moon phase, and the rest of the
+weather globals it rides with).

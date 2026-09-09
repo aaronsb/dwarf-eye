@@ -1,7 +1,9 @@
 # Sky, weather and atmosphere
 
-Status: landed (`crates/dwarf-eye/src/{sky.rs,stars.rs,clouds.rs,shadow.rs,god_rays.rs,noise.rs}`);
-night lighting in flight (issue #14); haze inputs planned (issue #18).
+Status: landed (`crates/dwarf-eye/src/{sky.rs,stars.rs,clouds.rs,shadow.rs,god_rays.rs,noise.rs,precipitation.rs}`,
+`crates/dwarf-eye-world/src/weather.rs`); night lighting in flight (issue #14);
+the rest of the weather inventory in flight (issue #32); haze calibration
+planned (issue #18).
 
 ## What it does
 
@@ -20,7 +22,11 @@ flowchart TD
   C[DF clock] --> S[sky.rs: sun direction]
   S --> L[DirectionalLight + Bevy atmosphere]
   S --> ST[stars.rs: spin and fade]
-  W[DF world map clouds] --> WE[clouds.rs: Weather]
+  P[DF weather globals, Lua probe] --> WE[clouds.rs: Weather]
+  P --> R[precipitation.rs: rain, snow, wet, cover]
+  P --> M[sky.rs: moon phase]
+  R --> T
+  W[DF world map clouds, fallback] --> WE[clouds.rs: Weather]
   WE --> N[noise.rs: weather sheet]
   N --> V[cloud volume: drawn sky]
   N --> B[bake_shadow: CPU sun march]
@@ -36,7 +42,7 @@ flowchart TD
 | [clock.md](clock.md) | DF's calendar, fortress and adventure counters |
 | [sun-and-stars.md](sun-and-stars.md) | sun direction, atmosphere, star field, night |
 | [clouds.md](clouds.md) | the cloud volume and its baked shadows |
-| [weather.md](weather.md) | haze, god rays, and the weather poll |
+| [weather.md](weather.md) | the weather probe, precipitation, snow, wet ground, haze and god rays |
 
 ## Invariants and gotchas
 
@@ -49,11 +55,11 @@ flowchart TD
   environment light and the stars. Issue #14.
 - Exposure is `ev100` 13.0 by default because `RAW_SUNLIGHT` is pre-scattering;
   `DWARF_EYE_EV100` overrides it.
-- Env overrides win permanently: with `DWARF_EYE_CLOUDS` set, the sky DF reports
-  never lands (`main.rs:drain_worker`).
+- Env overrides win permanently: with `DWARF_EYE_CLOUDS` or `DWARF_EYE_WEATHER`
+  set, the sky DF reports never lands (`main.rs:drain_worker`).
 
 ## Related issues
 
-#14 (night lighting and emissives), #18 (haze from DF's humidity inputs), #4
-(the clock poll queues behind a heavy map pass), #19 (closed, adventure-mode
-clock).
+#14 (night lighting and emissives), #32 (the weather inventory), #18 (haze from
+DF's humidity inputs), #4 (the clock poll queues behind a heavy map pass), #19
+(closed, adventure-mode clock).
