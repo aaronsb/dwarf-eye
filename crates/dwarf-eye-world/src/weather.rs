@@ -228,6 +228,42 @@ impl Reading {
     }
 }
 
+/// How long it has been since rain last fell.
+///
+/// The probe's grid says what is falling now; the haze wants what fell
+/// recently, because the air stays damp for an hour or two after a shower and
+/// a bright morning after rain is the one that shows shafts. One field, fed a
+/// reading at a time, so nothing has to be kept but the age of the last wet
+/// one.
+///
+/// The clock is the viewer's own wall clock rather than the game's: DF's own
+/// minute runs at whatever speed the player has the world at, and the damp in
+/// the air is a thing the eye is watching, not a thing the world is counting.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RainHistory {
+    /// Seconds since the last reading that carried rain, or `None` where none
+    /// has been seen yet.
+    pub since_wet: Option<f32>,
+}
+
+impl RainHistory {
+    /// One frame: `wet` is whether rain is falling now, `dt` the seconds since
+    /// the last call.
+    pub fn observe(&mut self, wet: bool, dt: f32) {
+        self.since_wet = match (wet, self.since_wet) {
+            (true, _) => Some(0.0),
+            (false, Some(age)) => Some(age + dt.max(0.0)),
+            (false, None) => None,
+        };
+    }
+
+    /// Minutes since it last rained, or `None` if it has not rained while
+    /// anyone was watching.
+    pub fn minutes(&self) -> Option<f32> {
+        self.since_wet.map(|seconds| seconds / 60.0)
+    }
+}
+
 /// Picks the tagged line out of whatever DFHack echoed back.
 pub fn parse(text: &str) -> Option<Reading> {
     let tail = text.split(TAG).nth(1)?;
@@ -376,6 +412,23 @@ mod tests {
         );
         r.moon_phase = -1;
         assert_eq!(r.moon(), None);
+    }
+
+    #[test]
+    fn the_rain_history_ages_from_the_last_wet_reading() {
+        let mut history = RainHistory::default();
+        // Nothing seen yet is not the same as a long time ago.
+        history.observe(false, 60.0);
+        assert_eq!(history.minutes(), None);
+
+        history.observe(true, 1.0);
+        assert_eq!(history.minutes(), Some(0.0));
+        history.observe(false, 30.0);
+        history.observe(false, 30.0);
+        assert_eq!(history.minutes(), Some(1.0));
+        // Rain again resets it however long the dry spell was.
+        history.observe(true, 600.0);
+        assert_eq!(history.minutes(), Some(0.0));
     }
 
     #[test]

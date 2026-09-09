@@ -13,13 +13,15 @@
 //! `bevy_pbr::volumetric_fog` does, which is what gives a fullscreen pass
 //! access to the lights, the shadow cascade array and the atmosphere.
 //!
-//! The weather sets how thick the medium is: a clear day is a thin haze, fog
-//! thickens it and pulls it down toward the ground. `DWARF_EYE_GODRAYS`
-//! overrides any of it, and `G` toggles the pass.
+//! The weather sets how thick the medium is: `Humidity::density` is the whole
+//! model, and it reads what the air is actually carrying rather than the cloud
+//! kind alone. `DWARF_EYE_GODRAYS` overrides any of it, `G` toggles the pass
+//! and `F` cycles a forced haze level over the derived one.
 
 use crate::clouds::Weather;
 use crate::shadow::TerrainMaterial;
 use crate::sky::Clock;
+use dwarf_eye_world::weather::RainHistory;
 use bevy::asset::{embedded_asset, load_embedded_asset};
 use bevy::camera::Camera3d;
 use bevy::core_pipeline::FullscreenShader;
@@ -47,6 +49,204 @@ use bevy::render::view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget};
 use bevy::render::{GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems};
 use bevy::shader::Shader;
 
+/// The clear, dry, high-sun floor: the haze a desert noon still has. Near
+/// enough to nothing that the shafts read as absent rather than as a wash.
+pub const HAZE_FLOOR: f32 = 0.002;
+/// Extinction the low-sun term adds at its fullest. Kept at the value the
+/// approved shots were taken with (27f5af3).
+const LOW_SUN: f32 = 0.014;
+/// DF's own fog kind, the strongest single input: 0.25 mist, 0.55 fog, 0.85
+/// thick. Also from the approved shots.
+const FOG: f32 = 0.033;
+const STRATUS: f32 = 0.005;
+const CUMULUS: f32 = 0.002;
+/// The stratus countdown, so the sheet's build-up thickens the air ahead of the
+/// change instead of the haze stepping when the kind flips.
+const COUNTDOWN: f32 = 0.004;
+/// Rain in the air right now.
+const FALLING: f32 = 0.010;
+/// What a saturated, cold, still dawn over standing water would add on its own.
+/// This is the humidity term proper; everything above it is the sky.
+const DAMP: f32 = 0.019;
+/// How the damp splits between the region's climate, the last shower and the
+/// water underfoot. Sums to one, so `DAMP` is the whole of it.
+const RAINFALL_SHARE: f32 = 0.45;
+const RECENT_SHARE: f32 = 0.30;
+const WATER_SHARE: f32 = 0.25;
+/// Minutes for the memory of a shower to fall by 1/e. Two hours after the rain
+/// stops the air is most of the way back to the region's own damp.
+const DRY_MINUTES: f32 = 90.0;
+/// How much of the damp a hot day burns off. At the top of the temperature
+/// scale a third of it survives.
+const WARM_BURN: f32 = 0.65;
+/// How much the dawn and dusk peaks lift the damp over the middle of the day.
+const TWILIGHT_PEAK: f32 = 0.6;
+/// Where the peaks sit and how wide they are, in hours. Dusk is the broader of
+/// the two: the ground gives its heat back more slowly than the sun takes it.
+const DAWN_HOUR: f32 = 6.0;
+const DAWN_WIDTH: f32 = 2.0;
+const DUSK_HOUR: f32 = 18.0;
+const DUSK_WIDTH: f32 = 2.5;
+/// The density a forced haze of 1.0 stands for: a thick fog at a low sun, the
+/// top of what the derived model reaches. `F` cycles fractions of it.
+pub const HAZE_FULL: f32 = 0.05;
+/// The moon's shafts as a fraction of the sun's. Moonlight is already a
+/// three-hundredth of daylight and the night exposure only gives forty of that
+/// back, so this is the last of the three factors rather than the whole story.
+const MOON_RAYS: f32 = 0.5;
+
+/// The dawn and dusk peaks, 0 in the middle of the day and at midnight, 1 on
+/// the hour each sits at.
+///
+/// Overnight cooling brings the air to saturation and the first sun burns it
+/// off through the morning; the evening damp comes back as the ground gives up
+/// its heat. Both are gaussians on the hour, wrapped round the clock.
+fn twilight(hour: f32) -> f32 {
+    let bump = |centre: f32, width: f32| {
+        let d = ((hour - centre + 12.0).rem_euclid(24.0) - 12.0) / width;
+        (-d * d).exp()
+    };
+    bump(DAWN_HOUR, DAWN_WIDTH).max(bump(DUSK_HOUR, DUSK_WIDTH))
+}
+
+/// Everything the haze reads, in one place: the sky Dwarf Fortress reports, the
+/// water the region and the map hold, and where the sun is.
+///
+/// All the 0..1 fields are fractions of their own scale — `fog` is DF's own
+/// four-step kind through `FOG_COVER`, `rainfall` is `RegionTile.rainfall` over
+/// 100, `temperature` the region tile's own 0-to-100 field, `water` the share
+/// of the loaded window that is water.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Humidity {
+    pub fog: f32,
+    pub stratus: f32,
+    pub cumulus: f32,
+    /// DF's four-bit stratus countdown as a fraction.
+    pub countdown: f32,
+    /// Rain or snow actually falling, as `Precipitation::drawn` reports it.
+    pub falling: f32,
+    /// The region's own rainfall at the window centre, 0..1.
+    pub rainfall: f32,
+    /// Minutes since it last rained, or `None` where it has not rained while
+    /// the viewer has been watching.
+    pub since_rain: Option<f32>,
+    /// The region tile's temperature, 0 cold to 1 hot.
+    pub temperature: f32,
+    /// How much water is near: the share of the loaded window that carries it.
+    pub water: f32,
+    /// Hour of the game's day, 0..24.
+    pub hour: f32,
+    /// The sun's elevation, `sun_direction().y`.
+    pub elevation: f32,
+}
+
+impl Default for Humidity {
+    /// A clear, dry, temperate noon: the state the floor is defined at.
+    fn default() -> Self {
+        Self {
+            fog: 0.0,
+            stratus: 0.0,
+            cumulus: 0.0,
+            countdown: 0.0,
+            falling: 0.0,
+            rainfall: 0.0,
+            since_rain: None,
+            temperature: 0.5,
+            water: 0.0,
+            hour: 12.0,
+            elevation: 1.0,
+        }
+    }
+}
+
+impl Humidity {
+    /// Extinction per tile of the medium at ground level.
+    ///
+    /// A sum of small densities, so every input is separately monotone and the
+    /// constants can be read off one at a time. Two groups: the sky, which is
+    /// what DF's cloud bitfield says, and the damp, which is the water the
+    /// region, the last shower and the map underfoot are holding. The damp is
+    /// the part that a hot afternoon burns away and a dawn brings back, so the
+    /// temperature and the hour scale it rather than adding to it — that is
+    /// what keeps a dry noon faint whatever the hour term is doing.
+    ///
+    /// ```text
+    /// low_sun = 1 - min(elevation * 4, 1)
+    /// recent  = exp(-minutes_since_rain / 90)
+    /// damp    = 0.45*rainfall + 0.30*recent + 0.25*water
+    /// warmth  = 1 - 0.65*temperature
+    /// peak    = 1 + 0.6*twilight(hour)
+    /// density = 0.002 + 0.014*low_sun
+    ///         + 0.033*fog + 0.005*stratus + 0.002*cumulus
+    ///         + 0.004*countdown + 0.010*falling
+    ///         + 0.019*damp*warmth*peak
+    /// ```
+    pub fn density(&self) -> f32 {
+        let unit = |v: f32| v.clamp(0.0, 1.0);
+        let low_sun = 1.0 - (unit(self.elevation) * 4.0).min(1.0);
+        let recent = match self.since_rain {
+            Some(minutes) => (-minutes.max(0.0) / DRY_MINUTES).exp(),
+            None => 0.0,
+        };
+        let damp = RAINFALL_SHARE * unit(self.rainfall)
+            + RECENT_SHARE * recent
+            + WATER_SHARE * unit(self.water);
+        let warmth = 1.0 - WARM_BURN * unit(self.temperature);
+        let peak = 1.0 + TWILIGHT_PEAK * twilight(self.hour);
+
+        HAZE_FLOOR
+            + LOW_SUN * low_sun
+            + FOG * unit(self.fog)
+            + STRATUS * unit(self.stratus)
+            + CUMULUS * unit(self.cumulus)
+            + COUNTDOWN * unit(self.countdown)
+            + FALLING * unit(self.falling)
+            + DAMP * damp * warmth * peak
+    }
+}
+
+/// What `F` is showing: the model's own answer, or a level forced over it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Haze {
+    #[default]
+    Derived,
+    /// A fraction of `HAZE_FULL`, which is a thick fog at a low sun.
+    Forced(f32),
+}
+
+/// The levels `F` walks through, starting from and returning to the derived
+/// density.
+pub const HAZE_CYCLE: [Haze; 5] = [
+    Haze::Derived,
+    Haze::Forced(0.0),
+    Haze::Forced(0.2),
+    Haze::Forced(0.5),
+    Haze::Forced(0.8),
+];
+
+impl Haze {
+    pub fn next(self) -> Self {
+        let at = HAZE_CYCLE.iter().position(|&h| h == self).unwrap_or(0);
+        HAZE_CYCLE[(at + 1) % HAZE_CYCLE.len()]
+    }
+
+    /// The density this state asks for, given what the model derived.
+    pub fn density(self, derived: f32) -> f32 {
+        match self {
+            Haze::Derived => derived,
+            Haze::Forced(level) => level.clamp(0.0, 1.0) * HAZE_FULL,
+        }
+    }
+
+    /// The HUD's reading: `derived 0.021` or `forced 0.5`.
+    pub fn describe(self, derived: f32) -> String {
+        match self {
+            Haze::Derived => format!("derived {derived:.3}"),
+            Haze::Forced(level) => format!("forced {level:.1}"),
+        }
+    }
+}
+
 /// Everything the pass needs, gathered in the main world and handed straight
 /// to the render world.
 #[derive(Resource, Clone, ExtractResource)]
@@ -55,6 +255,10 @@ pub struct GodRays {
     pub enabled: bool,
     /// Extinction per tile of the medium at ground level.
     pub density: f32,
+    /// What `F` last asked for, and what the model would have said. The HUD
+    /// reads both; only `density` reaches the shader.
+    pub haze: Haze,
+    pub derived: f32,
     /// Henyey-Greenstein asymmetry: how tightly the shafts hug the sun.
     pub g: f32,
     /// Multiplier on the in-scattered sunlight.
@@ -81,7 +285,9 @@ impl Default for GodRays {
     fn default() -> Self {
         Self {
             enabled: true,
-            density: 0.002,
+            density: HAZE_FLOOR,
+            haze: Haze::Derived,
+            derived: HAZE_FLOOR,
             g: 0.6,
             strength: 0.35,
             falloff: 1.0 / 60.0,
@@ -141,38 +347,130 @@ impl Overrides {
     }
 }
 
+/// How long since it last rained, kept frame to frame. The type is
+/// `weather.rs`'s; the world crate knows nothing of Bevy, so the resource is
+/// this wrapper.
+#[derive(Resource, Default, Deref, DerefMut)]
+pub struct Rain(pub RainHistory);
+
+/// The two humidity inputs the protocol never sends and the worker does not
+/// forward, plus the one the viewer measures for itself.
+///
+/// `RegionTile.rainfall` and the region tile's temperature both sit in
+/// `weather.rs:Reading` territory but stop at `worker.rs:WeatherReport`, which
+/// this pass does not own; until a line each carries them, they stand at a
+/// temperate embark's own values and `DWARF_EYE_HAZE=rainfall=0.9,temp=0.2`
+/// sets them by hand. `water` is live: `measure_water` counts it off the
+/// chunks that are loaded.
+#[derive(Resource, Clone, Copy)]
+pub struct Climate {
+    pub rainfall: f32,
+    pub temperature: f32,
+    pub water: f32,
+}
+
+impl Default for Climate {
+    fn default() -> Self {
+        Self { rainfall: 0.5, temperature: 0.5, water: 0.0 }
+    }
+}
+
+impl Climate {
+    pub fn from_env() -> Self {
+        let mut climate = Self::default();
+        let Ok(spec) = std::env::var("DWARF_EYE_HAZE") else { return climate };
+        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let Some((name, value)) = part.split_once('=') else { continue };
+            let Ok(value) = value.trim().parse::<f32>() else { continue };
+            match name.trim() {
+                "rainfall" | "rain" => climate.rainfall = value,
+                "temp" | "temperature" => climate.temperature = value,
+                "water" => climate.water = value,
+                _ => {}
+            }
+        }
+        climate
+    }
+}
+
+/// How much of the loaded window carries water, as the share of chunks that
+/// spawned a water surface. A chunk is sixteen tiles square, so this is
+/// proximity rather than a tile count: a river through the middle of the view
+/// reads a few per cent, a coast reads half.
+///
+/// Held apart from `drive` so the query runs a couple of times a second rather
+/// than every frame; the number moves at the speed the map is fetched.
+fn measure_water(
+    time: Res<Time>,
+    terrain: Res<crate::TerrainMaterial>,
+    water: Res<crate::WaterMaterial>,
+    surfaces: Query<&MeshMaterial3d<TerrainMaterial>>,
+    mut climate: ResMut<Climate>,
+    mut due: Local<f32>,
+) {
+    *due -= time.delta_secs();
+    if *due > 0.0 {
+        return;
+    }
+    *due = 0.5;
+    let (mut ground, mut wet) = (0u32, 0u32);
+    for material in surfaces.iter() {
+        ground += (material.0 == terrain.0) as u32;
+        wet += (material.0 == water.0) as u32;
+    }
+    if ground > 0 {
+        climate.water = (wet as f32 / ground as f32).clamp(0.0, 1.0);
+    }
+}
+
 /// Follows the weather and the cloud bake.
 ///
 /// The cloud terms come out of the terrain material rather than the bake
 /// directly, so the shafts read exactly the map the ground is shaded with,
 /// wind offset and all.
 fn drive(
+    time: Res<Time>,
     weather: Res<Weather>,
     precip: Res<crate::precipitation::Precipitation>,
     clock: Res<Clock>,
     over: Res<Overrides>,
+    climate: Res<Climate>,
     terrain: Res<crate::TerrainMaterial>,
     materials: Res<Assets<TerrainMaterial>>,
+    mut history: ResMut<Rain>,
     mut rays: ResMut<GodRays>,
 ) {
     let Weather { cumulus, stratus, cirrus: _, fog, countdown } = *weather;
+    let (kind, falling) = precip.drawn();
+    history.observe(kind == dwarf_eye_world::weather::Precip::Rain && falling > 0.0,
+        time.delta_secs());
 
-    // A clear day is a thin haze, thicker in the first and last hours of
-    // light when the air holds the night's moisture; fog thickens it and
-    // pulls it to the ground. Rain arrives as stratus, which adds a little.
-    //
-    // `fog` is DF's own kind rather than a guess: 0.25 mist, 0.55 fog, 0.85
-    // thick, straight off the region tile the Lua probe reads. The stratus
-    // countdown rides with it, so the sheet's own build-up thickens the air
-    // ahead of the change instead of the haze stepping when the kind flips, and
-    // falling rain wets it on top of all of that (issue #18).
-    let elevation = clock.sun_direction().y.clamp(0.0, 1.0);
-    let low_sun = 1.0 - (elevation * 4.0).min(1.0);
-    let (_, falling) = precip.drawn();
-    rays.density = over.density.unwrap_or(
-        0.006 + low_sun * 0.014 + fog * 0.033 + stratus * 0.005 + cumulus * 0.002
-            + countdown * 0.004 + falling * 0.010,
-    );
+    // Everything the air is carrying, in one call. `Humidity::density` carries
+    // the model and the constants; the shots it was calibrated against are in
+    // `docs/architecture/sky/weather.md` (issue #18).
+    let sun = clock.sun_direction();
+    let humidity = Humidity {
+        fog,
+        stratus,
+        cumulus,
+        countdown,
+        falling,
+        rainfall: climate.rainfall,
+        since_rain: history.minutes(),
+        temperature: climate.temperature,
+        water: climate.water,
+        hour: clock.day_fraction() * 24.0,
+        elevation: sun.y,
+    };
+    rays.derived = humidity.density();
+    // `F` beats the environment, which beats the model: the key is a hand on
+    // the dial, and a shot that pins the density still gets what it asked for.
+    rays.density = match rays.haze {
+        Haze::Derived => over.density.unwrap_or(rays.derived),
+        forced => forced.density(rays.derived),
+    };
+
+    let low_sun = 1.0 - (sun.y.clamp(0.0, 1.0) * 4.0).min(1.0);
     let height = 60.0 - 44.0 * fog.clamp(0.0, 1.0);
     rays.falloff = over.falloff.unwrap_or(1.0 / height);
     rays.g = over.g.unwrap_or(0.6);
@@ -181,11 +479,14 @@ fn drive(
     // Fog wants to be felt as fog, so it dims the scene behind the shafts more.
     rays.dim = over.dim.unwrap_or(0.15 + 0.55 * fog.clamp(0.0, 1.0));
 
-    // No sun, no shafts.
-    let sun = clock.sun_direction();
+    // No light, no shafts. The moon carries them at a fraction of the sun's
+    // strength once it is up, which is what gives a misty night its glow; the
+    // shader already marches whichever directional light is brightest, so the
+    // only thing the moon needs from here is a strength that is not zero.
     let daylight = (sun.y * 6.0).clamp(0.0, 1.0);
+    let moonlight = MOON_RAYS * clock.moon_light();
     // Shafts read strongest when the sun is low and the light comes in sideways.
-    rays.strength = over.strength.unwrap_or(0.45 + 0.35 * low_sun) * daylight;
+    rays.strength = over.strength.unwrap_or(0.45 + 0.35 * low_sun) * daylight.max(moonlight);
 
     if let Some(material) = materials.get(&terrain.0) {
         let u = &material.extension.uniform;
@@ -202,6 +503,9 @@ fn drive(
 fn toggle(keys: Res<ButtonInput<KeyCode>>, mut rays: ResMut<GodRays>) {
     if keys.just_pressed(KeyCode::KeyG) {
         rays.enabled = !rays.enabled;
+    }
+    if keys.just_pressed(KeyCode::KeyF) {
+        rays.haze = rays.haze.next();
     }
 }
 
@@ -451,8 +755,10 @@ impl Plugin for GodRaysPlugin {
         let over = Overrides::from_env();
         app.insert_resource(over)
             .insert_resource(GodRays { enabled: !over.off, ..default() })
+            .insert_resource(Climate::from_env())
+            .init_resource::<Rain>()
             .add_plugins(ExtractResourcePlugin::<GodRays>::default())
-            .add_systems(Update, (drive, toggle));
+            .add_systems(Update, (measure_water, drive, toggle));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
@@ -473,5 +779,168 @@ impl Plugin for GodRaysPlugin {
                 Core3d,
                 god_rays.after(Core3dSystems::MainPass).before(Core3dSystems::EarlyPostProcess),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sky::TICKS_PER_DAY;
+
+    /// 15 Granite of year 100 at 07:00, which is the clock the approved shots
+    /// were lit by: `DWARF_EYE_HOUR=7` pins the tick of day and keeps the date.
+    fn dawn() -> Clock {
+        Clock { year: 100, tick: 14 * TICKS_PER_DAY + 7 * TICKS_PER_DAY / 24, moon: None }
+    }
+
+    /// The scene the approved shots were framed at: that clock,
+    /// `DWARF_EYE_CLOUDS=cumulus=0.5,fog=0.4`, over a temperate embark with a
+    /// stream in the window and no rain for days.
+    fn approved() -> Humidity {
+        Humidity {
+            fog: 0.4,
+            cumulus: 0.5,
+            rainfall: 0.5,
+            water: 0.05,
+            temperature: 0.5,
+            hour: 7.0,
+            elevation: dawn().sun_direction().y,
+            ..default()
+        }
+    }
+
+    /// The density the approved shots were rendered with, straight out of
+    /// 27f5af3, which is what the model replaces.
+    fn legacy(h: &Humidity) -> f32 {
+        let low_sun = 1.0 - (h.elevation.clamp(0.0, 1.0) * 4.0).min(1.0);
+        0.006 + 0.014 * low_sun + 0.033 * h.fog + 0.005 * h.stratus + 0.002 * h.cumulus
+    }
+
+    #[test]
+    fn a_foggy_dawn_lands_where_the_approved_shots_did() {
+        // 0.0211 against the shots' own 0.0207: two and a third per cent over.
+        let h = approved();
+        let (was, is) = (legacy(&h), h.density());
+        assert!((is - was).abs() / was < 0.10, "{is} is not within a tenth of the approved {was}");
+    }
+
+    #[test]
+    fn a_dry_noon_is_faint_and_a_desert_one_is_nearly_nothing() {
+        let temperate = Humidity {
+            rainfall: 0.5,
+            water: 0.0,
+            temperature: 0.6,
+            hour: 12.0,
+            elevation: 0.9,
+            ..default()
+        };
+        let desert = Humidity { rainfall: 0.1, temperature: 0.85, ..temperate };
+        assert!(temperate.density() < approved().density() / 3.0, "{}", temperate.density());
+        assert!(desert.density() < temperate.density());
+        assert!(desert.density() < 2.0 * HAZE_FLOOR, "{}", desert.density());
+    }
+
+    #[test]
+    fn a_clear_dry_high_sun_is_the_floor() {
+        let clear = Humidity { rainfall: 0.0, water: 0.0, temperature: 1.0, ..default() };
+        assert_eq!(clear.density(), HAZE_FLOOR);
+        // And no hour of the day can drive a dry sky below it.
+        for hour in 0..24 {
+            let h = Humidity { hour: hour as f32, ..clear };
+            assert!(h.density() >= HAZE_FLOOR, "hour {hour}");
+        }
+    }
+
+    #[test]
+    fn every_input_moves_the_haze_the_way_it_should() {
+        let base = approved();
+        // Wetter, cloudier or darker air holds more.
+        for (name, more) in [
+            ("fog", Humidity { fog: 0.85, ..base }),
+            ("stratus", Humidity { stratus: 0.75, ..base }),
+            ("cumulus", Humidity { cumulus: 0.88, ..base }),
+            ("countdown", Humidity { countdown: 1.0, ..base }),
+            ("falling", Humidity { falling: 1.0, ..base }),
+            ("rainfall", Humidity { rainfall: 1.0, ..base }),
+            ("water", Humidity { water: 1.0, ..base }),
+            ("a lower sun", Humidity { elevation: 0.0, ..base }),
+        ] {
+            assert!(more.density() > base.density(), "more {name} thinned the haze");
+        }
+        // A warm day burns it off; a cold one keeps it.
+        assert!(Humidity { temperature: 1.0, ..base }.density() < base.density());
+        assert!(Humidity { temperature: 0.0, ..base }.density() > base.density());
+
+        // And the memory of the last shower fades the longer ago it was.
+        let mut previous = f32::INFINITY;
+        for minutes in [0.0, 10.0, 30.0, 90.0, 240.0, 1440.0] {
+            let h = Humidity { since_rain: Some(minutes), ..base };
+            assert!(h.density() < previous, "{minutes} minutes did not dry the air");
+            previous = h.density();
+        }
+        // Never having rained is where a long dry spell is heading: a day out,
+        // the memory of the shower has all but gone.
+        let never = Humidity { since_rain: None, ..base }.density();
+        assert!(never <= previous && previous - never < 1e-6, "{never} against {previous}");
+        assert!(never < Humidity { since_rain: Some(240.0), ..base }.density());
+    }
+
+    #[test]
+    fn the_haze_peaks_at_dawn_and_dusk() {
+        let damp = Humidity { rainfall: 0.8, water: 0.1, elevation: 0.5, ..default() };
+        let at = |hour| Humidity { hour, ..damp }.density();
+        assert!(at(DAWN_HOUR) > at(12.0), "dawn is no thicker than noon");
+        assert!(at(DUSK_HOUR) > at(12.0), "dusk is no thicker than noon");
+        assert!(at(DAWN_HOUR) > at(3.0) && at(DAWN_HOUR) > at(9.0), "dawn is not a peak");
+        assert!(at(DUSK_HOUR) > at(15.0) && at(DUSK_HOUR) > at(21.0), "dusk is not a peak");
+        // Midnight is quiet: the peaks are the crossings, not the whole night.
+        assert!(at(0.0) < at(DAWN_HOUR) && at(0.0) < at(DUSK_HOUR));
+        // The peaks wrap the clock rather than running off either end.
+        assert!((twilight(DAWN_HOUR) - 1.0).abs() < 1e-6);
+        assert!((twilight(24.0 + DAWN_HOUR) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f_cycles_the_forced_levels_and_comes_back_to_the_model() {
+        let mut haze = Haze::default();
+        assert_eq!(haze, Haze::Derived);
+        for expected in [
+            Haze::Forced(0.0),
+            Haze::Forced(0.2),
+            Haze::Forced(0.5),
+            Haze::Forced(0.8),
+            Haze::Derived,
+        ] {
+            haze = haze.next();
+            assert_eq!(haze, expected);
+        }
+    }
+
+    #[test]
+    fn a_forced_level_stands_in_for_the_model_and_reads_as_forced() {
+        let derived = approved().density();
+        assert_eq!(Haze::Derived.density(derived), derived);
+        assert_eq!(Haze::Forced(0.0).density(derived), 0.0);
+        assert_eq!(Haze::Forced(0.5).density(derived), 0.5 * HAZE_FULL);
+        // The approved dawn sits between the two levels either side of it.
+        assert!(derived > Haze::Forced(0.2).density(derived));
+        assert!(derived < Haze::Forced(0.5).density(derived));
+        assert_eq!(Haze::Forced(0.5).describe(derived), "forced 0.5");
+        assert!(Haze::Derived.describe(derived).starts_with("derived 0.0"));
+    }
+
+    #[test]
+    fn the_moon_carries_the_shafts_at_a_fraction_of_the_suns() {
+        // Midnight of a full moon: the sun is down, so the moon term is all
+        // that is left, and it is a fraction rather than nothing.
+        let midnight = Clock { year: 100, tick: 14 * TICKS_PER_DAY, moon: None };
+        assert_eq!((midnight.sun_direction().y * 6.0).clamp(0.0, 1.0), 0.0);
+        let moonlit = MOON_RAYS * midnight.moon_light();
+        assert!(moonlit > 0.4 && moonlit < 1.0, "{moonlit}");
+
+        // At noon the moon is down and the sun has it all.
+        let noon = Clock { tick: midnight.tick + TICKS_PER_DAY / 2, ..midnight };
+        assert_eq!(noon.moon_light(), 0.0);
+        assert_eq!((noon.sun_direction().y * 6.0).clamp(0.0, 1.0), 1.0);
     }
 }
