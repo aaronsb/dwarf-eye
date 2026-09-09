@@ -162,13 +162,49 @@ resolved `FlatTile` to an atlas cell since the ground atlas landed.
 
 ## The treatment is a chain
 
-Planned (issues #5, #10, #31): `resolve` returns a chain of stages, each a
-builder and the projected-size threshold it holds down to. A tree's chain is
-full voxels, quarter-resolution opaque voxels, one canonical crown per preset,
-a green box, then nothing per tree with the canopy baked into the coarse
-heightfield. The factory caches meshes per (preset, stage), so a fine chunk at
-mid range and a region tile at the horizon draw the same crown. Region tiles
-enter `classify` as a coarse source and receive the same classes as fine tiles.
+Landed (issues #5, #10, #31). `resolve` answers with one treatment, which is
+the head of a longer answer: `chain(Class, Style)` returns the whole list of
+stages, each a builder and the projected size it holds down to.
+
+```
+Detail   Voxels{per_tile, cutout, undergrowth, strands} | Crown | Box
+         | Billboard | Prefab | Surface | Quad | Baked
+EdgeRule Projected | Reach{of_near, at_least} | Far | Unbuilt
+Stage    { detail, edge }   edge(near) -> tiles   key() -> Detail   built() -> bool
+Chain    { stages }  stages()  window()  instanced()
+chain(class, style) -> Chain      water_chain() -> Chain
+tree_chain() -> &'static Chain    edges(&[Stage], near) -> Vec<f32>
+StageCache<K, V>  get/insert/contains/retain/iter/at, keyed (K, Detail)
+```
+
+`Stage::edge` is the only place a hand-off distance is computed.
+`EdgeRule::Projected` is the near band's own rule applied to that stage's leaf
+voxel — a voxel `DETAIL / per_tile` times as wide still covers the pixel floor
+that many times further out — and `Reach` is for a stage with no voxel of its
+own, or one something else sets a floor under. `Chain::window` is the run a
+chunk mesher can build; `Chain::instanced` is the whole list, which is what the
+horizon's scatter draws.
+
+The chains, written out whole even where only the head has a builder — a stage
+nobody can build yet carries `EdgeRule::Unbuilt` rather than an invented
+distance, and consumers skip it:
+
+| Class | Chain |
+|---|---|
+| `Tree`, `DeadTree` | 4 voxels cutout with the undergrowth, 3 and 2 voxels cutout with the strands, 1 voxel opaque, the canonical crown, its box |
+| `Shrub`, `Sapling`, `TallGrass` | grown at 2 voxels, *billboard*, *nothing* |
+| `Built`, `Building`, `ItemPile` | fine cubes, *prefab*, *footprint box*, *nothing* |
+| water (`water_chain`) | the mesher's surface, *one flat tinted quad* |
+
+`StageCache` is the per-(key, stage) mesh cache the chain implies. The key is
+whatever varies inside a stage — a tree's origin tile for the window, where
+every tree is its own, a preset and growth variant for the horizon, where six
+canonical shapes serve thousands of instances — and the stage is `Stage::key`,
+so a coarse cut never overwrites the fine one at the key they share.
+`canopy.rs:Forest.trees` and `horizon/grown.rs` are both behind it.
+
+Region tiles do not yet enter `classify` as a coarse source; the scatter maps a
+region tile's tree materials onto a preset itself (`scatter.rs:preset_for`).
 
 ## Related issues
 

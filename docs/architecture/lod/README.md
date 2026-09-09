@@ -3,7 +3,9 @@
 Status: fine chunks landed (`crates/dwarf-eye-world/src/mesh.rs`); the four
 canopy bands landed (`crates/dwarf-eye-world/src/canopy.rs`, issue #10); the
 far band from region data landed (`crates/dwarf-eye-world/src/horizon/`, issue
-#31); mid terrain heightfield planned (issue #10); seam skirt past the region
+#31); the bands and the far band's instances now come off one chain in the
+factory (`factory.rs:Chain`, [../factory/README.md](../factory/README.md), issue
+#5); mid terrain heightfield planned (issue #10); seam skirt past the region
 details planned (issue #9).
 
 ## What it does
@@ -27,15 +29,18 @@ location:
 
 The factory classifies from whichever source it has, so a tree is a tree whether
 it came from a tiletype or from a region tile's tree materials and vegetation
-density. Every band renders the same objects: L-system trees and bushes at the
-resolution the band needs, in five stages — full voxels, coarser cuts down to
-one opaque voxel a tile, one canonical crown per species
-(`dwarf_eye_trees::crown`), its bounding box (`crown_box`), and finally the
-canopy colour baked into the heightfield; building prefabs from site footprints or from construction tiles;
-water and rivers as surfaces. Approximation lives in the placement rule, seeded
-from absolute coordinates, so a horizon tree keeps its place as the camera
-approaches and is replaced in place when fine data arrives. The band is chosen
-by projected tile size on screen, not by which source fed it.
+density. Every band renders the same objects, off one chain the factory resolves
+(`factory::chain`): L-system trees and bushes cut at four, three, two and one
+voxel to a tile, then one canonical crown per species
+(`dwarf_eye_trees::crown`), then its bounding box (`crown_box`), and past the
+scatter's reach the canopy colour baked into the heightfield; building prefabs
+from site footprints or from construction tiles; water and rivers as surfaces.
+Approximation lives in the placement rule, seeded from absolute coordinates, so
+a horizon tree keeps its place as the camera approaches and is replaced in place
+when fine data arrives. **The stage is chosen by projected size on screen, never
+by which source fed it** — a chunk mesher draws the tree DF reports and the
+horizon draws a canonical growth, but both at the cut the camera's distance
+asks for, so the window's boundary does not show in the canopy.
 
 ## The tiers
 
@@ -51,15 +56,18 @@ by projected tile size on screen, not by which source fed it.
 The three coarse bands are terraced to whole z-levels, so they step the way fine
 tiles do; only the world grid, where a level is under a pixel, stays smooth.
 
-The far band has a tree chain of its own, three stages deep, swapped by the
+The far band draws **the same chain**, all six stages of it, swapped by the
 camera's distance to each tree rather than by the window's centre
-([horizon.md](horizon.md)): a grown tree at one voxel to a tile, the canonical
-crown, then its box. It is the same rule as the canopy bands and the same
-`VisibilityRange` machinery; only the meshes differ.
+([horizon.md](horizon.md)). Detail is that distance and never which survey a
+tree came from, so a tree just outside the live window is cut exactly as
+coarsely as one just inside it and no more.
 
-Canopy bands, all built from the same growth and spawned together. The edge is
-where that band's own leaf voxel falls to two pixels (`canopy.rs:Band::edge`);
-the crossfade is that edge widened to the distance the dither needs
+Canopy bands, all built from the same growth and spawned together. A band *is*
+a stage of `factory::chain(Class::Tree, ..)`: its resolution, its cut, what
+rides with it and where it ends are all read off that stage
+(`canopy.rs:Band::stage`). The edge is where that band's own leaf voxel falls to
+two pixels (`factory::Stage::edge`, through `canopy.rs:Band::edge`); the
+crossfade is that edge widened to the distance the dither needs
 (`main.rs:band_fades`). The tile figures are Bevy's 45-degree lens into a
 720-tall window:
 
@@ -140,12 +148,15 @@ out (`canopy.rs:Band::edge`): the close band reaches 4N/3, the mid band's
 half-tile voxel 2N, 217 tiles at 720, and the far band runs from there to the
 camera's far plane.
 
-The bands are a list, not a pair: `canopy.rs:BANDS` orders them nearest first,
-`main.rs:band_edges` gives one handover distance per gap and
-`main.rs:band_ranges` turns those into one `VisibilityRange` per band. A coarser
-stage — a canonical crown per species, a green box — is one more entry in
-`BANDS`, one more mesh per chunk from the worker, and nothing else: the edges
-follow from the detail.
+The bands are a list, not a pair, and the list is the factory's:
+`canopy.rs:BANDS` names the four entries of `factory::Chain::window` nearest
+first, `main.rs:band_edges` is `factory::edges` over that run — one handover
+distance per gap — and `main.rs:stage_ranges` turns those into one
+`VisibilityRange` per band. A coarser stage is one more entry in the chain, one
+more mesh per chunk from the worker, and nothing else: the edges follow from the
+detail. `main.rs:horizon_ranges` is the same two calls over
+`factory::Chain::instanced`, so the window and the horizon hand over by the same
+numbers.
 
 `main.rs:size_bands` recomputes N from the window and the camera's own
 projection, and rewrites the ranges already on the GPU when either changes.
@@ -191,7 +202,7 @@ tiles beyond `world.map.block_index`
 
 | Page | |
 |---|---|
-| [horizon.md](horizon.md) | the terraced far band: region and world maps, the ground sprites it wears, its own three-stage tree chain, rivers, sites, the block mask and the stitched seam |
+| [horizon.md](horizon.md) | the terraced far band: region and world maps, the ground sprites it wears, the window's own tree chain drawn as instances, rivers, sites, the block mask and the stitched seam |
 
 ## Invariants and gotchas
 
@@ -204,10 +215,10 @@ tiles beyond `world.map.block_index`
   must be at least half non-empty. A sparse lowest chunk is canopy with no
   ground under it.
 - Retention is horizontal only, so a mid tier has to keep the same rule.
-- A tree is cached per origin **and** per resolution (`canopy.rs:Forest.trees`),
-  and every cut comes off one growth: the skeleton is the expensive half, so
-  rasterising four times costs a fraction of growing four times. Retiring a
-  tree takes all of its cuts.
+- A tree is cached per origin **and** per stage (`canopy.rs:Forest.trees`, a
+  `factory::StageCache`), and every cut comes off one growth: the skeleton is
+  the expensive half, so rasterising four times costs a fraction of growing four
+  times. Retiring a tree takes all of its cuts.
 - The worker builds every band for every chunk it meshes and ships them in one
   `Event::Chunks` entry; a chunk arrives whole or not at all.
 - The close and mid bands drop plants and tufts but keep the strands, which are

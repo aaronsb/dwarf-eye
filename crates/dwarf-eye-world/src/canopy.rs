@@ -131,6 +131,11 @@ pub const FAR_DETAIL: i32 = DETAIL / 4;
 
 /// How finely one chunk's crowns are cut, and what rides along with them.
 ///
+/// One name per entry in the tree chain's window run
+/// (`factory::Chain::window`): the band *is* that stage, and everything below —
+/// its resolution, its cut, its hand-off distance, what rides with it — is read
+/// off it rather than restated here.
+///
 /// The near band is the full tree, its plants and its hanging strands. The
 /// close and mid bands are the same tree at [`CLOSE_DETAIL`] and
 /// [`MID_DETAIL`], without the ground cover but still under the leaf cutout,
@@ -157,13 +162,24 @@ pub enum Band {
 pub const BANDS: [Band; 4] = [Band::Near, Band::Close, Band::Mid, Band::Far];
 
 impl Band {
-    pub fn detail(self) -> i32 {
+    /// Where this band sits in the chain's window run.
+    fn index(self) -> usize {
         match self {
-            Band::Near => DETAIL,
-            Band::Close => CLOSE_DETAIL,
-            Band::Mid => MID_DETAIL,
-            Band::Far => FAR_DETAIL,
+            Band::Near => 0,
+            Band::Close => 1,
+            Band::Mid => 2,
+            Band::Far => 3,
         }
+    }
+
+    /// The chain stage this band draws. Pinned to [`BANDS`] by
+    /// `the_bands_are_the_chain_s_window_run`.
+    pub fn stage(self) -> factory::Stage {
+        factory::tree_chain().window()[self.index()]
+    }
+
+    pub fn detail(self) -> i32 {
+        self.stage().detail.per_tile().unwrap_or(DETAIL)
     }
 
     /// What this band asks the rasteriser for: the near band's wood, however
@@ -182,25 +198,27 @@ impl Band {
     /// Where this band hands over to the next, in tiles, given where the near
     /// band ends.
     ///
-    /// [`near_band`]'s rule applied to this band's own leaf voxel: a voxel
+    /// The chain's own edge rule ([`factory::Stage::edge`]), which is
+    /// [`near_band`]'s applied to this band's leaf voxel: a voxel
     /// `DETAIL / detail` times as wide still covers [`MIN_LEAF_PIXELS`] that
-    /// many times further out. The last band hands over to nothing and its edge
-    /// is never asked for.
+    /// many times further out. The horizon's instances ask the same function of
+    /// the same stages, so the two hand over by the same numbers. The last band
+    /// the window draws hands over to nothing and its edge is never asked for.
     pub fn edge(self, near: f32) -> f32 {
-        near * DETAIL as f32 / self.detail() as f32
+        self.stage().edge(near)
     }
 
     /// Whether this band carries the ground cover: standing plants, tufts and
     /// the strands a weeping crown hangs.
     fn undergrowth(self) -> bool {
-        self == Band::Near
+        self.stage().detail.undergrowth()
     }
 
     /// Whether a weeping crown's strands come with this band. They are quads
     /// the growth crate has already meshed, so carrying them one band further
     /// out costs a copy rather than a rasterisation.
     fn strands(self) -> bool {
-        self != Band::Far
+        self.stage().detail.strands()
     }
 
     /// Which of [`CanopyMeshes`]'s four meshes a surface goes into.
@@ -210,10 +228,7 @@ impl Band {
     /// material is one entity and one draw call per chunk, and a chunk that far
     /// off has no bark grain or leaf holes left to tell apart.
     fn slot(self, surface: Surface) -> usize {
-        match self {
-            Band::Far => 0,
-            _ => surface.slot(),
-        }
+        if self.stage().detail.cutout() { surface.slot() } else { 0 }
     }
 
     /// What each of [`CanopyMeshes`]'s four meshes is drawn with.
@@ -223,14 +238,10 @@ impl Band {
     /// worth paying while a hole is still a pixel wide and not after. Only the
     /// far band's first slot is ever filled.
     pub fn coats(self) -> [Coat; 4] {
-        match self {
-            Band::Near | Band::Close | Band::Mid => [
-                Coat::Bark,
-                Coat::Cutout(Surface::Broadleaf),
-                Coat::Cutout(Surface::Needle),
-                Coat::Strip,
-            ],
-            Band::Far => [Coat::Leaf; 4],
+        if self.stage().detail.cutout() {
+            [Coat::Bark, Coat::Cutout(Surface::Broadleaf), Coat::Cutout(Surface::Needle), Coat::Strip]
+        } else {
+            [Coat::Leaf; 4]
         }
     }
 }
@@ -480,7 +491,7 @@ fn strands(grown: &trees::VoxelTree, at: [f32; 3]) -> TreeMesh {
 /// `DWARF_EYE_PLANT_VOXELS` overrides it. Three is visibly rounder close up and
 /// costs about half a second more on the first mesh of a cached map, and half
 /// again as many triangles.
-const DEFAULT_PLANT_DETAIL: u32 = 2;
+const DEFAULT_PLANT_DETAIL: u32 = factory::PLANT_DETAIL as u32;
 
 fn plant_detail() -> u32 {
     static DETAIL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -632,17 +643,14 @@ fn face_shade(normal: [f32; 3]) -> f32 {
     }
 }
 
-/// A tree's origin tile and the detail its copy was cut at.
-type TreeKey = ((i32, i32, i32), i32);
-
 /// Trees that have been grown, kept so a chunk never regrows one.
 ///
-/// Keyed by origin and by the detail the copy was cut at: the bands are the
-/// same tree sampled once each, and all of them are wanted for as long as the
-/// chunk is.
+/// The factory's [`factory::StageCache`], keyed by the tree's origin tile and
+/// the chain stage the copy was cut at: the bands are the same tree sampled
+/// once each, and all of them are wanted for as long as the chunk is.
 #[derive(Default)]
 pub struct Forest {
-    trees: HashMap<TreeKey, Option<Arc<TreeVoxels>>>,
+    trees: factory::StageCache<(i32, i32, i32), Option<Arc<TreeVoxels>>>,
     /// Standing plants, by the absolute tile each one stands on.
     plants: HashMap<(i32, i32, i32), Option<Arc<Plant>>>,
 }
@@ -701,7 +709,7 @@ impl Forest {
         if keys.is_empty() {
             return;
         }
-        self.trees.retain(|(origin, _), _| {
+        self.trees.retain(|origin, _| {
             !keys.iter().any(|&(bx, by, z)| {
                 (origin.0.div_euclid(BLOCK) - bx).abs() <= 1
                     && (origin.1.div_euclid(BLOCK) - by).abs() <= 1
@@ -716,16 +724,15 @@ impl Forest {
 
     /// Trees grown, counted once each rather than once per band.
     pub fn tree_count(&self) -> usize {
-        self.trees.iter().filter(|((_, d), t)| *d == DETAIL && t.is_some()).count()
+        self.trees.at(Band::Near.stage().key()).filter(|t| t.is_some()).count()
     }
 
     /// Leaf and bark voxels across every tree grown at near detail, each counted
     /// once however many chunks it reaches.
     pub fn voxel_counts(&self) -> (usize, usize) {
         self.trees
-            .iter()
-            .filter(|((_, d), _)| *d == DETAIL)
-            .filter_map(|(_, t)| t.as_ref())
+            .at(Band::Near.stage().key())
+            .filter_map(|t| t.as_ref())
             .fold((0, 0), |(l, b), t| (l + t.leaf_voxels, b + t.bark_voxels))
     }
 
@@ -943,7 +950,7 @@ impl Forest {
         world_origin: (i32, i32, i32),
         band: Band,
     ) -> Option<Arc<TreeVoxels>> {
-        if let Some(found) = self.trees.get(&(origin, band.detail())) {
+        if let Some(found) = self.trees.get(origin, band.stage().key()) {
             return found.clone();
         }
         let started = std::time::Instant::now();
@@ -951,7 +958,7 @@ impl Forest {
         timing::PHASES.envelope.since(started);
         let Some(env) = read else {
             for band in BANDS {
-                self.trees.insert((origin, band.detail()), None);
+                self.trees.insert(origin, band.stage().key(), None);
             }
             return None;
         };
@@ -987,7 +994,7 @@ impl Forest {
                     crate::tree::cap_radius(&env),
                 );
             }
-            self.trees.insert((origin, cut.detail()), Some(grown));
+            self.trees.insert(origin, cut.stage().key(), Some(grown));
         }
         wanted
     }
@@ -1582,14 +1589,36 @@ mod tests {
         assert!(far.leaf * 8 < near.leaf, "near {} far {}", near.leaf, far.leaf);
     }
 
+    /// [`BANDS`] names the chain's window run, one for one and in order, so a
+    /// band's resolution, cut, hand-off and cargo are all read off the chain.
+    #[test]
+    fn the_bands_are_the_chain_s_window_run() {
+        let window = factory::tree_chain().window();
+        assert_eq!(BANDS.len(), window.len(), "a band has no stage or a stage has no band");
+        for (i, band) in BANDS.iter().enumerate() {
+            assert_eq!(band.index(), i, "{band:?} is out of order");
+            assert_eq!(band.stage(), window[i]);
+        }
+        assert_eq!(
+            BANDS.map(|b| b.detail()),
+            [DETAIL, CLOSE_DETAIL, MID_DETAIL, FAR_DETAIL],
+            "the bands no longer step 4, 3, 2, 1"
+        );
+        // Only the far band trades the leaf holes away, and only the near band
+        // carries the ground cover.
+        assert_eq!(BANDS.map(|b| b.coats()[0]), [Coat::Bark, Coat::Bark, Coat::Bark, Coat::Leaf]);
+        assert_eq!(BANDS.map(|b| b.undergrowth()), [true, false, false, false]);
+        assert_eq!(BANDS.map(|b| b.strands()), [true, true, true, false]);
+    }
+
     #[test]
     fn a_tree_is_cached_once_per_band() {
-        // The cache key carries the detail, so the coarse copy of a tree never
+        // The cache key carries the stage, so the coarse copy of a tree never
         // stands in for the fine one at the origin they share.
         let mut forest = Forest::default();
         let origin = (4, 5, 6);
         for band in BANDS {
-            forest.trees.insert((origin, band.detail()), None);
+            forest.trees.insert(origin, band.stage().key(), None);
         }
         assert_eq!(forest.trees.len(), BANDS.len(), "two bands shared a cache key");
         forest.retire_near(&[(0, 0, 6)]);

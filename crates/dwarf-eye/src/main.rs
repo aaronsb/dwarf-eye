@@ -47,7 +47,8 @@ use bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport;
 use bevy::render::occlusion_culling::OcclusionCulling;
 use bevy::render::{RenderApp, RenderStartup};
 use dwarf_eye_world::canopy::{BANDS, Band, CanopyMeshes, Coat, Surface};
-use dwarf_eye_world::horizon::scatter::{STAGES as HORIZON_STAGES, Stage as TreeStage};
+use dwarf_eye_world::factory::{self, Detail as TreeStage};
+use dwarf_eye_world::horizon::scatter::stages as horizon_stages;
 use dwarf_eye_world::{BLOCK, MeshData, MeshOptions, mesh::Z_SCALE};
 use std::collections::HashMap;
 use worker::{Bridge, ChunkKey, Command, Event};
@@ -241,12 +242,12 @@ const BAND_FAR: f32 = 40000.0;
 
 /// Where one band hands over to the next, in tiles, nearest first.
 ///
-/// One edge per handover, each from the band's own leaf voxel
-/// (`canopy::Band::edge`), so `canopy::BANDS` and this list grow together: a
-/// coarser stage is one more entry there and nothing here. The last band runs
-/// to the far plane and has no edge.
+/// One edge per handover, straight off the chain the factory resolves a tree to
+/// (`factory::edges` over `Chain::window`), so `canopy::BANDS` and this list
+/// grow together: a coarser stage is one more entry in the chain and nothing
+/// here. The last band the window draws runs to the far plane and has no edge.
 fn band_edges(near: f32) -> Vec<f32> {
-    BANDS[..BANDS.len() - 1].iter().map(|band| band.edge(near)).collect()
+    factory::edges(factory::tree_chain().window(), near)
 }
 
 /// The distances a hand-off dithers across, one per edge.
@@ -279,8 +280,17 @@ fn band_fades(edges: &[f32]) -> Vec<std::ops::Range<f32>> {
 /// start margin, which is what Bevy crossfades across; the last runs to the far
 /// plane.
 fn band_ranges(near: f32) -> Vec<VisibilityRange> {
-    let edges = band_edges(near);
-    let fades = band_fades(&edges);
+    stage_ranges(&band_edges(near))
+}
+
+/// One `VisibilityRange` per stage of a chain, nearest first, from its own
+/// hand-off distances.
+///
+/// The window's canopy bands and the horizon's instances both come through
+/// here, over `factory::edges` and [`band_fades`], so the two hand over by the
+/// same numbers whichever survey a tree came from.
+fn stage_ranges(edges: &[f32]) -> Vec<VisibilityRange> {
+    let fades = band_fades(edges);
     let fade = |stage: usize| fades[stage].clone();
     (0..=edges.len())
         .map(|stage| VisibilityRange {
@@ -300,54 +310,65 @@ fn band_ranges(near: f32) -> Vec<VisibilityRange> {
 struct CanopyBand(usize);
 
 /// Which stage of the far band's tree chain an instance is, by its place in
-/// `horizon::scatter::STAGES`.
+/// `horizon::scatter::stages`.
 #[derive(Component, Clone, Copy, PartialEq)]
 struct HorizonStage(usize);
 
 /// How far the sun's shadow cascades reach, mirroring Bevy's own default
-/// `CascadeShadowConfig`. Nothing inside this is allowed to be shadowless, so
-/// it is the floor on where the box stage — the one stage that casts no shadow
-/// — may begin.
-const SHADOW_DISTANCE: f32 = 150.0;
+/// `CascadeShadowConfig`. The chain's own copy is the floor under the crown
+/// stage's edge, and any stage beginning at or past this one casts a blob
+/// rather than a shadow-map shadow (`horizon_blob_from`).
+const SHADOW_DISTANCE: f32 = factory::SHADOW_DISTANCE;
 
-/// How far the grown stage runs, as a multiple of the canopy's near band.
+/// Where one stage of the far band's tree chain hands over to the next.
 ///
-/// The projected-size rule would put it at four times that — a one-tile leaf
-/// voxel is two pixels out to four times where a quarter-tile one is — and the
-/// triangle budget will not carry it: a grown far tree is about eight hundred
-/// triangles and the count goes with the square of the reach. Half again is
-/// where a box crown starts reading as a box, which is what this stage exists
-/// to push back.
-const GROWN_REACH: f32 = 1.5;
-
-/// How much of a hand-off the far band's tree stages dither across. Wider than
-/// the canopy's, because the shapes either side differ more: a grown tree into
-/// a handful of boxes wants a long fade, and there is no cutout to pay for.
-const HORIZON_CROSSFADE: f32 = 0.35;
+/// The same list the canopy bands are cut from, over the same edge rule, so an
+/// instance is cut as finely as the camera's distance asks for and no more
+/// coarsely: a tree just outside the live window matches one just inside it.
+fn horizon_edges(near: f32) -> Vec<f32> {
+    factory::edges(horizon_stages(), near)
+}
 
 /// One range per stage of the far band's tree chain, nearest first.
 ///
 /// Measured from the camera to the tree, not from the window's centre: a
 /// region-sourced tree can stand a few tiles away, and the old rule drew it as
-/// a box the size of a house. The grown stage ends where the canopy's near
-/// band does, since it is the same growth at the same resolution; the crown
-/// stage runs three times as far, and never stops short of the shadow
-/// cascades, so the one stage that casts no shadow is wholly outside them.
+/// a box the size of a house.
 fn horizon_ranges(near: f32) -> Vec<VisibilityRange> {
-    let edges = [near * GROWN_REACH, (near * 3.0).max(SHADOW_DISTANCE)];
-    let fade = |at: f32| at..at * (1.0 + HORIZON_CROSSFADE);
-    (0..=edges.len())
-        .map(|stage| VisibilityRange {
-            start_margin: if stage == 0 { 0.0..0.0 } else { fade(edges[stage - 1]) },
-            end_margin: match edges.get(stage) {
-                Some(&at) => fade(at),
-                None => BAND_FAR..BAND_FAR,
-            },
-            // A crown is one mesh at one transform, so its bounds are where it
-            // stands: the measure is the camera's distance to that tree.
-            use_aabb: true,
-        })
-        .collect()
+    stage_ranges(&horizon_edges(near))
+}
+
+/// The first stage of the far band's chain that begins at or beyond the shadow
+/// cascades, and so casts a blob rather than a shadow-map shadow.
+///
+/// Everything nearer is inside the cascades and casts properly. Past them a
+/// shadow map has nothing left to resolve a tree with, and a far band with no
+/// shadows at all reads as flat.
+fn horizon_blob_from(near: f32) -> usize {
+    let edges = horizon_edges(near);
+    edges.iter().position(|&at| at >= SHADOW_DISTANCE).map(|i| i + 1).unwrap_or(edges.len())
+}
+
+/// The range a blob shadow carries: one blob a tree, appearing where the first
+/// non-casting stage does and running to the far plane, so the ground under a
+/// far wood is shaded once however many stages stand over it in turn.
+fn horizon_blob_range(near: f32) -> VisibilityRange {
+    let ranges = horizon_ranges(near);
+    let at = horizon_blob_from(near).min(ranges.len() - 1);
+    VisibilityRange {
+        start_margin: ranges[at].start_margin.clone(),
+        end_margin: BAND_FAR..BAND_FAR,
+        use_aabb: true,
+    }
+}
+
+/// A stage's name and what it costs, for the horizon's one-line report.
+fn stage_label(stage: TreeStage, triangles: usize) -> String {
+    let name = match stage.per_tile() {
+        Some(per_tile) => format!("{per_tile}vox"),
+        None => format!("{stage:?}").to_lowercase(),
+    };
+    format!("{name} {}k", triangles / 1000)
 }
 
 /// A blob shadow: the ground shadow of a tree past the cascades, as one quad.
@@ -1149,9 +1170,9 @@ fn drain_worker(
                 let ranges = horizon_ranges(far.bands.near);
                 let ground = data.mesh.triangle_count();
                 let (trees, instances) = (data.instance_count(), data.entity_count());
-                let per_stage: Vec<String> = HORIZON_STAGES
+                let per_stage: Vec<String> = horizon_stages()
                     .iter()
-                    .map(|s| format!("{:?} {}k", s, data.stage_triangles(*s) / 1000))
+                    .map(|s| stage_label(s.detail, data.stage_triangles(s.detail)))
                     .collect();
                 status.detail = format!(
                     "horizon: {ground} ground triangles, {trees} trees ({}), {instances} instances; \
@@ -1161,6 +1182,9 @@ fn drain_worker(
                     data.edge_density,
                     data.clearings,
                 );
+                // The same line in the log, so an unattended shot still says
+                // what the chain cost.
+                info!("{}", status.detail);
                 commands.spawn((
                     Mesh3d(meshes.add(to_bevy_mesh(data.mesh))),
                     MeshMaterial3d(far.ground.0.clone()),
@@ -1173,8 +1197,11 @@ fn drain_worker(
                 // calls, and each entity's own `VisibilityRange` decides which
                 // stage draws from the camera's distance to that tree.
                 let blob = meshes.add(to_bevy_mesh(blob_quad()));
+                let blob_from = horizon_blob_from(far.bands.near);
+                let blob_range = horizon_blob_range(far.bands.near);
                 for batch in data.crowns {
-                    let stage = HORIZON_STAGES.iter().position(|s| *s == batch.stage).unwrap_or(0);
+                    let stage =
+                        horizon_stages().iter().position(|s| s.detail == batch.stage).unwrap_or(0);
                     let range = ranges[stage].clone();
                     // The mesh's own size, so an instance is scaled to the
                     // height the scatter gave it and a blob is sized from the
@@ -1187,7 +1214,12 @@ fn drain_worker(
                         .map(|p| p[0].abs().max(p[2].abs()))
                         .fold(0.5f32, f32::max);
                     let mesh = meshes.add(to_bevy_mesh(batch.mesh));
-                    let coat = if batch.stage == TreeStage::Grown {
+                    // A rasterised cut carries no shading of its own and takes
+                    // the canopy's sky term; `crown.rs` bakes a lit top and
+                    // darker sides into the crown and box stages' vertex
+                    // colours, and the sky term over that takes their sides to
+                    // nearly black.
+                    let coat = if batch.stage.per_tile().is_some() {
                         far.canopy.grown.clone()
                     } else {
                         far.canopy.boxes.clone()
@@ -1204,14 +1236,15 @@ fn drain_worker(
                             HorizonStage(stage),
                             Horizon,
                         ));
-                        // Everything inside the sun's cascades casts: the two
-                        // near stages are wholly inside them
-                        // (`horizon_ranges` holds the box stage's near edge at
-                        // or beyond `SHADOW_DISTANCE`), and the box stage is
-                        // wholly outside, where a cascade would never have
-                        // resolved it. There it casts a blob instead.
-                        if batch.stage == TreeStage::Box {
+                        // Everything inside the sun's cascades casts a real
+                        // shadow. Past them a shadow map has nothing left to
+                        // resolve a tree with, so every stage whose near edge is
+                        // at or beyond `SHADOW_DISTANCE` casts a blob instead —
+                        // one blob a tree, on the first of them.
+                        if stage >= blob_from {
                             entity.insert(NotShadowCaster);
+                        }
+                        if stage == blob_from {
                             commands.spawn((
                                 Mesh3d(blob.clone()),
                                 MeshMaterial3d(far.blob.0.clone()),
@@ -1223,7 +1256,7 @@ fn drain_worker(
                                     },
                                     far.aim.0,
                                 ),
-                                range.clone(),
+                                blob_range.clone(),
                                 HorizonStage(stage),
                                 BlobShadow {
                                     pos: tree.pos,
@@ -1267,7 +1300,10 @@ fn size_bands(
     windows: Query<&Window>,
     camera: Query<&Projection, With<FlyCamera>>,
     mut ranged: Query<(&CanopyBand, &mut VisibilityRange), Without<HorizonStage>>,
-    mut staged: Query<(&HorizonStage, &mut VisibilityRange), Without<CanopyBand>>,
+    mut staged: Query<
+        (&HorizonStage, Option<&BlobShadow>, &mut VisibilityRange),
+        Without<CanopyBand>,
+    >,
 ) {
     let Ok(window) = windows.single() else { return };
     let fov = match camera.single() {
@@ -1286,8 +1322,13 @@ fn size_bands(
         }
     }
     let stages = horizon_ranges(near);
-    for (stage, mut range) in &mut staged {
-        if let Some(wanted) = stages.get(stage.0) {
+    let blob = horizon_blob_range(near);
+    for (stage, is_blob, mut range) in &mut staged {
+        // A blob is not a stage: it runs from wherever the first non-casting
+        // stage starts to the far plane, whatever the window is now.
+        if is_blob.is_some() {
+            *range = blob.clone();
+        } else if let Some(wanted) = stages.get(stage.0) {
             *range = wanted.clone();
         }
     }
@@ -1709,5 +1750,52 @@ mod tests {
             );
         }
         assert_eq!(ranges[BANDS.len() - 1].end_margin, BAND_FAR..BAND_FAR);
+    }
+
+    /// The window's four bands still end exactly where they always did: the
+    /// near band's own distance, then its leaf voxel's rule on each coarser cut.
+    #[test]
+    fn the_band_edges_are_the_ones_that_shipped() {
+        let n = near();
+        assert_eq!(band_edges(n), vec![n, n * 4.0 / 3.0, n * 2.0]);
+    }
+
+    /// The horizon's instances open on the window's own edges, so a tree just
+    /// outside the live window is cut exactly as coarsely as one just inside it
+    /// at the same distance. This is the whole of the boundary invariant.
+    #[test]
+    fn the_horizon_hands_over_where_the_window_does() {
+        let n = near();
+        let window = band_edges(n);
+        let horizon = horizon_edges(n);
+        assert_eq!(&horizon[..window.len()], &window[..], "the two chains disagree");
+        assert_eq!(horizon.len(), horizon_stages().len() - 1, "one hand-off per gap");
+    }
+
+    /// Coarsening outward: every hand-off is further out than the one before,
+    /// so no stage is ever asked to draw inside a finer one's range.
+    #[test]
+    fn the_chain_coarsens_outward() {
+        let n = near();
+        for edges in [band_edges(n), horizon_edges(n)] {
+            assert!(edges.windows(2).all(|w| w[0] < w[1]), "{edges:?} is not monotone");
+        }
+    }
+
+    /// The blob starts at the first stage the cascades no longer reach and runs
+    /// to the far plane, so the ground under a far wood is never bare.
+    #[test]
+    fn a_blob_covers_every_stage_past_the_cascades() {
+        let n = near();
+        let at = horizon_blob_from(n);
+        let edges = horizon_edges(n);
+        assert!(at > 0 && at <= edges.len(), "blob stage {at} is off the chain");
+        assert!(edges[at - 1] >= SHADOW_DISTANCE, "the blob starts inside the cascades");
+        if at > 1 {
+            assert!(edges[at - 2] < SHADOW_DISTANCE, "a casting stage was given a blob");
+        }
+        let range = horizon_blob_range(n);
+        assert_eq!(range.start_margin, horizon_ranges(n)[at].start_margin);
+        assert_eq!(range.end_margin, BAND_FAR..BAND_FAR);
     }
 }

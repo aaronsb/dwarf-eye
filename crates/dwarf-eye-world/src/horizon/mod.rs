@@ -42,7 +42,7 @@ use std::collections::HashMap;
 
 use field::{Cell, Field};
 use fine::FineSurface;
-use scatter::{Clearing, CrownInstance, Patch, STAGES, Stage};
+use scatter::{Clearing, CrownInstance, Patch, Stage, stages};
 use skin::Skins;
 use shade::{WATER, jitter, to_linear, top_color};
 use terrace::{FAR, Terrain, smooth_height};
@@ -94,11 +94,11 @@ impl Horizon {
     }
 
     /// Distinct trees. Each is one entity per stage, so the entity count is
-    /// this times [`STAGES`]'s length.
+    /// this times the chain's length.
     pub fn instance_count(&self) -> usize {
         self.crowns
             .iter()
-            .filter(|b| b.stage == STAGES[0])
+            .filter(|b| b.stage == stages()[0].detail)
             .map(|b| b.instances.len())
             .sum()
     }
@@ -113,8 +113,8 @@ impl Horizon {
 pub struct CrownBatch {
     pub preset: Preset,
     pub stage: Stage,
-    /// Which of the species' canonical growths, for [`Stage::Grown`]. The two
-    /// box stages have one mesh a species and leave this at zero.
+    /// Which of the species' canonical growths, for the rasterised stages. The
+    /// crown and the box have one mesh a species and leave this at zero.
     pub variant: u32,
     /// How tall the mesh itself stands, in tiles: an instance's transform is
     /// scaled by its own height over this.
@@ -519,15 +519,15 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
 /// Groups the placed trees by species, growth variant and stage, and builds
 /// the one mesh each group shares.
 ///
-/// Every tree lands in one group per stage. Only the nearest stage varies by
-/// growth variant; the two box stages have one mesh a species, so their groups
-/// hold the whole species.
+/// Every tree lands in one group per stage. Only the rasterised stages vary by
+/// growth variant; the crown and the box have one mesh a species, so their
+/// groups hold the whole species.
 fn batch_crowns(instances: Vec<(Preset, CrownInstance)>) -> Vec<CrownBatch> {
     let mut groups: HashMap<(Preset, Stage, u32), Vec<CrownInstance>> = HashMap::new();
     for (preset, instance) in instances {
-        for stage in STAGES {
-            let variant = if stage == Stage::Grown { instance.variant } else { 0 };
-            groups.entry((preset, stage, variant)).or_default().push(instance);
+        for stage in stages() {
+            let variant = if stage.detail.per_tile().is_some() { instance.variant } else { 0 };
+            groups.entry((preset, stage.detail, variant)).or_default().push(instance);
         }
     }
     let mut batches: Vec<CrownBatch> = groups
@@ -551,9 +551,12 @@ fn mesh_height(mesh: &MeshData) -> f32 {
 /// One species' crown at one stage, in this crate's mesh buffers.
 fn crown_mesh(preset: Preset, stage: Stage, variant: u32) -> MeshData {
     let source = match stage {
-        Stage::Grown => return grown::mesh(preset, variant),
+        Stage::Voxels { .. } => return grown::mesh(preset, variant, stage),
         Stage::Crown => dwarf_eye_trees::crown(preset),
         Stage::Box => dwarf_eye_trees::crown_box(preset),
+        // Nothing else in the chain has an instanced builder, and `stages()`
+        // never hands one over.
+        _ => return MeshData::default(),
     };
     MeshData {
         uvs: vec![WHITE_UV; source.positions.len()],
@@ -752,7 +755,8 @@ mod tests {
     #[test]
     fn every_preset_and_stage_meshes() {
         for preset in [Preset::Oak, Preset::Birch, Preset::Pine, Preset::Willow, Preset::MushroomTree] {
-            for stage in STAGES {
+            for stage in stages() {
+                let stage = stage.detail;
                 let mesh = crown_mesh(preset, stage, 1);
                 assert!(!mesh.indices.is_empty(), "{preset:?} {stage:?}");
                 assert_eq!(mesh.uvs.len(), mesh.positions.len());
@@ -768,12 +772,13 @@ mod tests {
         let trees = placed(90, &FineSurface::default());
         assert!(!trees.is_empty());
         let batches = batch_crowns(trees.clone());
-        for stage in STAGES {
+        for stage in stages() {
+            let stage = stage.detail;
             let held: usize =
                 batches.iter().filter(|b| b.stage == stage).map(|b| b.instances.len()).sum();
             assert_eq!(held, trees.len(), "{stage:?} is missing trees");
         }
-        // Only the grown stage splits by growth variant.
+        // Only the rasterised stages split by growth variant.
         for stage in [Stage::Crown, Stage::Box] {
             assert!(
                 batches.iter().filter(|b| b.stage == stage).all(|b| b.variant == 0),
@@ -797,7 +802,7 @@ mod tests {
             }
         }
         for ((key, stage), height) in &seen {
-            let grown = seen[&(*key, Stage::Grown)];
+            let grown = seen[&(*key, stages()[0].detail)];
             assert!((grown - height).abs() < 1e-3, "{stage:?} stands {height} not {grown}");
         }
     }

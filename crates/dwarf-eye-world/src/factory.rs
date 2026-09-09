@@ -20,9 +20,13 @@
 //!   its species. Never render coordinates, never the tile configuration, so a
 //!   plant is the same plant across a reload and wherever the origin sits.
 
+use crate::tree::DETAIL;
 use dfhack_remote::rfr::{TiletypeMaterial, TiletypeShape, TiletypeSpecial};
 use dwarf_eye_trees as trees;
 use dwarf_eye_trees::{TreeParams, VegetationKind};
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::OnceLock;
 
 /// What Dwarf Fortress says about one tile: everything the classifier reads.
 #[derive(Clone, Copy, Debug)]
@@ -206,6 +210,331 @@ pub enum Treatment {
 impl Treatment {
     pub fn is_grown(&self) -> bool {
         matches!(self, Treatment::Grown(..))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The treatment is a chain
+// ---------------------------------------------------------------------------
+
+/// Sub-voxels to a tile a standing plant is cut into. The chain's own copy of
+/// `canopy::DEFAULT_PLANT_DETAIL`, so a chain can be read without a mesher.
+pub const PLANT_DETAIL: i32 = 2;
+
+/// How far the sun's shadow cascades reach, in tiles, mirroring Bevy's default
+/// `CascadeShadowConfig`.
+///
+/// Nothing inside this may be shadowless, so it is the floor under the last
+/// stage that still casts: the crown stage never hands over to the box stage
+/// nearer than this, whatever the projected-size rule asks for.
+pub const SHADOW_DISTANCE: f32 = 150.0;
+
+/// How far the canonical crown runs, as a multiple of the near band.
+///
+/// Twice the reach of the one-voxel cut it replaces, which is the ratio the far
+/// band shipped with — its crown stage ran to `3 N` behind a grown stage that
+/// stopped at `1.5 N`. The cut it stands behind now ends where its own voxel
+/// falls under the pixel floor, at `4 N`, so the crown ends at `8 N`.
+pub const CROWN_REACH: f32 = 8.0;
+
+/// How one stage of a [`Chain`] is drawn.
+///
+/// This is the whole of a stage's identity as far as a mesh cache is concerned:
+/// two stages that differ only in where they hand over draw the same geometry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Detail {
+    /// Rasterised voxels, `per_tile` of them to a tile edge. `cutout` is
+    /// whether the leaves keep their alpha mask, `undergrowth` whether standing
+    /// plants and tufts come with them, `strands` whether a weeping crown's
+    /// curtains do.
+    Voxels { per_tile: i32, cutout: bool, undergrowth: bool, strands: bool },
+    /// One canonical crown per preset: a trunk under one to three boxes
+    /// (`dwarf_eye_trees::crown`).
+    Crown,
+    /// A box: a crown's own bounds (`dwarf_eye_trees::crown_box`), or a
+    /// building's footprint.
+    Box,
+    /// Two crossed planes of sprite.
+    Billboard,
+    /// A voxel prefab instance, such as vox-uristi's `.vox` buildings.
+    Prefab,
+    /// A liquid's own surface, as the mesher draws it.
+    Surface,
+    /// One flat tinted quad over a whole body of water.
+    Quad,
+    /// Nothing of its own: the colour is baked into the coarse heightfield.
+    Baked,
+}
+
+impl Detail {
+    /// Sub-voxels to a tile, for the stages that are rasterised. The stages
+    /// that are not have no leaf voxel, and so no projected-size rule of their
+    /// own.
+    pub fn per_tile(self) -> Option<i32> {
+        match self {
+            Detail::Voxels { per_tile, .. } => Some(per_tile),
+            _ => None,
+        }
+    }
+
+    /// Whether this cut keeps the leaf cutout. A cutout costs a masked pass, a
+    /// discard in the depth prepass and the overdraw behind every hole, which
+    /// is worth paying while a hole is still about a pixel across.
+    pub fn cutout(self) -> bool {
+        matches!(self, Detail::Voxels { cutout: true, .. })
+    }
+
+    /// Whether the ground cover comes with this cut: standing plants and tufts.
+    pub fn undergrowth(self) -> bool {
+        matches!(self, Detail::Voxels { undergrowth: true, .. })
+    }
+
+    /// Whether a weeping crown's strands come with this cut. They are quads the
+    /// growth crate has already meshed, so carrying them one stage further out
+    /// costs a copy rather than a rasterisation.
+    pub fn strands(self) -> bool {
+        matches!(self, Detail::Voxels { strands: true, .. })
+    }
+}
+
+/// Where a stage hands over to the next.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EdgeRule {
+    /// The projected-size rule on this stage's own leaf voxel: it holds until
+    /// that voxel stops covering the pixel floor, which is `DETAIL / per_tile`
+    /// times as far out as the near band.
+    Projected,
+    /// A fixed multiple of the near band, never nearer than `at_least` tiles.
+    /// For a stage the projected rule would reach further with than the
+    /// triangle budget allows, or one something else sets a floor under.
+    Reach { of_near: f32, at_least: f32 },
+    /// The last stage of a chain: it runs to the camera's far plane, and its
+    /// edge is never asked for.
+    Far,
+    /// The builder does not exist yet, so where the stage would hand over is
+    /// not a number anyone has measured. Consumers skip it.
+    Unbuilt,
+}
+
+/// One link of a [`Chain`]: a builder, and the projected size it holds down to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Stage {
+    pub detail: Detail,
+    pub edge: EdgeRule,
+}
+
+impl Stage {
+    /// Where this stage hands over to the next, in tiles, given where the near
+    /// band ends.
+    ///
+    /// The one edge function: the window's canopy bands and the horizon's
+    /// instances both come through here, so the two hand over by the same
+    /// numbers. A stage with no edge — the last of a chain, or one nobody can
+    /// build yet — never hands over, and says so with infinity.
+    pub fn edge(self, near: f32) -> f32 {
+        match self.edge {
+            EdgeRule::Projected => {
+                let per_tile = self.detail.per_tile().unwrap_or(DETAIL).max(1);
+                near * DETAIL as f32 / per_tile as f32
+            }
+            EdgeRule::Reach { of_near, at_least } => (near * of_near).max(at_least),
+            EdgeRule::Far | EdgeRule::Unbuilt => f32::INFINITY,
+        }
+    }
+
+    /// What a [`StageCache`] keys this stage by.
+    pub fn key(self) -> Detail {
+        self.detail
+    }
+
+    /// Whether anything can build this stage today. A chain lists the stages the
+    /// design calls for; a consumer skips the ones that have no builder.
+    pub fn built(self) -> bool {
+        self.edge != EdgeRule::Unbuilt
+    }
+}
+
+/// Who draws a class at every range, coarsening outward.
+///
+/// [`resolve`] is the head of this — the one treatment a consumer with no level
+/// of detail of its own uses. The chain is the same answer as a list, so the
+/// window's chunk spawner and the horizon's scatter take their stages from one
+/// place and their hand-off distances from one rule.
+#[derive(Clone, Debug)]
+pub struct Chain {
+    pub stages: Vec<Stage>,
+}
+
+impl Chain {
+    /// Every stage, nearest first.
+    pub fn stages(&self) -> &[Stage] {
+        &self.stages
+    }
+
+    /// The stages a chunk mesher builds: the rasterised cuts at the head of the
+    /// chain. The window holds fine data per entity, so it draws the entity
+    /// itself rather than a canonical one.
+    pub fn window(&self) -> &[Stage] {
+        &self.stages[..self.cuts()]
+    }
+
+    /// The stages an instanced consumer draws: all of them.
+    ///
+    /// The horizon's scatter has no per-tree data to preserve, so it draws a
+    /// handful of canonical growths per species instead — but at the same cuts,
+    /// at the same distances. Detail is the camera's distance to a tree and
+    /// never which survey the tree came from, which is what keeps the window's
+    /// boundary out of the canopy.
+    pub fn instanced(&self) -> &[Stage] {
+        &self.stages
+    }
+
+    /// How many rasterised cuts the chain opens with.
+    fn cuts(&self) -> usize {
+        self.stages.iter().take_while(|s| s.detail.per_tile().is_some()).count()
+    }
+}
+
+/// One hand-off distance per gap in a run of stages, nearest first.
+///
+/// The last stage a consumer draws runs to its own far plane and has no edge,
+/// which is why this is one shorter than the run. Unbuilt stages are the
+/// caller's to drop first: their edges are not numbers.
+pub fn edges(stages: &[Stage], near: f32) -> Vec<f32> {
+    let last = stages.len().saturating_sub(1);
+    stages[..last].iter().map(|s| s.edge(near)).collect()
+}
+
+/// The chain a class is drawn by, coarsening outward.
+///
+/// Written out in full even where only the first stage has a builder: the list
+/// is the design, and a stage nobody can build yet carries [`EdgeRule::Unbuilt`]
+/// rather than an invented distance.
+pub fn chain(class: Class, style: Style) -> Chain {
+    let cut = |per_tile, cutout, undergrowth, strands| Detail::Voxels {
+        per_tile,
+        cutout,
+        undergrowth,
+        strands,
+    };
+    let projected = |detail| Stage { detail, edge: EdgeRule::Projected };
+    let reach =
+        |detail, of_near, at_least| Stage { detail, edge: EdgeRule::Reach { of_near, at_least } };
+    let last = |detail| Stage { detail, edge: EdgeRule::Far };
+    let unbuilt = |detail| Stage { detail, edge: EdgeRule::Unbuilt };
+    let stages = match class {
+        // Full voxels, three coarser cuts, the canonical crown, its box. The
+        // window draws the four cuts — they are all a chunk mesher can build —
+        // and the horizon draws the whole list, so a tree just outside the
+        // window is cut exactly as coarsely as one just inside it at the same
+        // distance and no more.
+        Class::Tree | Class::DeadTree => vec![
+            projected(cut(DETAIL, true, true, true)),
+            projected(cut(DETAIL - 1, true, false, true)),
+            projected(cut(DETAIL / 2, true, false, true)),
+            projected(cut(DETAIL / 4, false, false, false)),
+            reach(Detail::Crown, CROWN_REACH, SHADOW_DISTANCE),
+            last(Detail::Box),
+        ],
+        // Grown, then a billboard, then nothing. Only the growth is built: a
+        // standing plant is dropped past the near band today rather than handed
+        // to a coarser stage.
+        Class::Shrub | Class::Sapling | Class::TallGrass => match style {
+            Style::Grown => vec![
+                projected(cut(PLANT_DETAIL, true, true, false)),
+                unbuilt(Detail::Billboard),
+                unbuilt(Detail::Baked),
+            ],
+            Style::Billboard => vec![projected(Detail::Billboard), unbuilt(Detail::Baked)],
+        },
+        Class::Boulder => vec![projected(Detail::Billboard), unbuilt(Detail::Baked)],
+        // Fine cubes, the prefab that replaces them, the footprint box, nothing.
+        // Only the cubes the sprite mesher already draws are built.
+        Class::Built | Class::Building(_) | Class::ItemPile => vec![
+            projected(cut(1, false, false, false)),
+            unbuilt(Detail::Prefab),
+            unbuilt(Detail::Box),
+            unbuilt(Detail::Baked),
+        ],
+        Class::Unit | Class::Other => vec![projected(cut(1, false, false, false))],
+    };
+    Chain { stages }
+}
+
+/// Water's own chain: the surface the mesher draws, then one flat tinted quad
+/// over the whole body. Water is not a [`Class`] — it rides on a tile rather
+/// than being one — so it has its own entry point.
+pub fn water_chain() -> Chain {
+    Chain {
+        stages: vec![
+            Stage { detail: Detail::Surface, edge: EdgeRule::Projected },
+            Stage { detail: Detail::Quad, edge: EdgeRule::Unbuilt },
+        ],
+    }
+}
+
+/// The tree chain, resolved once. Its stages are what both the window's canopy
+/// bands and the horizon's instances are cut from.
+pub fn tree_chain() -> &'static Chain {
+    static CHAIN: OnceLock<Chain> = OnceLock::new();
+    CHAIN.get_or_init(|| chain(Class::Tree, Style::Grown))
+}
+
+/// Meshes built once per key and stage, and kept.
+///
+/// The key is whatever varies inside a stage: a tree's origin tile for the
+/// window, where every tree is its own; a preset and growth variant for the
+/// horizon, where a handful of canonical shapes serve thousands of instances.
+/// The stage is [`Stage::key`], so a coarser cut of the same tree is its own
+/// entry and never overwrites the fine one.
+pub struct StageCache<K, V> {
+    entries: HashMap<(K, Detail), V>,
+}
+
+impl<K, V> Default for StageCache<K, V> {
+    fn default() -> Self {
+        Self { entries: HashMap::new() }
+    }
+}
+
+impl<K: Eq + Hash + Copy, V> StageCache<K, V> {
+    pub fn get(&self, key: K, stage: Detail) -> Option<&V> {
+        self.entries.get(&(key, stage))
+    }
+
+    pub fn insert(&mut self, key: K, stage: Detail, value: V) {
+        self.entries.insert((key, stage), value);
+    }
+
+    pub fn contains(&self, key: K, stage: Detail) -> bool {
+        self.entries.contains_key(&(key, stage))
+    }
+
+    /// Keeps the entries the predicate accepts, key and stage together.
+    pub fn retain(&mut self, mut keep: impl FnMut(K, Detail) -> bool) {
+        self.entries.retain(|&(key, stage), _| keep(key, stage));
+    }
+
+    /// Every entry, as key, stage and value.
+    pub fn iter(&self) -> impl Iterator<Item = (K, Detail, &V)> {
+        self.entries.iter().map(|(&(key, stage), value)| (key, stage, value))
+    }
+
+    /// The values held for one stage.
+    pub fn at(&self, stage: Detail) -> impl Iterator<Item = &V> {
+        self.entries.iter().filter(move |((_, s), _)| *s == stage).map(|(_, v)| v)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 
@@ -954,5 +1283,143 @@ mod tests {
         assert!(weeping("WILLOW"));
         assert!(weeping("BLACK_WILLOW"));
         assert!(!weeping("OAK"));
+    }
+
+    // ------------------------------------------------------------ the chain
+
+    /// Where the near band ends for a 45-degree lens in a 720-tall window: the
+    /// figure every edge below is a multiple of.
+    const NEAR: f32 = 109.0;
+
+    fn tree_stages() -> Vec<Stage> {
+        tree_chain().stages().to_vec()
+    }
+
+    /// The window run is the four cuts the canopy bands ship with, in order,
+    /// carrying what each one carries.
+    #[test]
+    fn the_window_run_is_the_four_bands_that_shipped() {
+        let window: Vec<Detail> = tree_chain().window().iter().map(|s| s.detail).collect();
+        assert_eq!(
+            window,
+            vec![
+                Detail::Voxels { per_tile: 4, cutout: true, undergrowth: true, strands: true },
+                Detail::Voxels { per_tile: 3, cutout: true, undergrowth: false, strands: true },
+                Detail::Voxels { per_tile: 2, cutout: true, undergrowth: false, strands: true },
+                Detail::Voxels { per_tile: 1, cutout: false, undergrowth: false, strands: false },
+            ]
+        );
+    }
+
+    /// The four band edges reproduce exactly: the near band's own distance, then
+    /// its leaf voxel's rule on each coarser cut. The last band the window draws
+    /// runs to the far plane and has no edge.
+    #[test]
+    fn the_band_edges_reproduce_bit_for_bit() {
+        let want = [NEAR, NEAR * 4.0 / 3.0, NEAR * 2.0];
+        assert_eq!(edges(tree_chain().window(), NEAR), want.to_vec());
+    }
+
+    /// The horizon draws the same stages at the same distances: its first three
+    /// hand-offs are the window's, to the bit. Detail is the camera's distance
+    /// and never the survey a tree came from.
+    #[test]
+    fn the_horizon_opens_on_the_window_s_own_edges() {
+        let window = edges(tree_chain().window(), NEAR);
+        let horizon = edges(tree_chain().instanced(), NEAR);
+        assert_eq!(&horizon[..window.len()], &window[..]);
+        assert_eq!(horizon.len(), tree_chain().stages().len() - 1);
+        // Then the one-voxel cut on the same rule, and the crown, held out past
+        // the cascades however small the window.
+        assert_eq!(horizon[3], NEAR * 4.0);
+        assert_eq!(horizon[4], (NEAR * CROWN_REACH).max(SHADOW_DISTANCE));
+        assert_eq!(edges(tree_chain().instanced(), 1.0)[4], SHADOW_DISTANCE);
+    }
+
+    /// A chain coarsens outward: every stage is coarser than the one before it
+    /// and hands over further out.
+    #[test]
+    fn a_chain_is_ordered_coarse_outward() {
+        let stages = tree_stages();
+        let cuts: Vec<i32> = stages.iter().filter_map(|s| s.detail.per_tile()).collect();
+        assert!(cuts.windows(2).all(|w| w[0] > w[1]), "{cuts:?} does not coarsen");
+        let at = edges(&stages, NEAR);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?} is not monotone");
+        // The last stage runs to the far plane and never hands over.
+        assert_eq!(stages.last().unwrap().edge(NEAR), f32::INFINITY);
+    }
+
+    /// A cut never carries more than the cut before it: the ground cover goes
+    /// first, then the strands, then the cutout.
+    #[test]
+    fn a_coarser_cut_never_carries_more() {
+        let carried: Vec<(bool, bool, bool)> = tree_chain()
+            .window()
+            .iter()
+            .map(|s| (s.detail.cutout(), s.detail.undergrowth(), s.detail.strands()))
+            .collect();
+        assert!(
+            carried.windows(2).all(|w| w[0].0 >= w[1].0 && w[0].1 >= w[1].1 && w[0].2 >= w[1].2),
+            "{carried:?}"
+        );
+    }
+
+    /// Every stage of a chain is its own cache key, so a coarse copy never
+    /// stands in for a fine one at the key they share.
+    #[test]
+    fn cache_keys_are_distinct_per_stage() {
+        let mut cache: StageCache<u32, &'static str> = StageCache::default();
+        for stage in tree_stages() {
+            cache.insert(7, stage.key(), "held");
+        }
+        assert_eq!(cache.len(), tree_stages().len(), "two stages shared a cache key");
+        for stage in tree_stages() {
+            cache.insert(8, stage.key(), "held");
+        }
+        assert_eq!(cache.len(), 2 * tree_stages().len(), "two keys shared a stage");
+        cache.retain(|key, _| key != 8);
+        assert_eq!(cache.len(), tree_stages().len(), "retiring a key has to take every stage");
+    }
+
+    /// The chains the issue lists are written out in full, and a stage nobody
+    /// can build yet says so rather than carrying an invented distance.
+    #[test]
+    fn every_chain_is_written_out_whole() {
+        let plant: Vec<Detail> =
+            chain(Class::Shrub, Style::Grown).stages().iter().map(|s| s.detail).collect();
+        assert_eq!(
+            plant,
+            vec![
+                Detail::Voxels {
+                    per_tile: PLANT_DETAIL,
+                    cutout: true,
+                    undergrowth: true,
+                    strands: false
+                },
+                Detail::Billboard,
+                Detail::Baked,
+            ]
+        );
+        let built: Vec<Detail> =
+            chain(Class::Built, Style::Grown).stages().iter().map(|s| s.detail).collect();
+        assert_eq!(
+            built,
+            vec![
+                Detail::Voxels { per_tile: 1, cutout: false, undergrowth: false, strands: false },
+                Detail::Prefab,
+                Detail::Box,
+                Detail::Baked,
+            ]
+        );
+        let water: Vec<Detail> = water_chain().stages().iter().map(|s| s.detail).collect();
+        assert_eq!(water, vec![Detail::Surface, Detail::Quad]);
+        // Only the head of each is built today; the tree chain is built whole.
+        for class in [Class::Shrub, Class::Built] {
+            let resolved = chain(class, Style::Grown);
+            let is_built: Vec<bool> = resolved.stages().iter().map(|s| s.built()).collect();
+            let want: Vec<bool> = (0..is_built.len()).map(|i| i == 0).collect();
+            assert_eq!(is_built, want, "{class:?}");
+        }
+        assert!(tree_chain().stages().iter().all(|s| s.built()));
     }
 }
