@@ -47,9 +47,21 @@ walls, one cell of texture per z-level.
 | natural ice | FrozenLiquid, Normal or Worn1-3 | `wall_ice.png` | `ICE_WALL` |
 | smoothed ice | FrozenLiquid, Smooth | `wall_ice_smoothed.png` | `SMOOTHED_ICE_WALL` |
 | semi-molten rock | Magma, any | `wall_magma.png` | `MAGMA_WALL` |
+| constructed floor, shoddy floor, track floor | Construction, any, floor shape | `floor_stone_blocks.png` | `FLOOR_STONE_BLOCK` |
 
 Cells: 8 families x (15 variants + 1 side) = 128, taking the atlas from 181 to
 309 of its 1024 (`cargo run -p dwarf-eye-world --example atlas`).
+
+A built floor is the same masonry seen from above, and DF ships it as a sheet of
+its own. `library.rs:construction_floor` gives every constructed floor —
+`ConstructedFloor`, the four shoddy cuts, the sixteen track variants —
+`floor_stone_blocks.png`, one shared atlas cell (the 310th), tinted by the
+construction's material like the wall. Where the slab faces a drop,
+`mesh.rs:strip_foot` skirts it with the bottom sliver of `ROCK_BLOCKS_WALL`'s own
+side strip, at the wall's texel density, so the edge of a roof is the course of
+blocks the wall below it would have shown rather than a white skirt. The tiletype never
+says what the thing was built from, so a wooden roof is blocks in wood colour;
+see the built-floor note in [README.md](README.md).
 
 The first five sheets are near-grey and get the material's colour damped, as the
 ground does; ice and magma carry their own and take only the tile's brightness
