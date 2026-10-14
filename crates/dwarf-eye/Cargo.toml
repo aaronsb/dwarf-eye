@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bevy = "0.19.1"
+bevy = "0.20.0"
 bytemuck = { version = "1", features = ["derive"] }
 dfhack-remote = { path = "../dfhack-remote" }
 dwarf-eye-art = { path = "../dwarf-eye-art" }
